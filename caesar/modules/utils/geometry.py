@@ -8,6 +8,7 @@ Provides Vec3Array and rotation utilities needed for structure manipulation.
 from __future__ import annotations
 
 import dataclasses
+from random import uniform
 from typing import Any, Optional, Union, Tuple, Iterable, Dict, List
 
 import torch
@@ -170,10 +171,6 @@ class Vec3Array:
             torch.cat([v.y for v in vecs], dim=dim),
             torch.cat([v.z for v in vecs], dim=dim),
         )
-
-    def to_array(self) -> torch.Tensor:
-        """Convert to (*, 3) tensor."""
-        return torch.stack([self.x, self.y, self.z], dim=-1)
 
 
 def square_euclidean_distance(
@@ -543,7 +540,7 @@ def get_random_neighbours(count: int):
         same_item = item[:, None] == item[None, :]
         # apply gumbel topk trick to select random neighbours
         weight = -3 * torch.log(distance + 1e-6)
-        uniform = torch.rand(weight.shape, dtype=weight.dtype, device=weight.device)
+        uniform = torch.empty_like(weight).uniform_(1e-6, 1.0 - 1e-6) #(c) avoid log(0)
         gumbel = torch.log(-torch.log(uniform))
         weight = weight - gumbel
         distance = -weight
@@ -841,35 +838,74 @@ def index_max(data: torch.Tensor,
         return result[index]
     return torch.where(mask, result[index], dmin)
 
-def index_mean(data: torch.Tensor,
-               index: torch.Tensor,
-               mask: torch.Tensor,
-               weight: Optional[torch.Tensor] = None,
-               apply_mask: bool = True):
-    """Mean of array entries with the same index value.
-
-    Args:
-        data: data array of shape (N, ...).
-        index: integer index of shape (N,) with values between 0 and N-1.
-        mask: boolean entry mask of shape (N,).
-        apply_mask: restrict the output to entries where mask is True. Default: True.
-    Returns:
-        Mean of array entries with the same index value, broadcasted
-        to all entries with that index value.
-        E.g. for values [1, 2, 3, 4, 5] and index [0, 0, 0, 1, 1]
-        the result would be [2, 2, 2, 4.5, 4.5].
+# Helper functions to broadcast mask and weight to data shape
+def _broadcast_mask_to_data(mask: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
     """
+    Make mask broadcastable to data by adding singleton dims.
+    jax allows mask (N,) or (N,1) etc; we emulate that.
+    """
+    # ensure mask starts with N dimension
+    if mask.dim() == 1 and data.dim() > 1:
+        mask = mask.view(mask.shape[0], *([1] * (data.dim() - 1)))
+    elif mask.dim() < data.dim():
+        mask = mask.view(*mask.shape, *([1] * (data.dim() - mask.dim())))
+    return mask
+
+def _broadcast_weight_to_data(weight: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
+    """
+    Broadcast weight to match data shape (same logic as mask).
+    """
+    if weight.dim() == 1 and data.dim() > 1:
+        weight = weight.view(weight.shape[0], *([1] * (data.dim() - 1)))
+    elif weight.dim() < data.dim():
+        weight = weight.view(*weight.shape, *([1] * (data.dim() - weight.dim())))
+    return weight
+
+def index_mean(data, index, mask, weight=None, apply_mask=True):
+    if index.dtype != torch.long:
+        index = index.long()
+
+    # mask -> bool
+    mask_bool = (mask != 0) if mask.dtype != torch.bool else mask
+
+    # broadcast mask для torch.where
+    mask_b = _broadcast_mask_to_data(mask_bool, data)
+
+    x = data
     if weight is not None:
-        data *= weight
-    data = torch.where(mask, data, 0)
-    result = torch.zeros_like(data).at[index].add(data)
-    position_weight = mask
-    if weight is not None:
-        position_weight = torch.where(mask, weight, 0)
-    result /= torch.maximum(torch.zeros_like(data).at[index].add(position_weight), 1e-6)
+        w = weight if torch.is_tensor(weight) else torch.as_tensor(weight, device=data.device)
+        w = w.to(device=data.device, dtype=data.dtype)
+        w = _broadcast_weight_to_data(w, data)              # -> (N,1) or (N,...) broadcastable
+        w = w.expand_as(data)                               
+        x = x * w
+
+    x = torch.where(mask_b, x, torch.zeros_like(x))
+
+    result = torch.zeros_like(x)
+    result.index_add_(0, index, x)
+
+    if weight is None:
+        position_weight = mask_bool.to(dtype=data.dtype, device=data.device)
+        position_weight = _broadcast_weight_to_data(position_weight, data) 
+        position_weight = position_weight.expand_as(data)                   
+    else:
+        w = weight.to(device=data.device, dtype=data.dtype) if torch.is_tensor(weight) else torch.as_tensor(weight, device=data.device, dtype=data.dtype)
+        w = _broadcast_weight_to_data(w, data)
+        w = w.expand_as(data)                                               # !!! (N,3)
+        position_weight = torch.where(mask_b, w, torch.zeros_like(w))
+
+    denom = torch.zeros_like(result)
+    denom.index_add_(0, index, position_weight)                            
+    denom = torch.clamp(denom, min=1e-6)
+
+    result = result / denom
+    out = result[index]
+
     if not apply_mask:
-        return result[index]
-    return torch.where(mask, result[index], 0)
+        return out
+
+    out = torch.where(mask_b, out, torch.zeros_like(out))
+    return out
 
 def index_var(data: torch.Tensor,
               index: torch.Tensor,

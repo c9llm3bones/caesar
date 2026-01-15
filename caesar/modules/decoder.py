@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from typing import Optional, Dict
 
-from caesar.geometry.geometry import distance_one_hot, get_spatial_neighbours, index_align
+from caesar.modules.utils.geometry import distance_one_hot, get_spatial_neighbours, index_align
 from caesar.modules.basic import Linear, MLP, init_zeros
 from caesar.config import DecoderConfig
 
