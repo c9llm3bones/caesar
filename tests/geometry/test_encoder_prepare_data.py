@@ -1,0 +1,157 @@
+import numpy as np
+import pytest
+import torch
+
+import jax
+import jax.numpy as jnp
+import haiku as hk
+
+from tests.utils import to_jax, to_torch
+
+
+def _assert_allclose(name, torch_x, jax_x, atol, rtol):
+    tx = torch_x.detach().cpu().numpy() if isinstance(torch_x, torch.Tensor) else np.asarray(torch_x)
+    jx = np.asarray(jax_x)
+    assert tx.shape == jx.shape, f"{name}: shape mismatch torch={tx.shape} jax={jx.shape}"
+    np.testing.assert_allclose(tx, jx, atol=atol, rtol=rtol, err_msg=f"{name}: mismatch")
+
+
+def _assert_array_equal(name, torch_x, jax_x):
+    tx = torch_x.detach().cpu().numpy() if isinstance(torch_x, torch.Tensor) else np.asarray(torch_x)
+    jx = np.asarray(jax_x)
+    assert tx.shape == jx.shape, f"{name}: shape mismatch torch={tx.shape} jax={jx.shape}"
+    assert np.array_equal(tx, jx), f"{name}: mismatch"
+
+
+@pytest.mark.parametrize("rng_seed", [0])
+def test_encoder_prepare_features_preparams_matches_jax(protein_data, atol, rtol, rng_seed):
+    """
+      - pos_input (without noise_encoder for deterministic features)
+      - neighbours = extract_neighbours(5,5,0)
+      - raw pair feature components:
+          sequence_relative_position(8, one_hot=True, pseudo_chains=True)
+          distance_features / direction_features / position_rotation_features / pair_vector_features
+    """
+
+    from salad.modules.structure_autoencoder import StructureAutoencoder as JaxAE
+    from salad.aflib.model.geometry import Vec3Array as JaxVec3
+    from salad.modules.utils.geometry import extract_neighbours as jax_extract_neighbours
+    from salad.modules.utils.geometry import sequence_relative_position as jax_sequence_relative_position
+    from salad.modules.geometric import (
+        distance_features as jax_distance_features,
+        direction_features as jax_direction_features,
+        position_rotation_features as jax_position_rotation_features,
+        pair_vector_features as jax_pair_vector_features,
+    )
+
+    from caesar.modules.autoencoder import StructureAutoencoder as TorchAE
+    from caesar.utils.geometry import Vec3Array as TorchVec3
+    from caesar.modules.utils import extract_neighbours as torch_extract_neighbours
+    from caesar.modules.utils.geometry import sequence_relative_position as torch_sequence_relative_position
+    from caesar.modules.geometric import (
+        distance_features as torch_distance_features,
+        direction_features as torch_direction_features,
+        position_rotation_features as torch_position_rotation_features,
+        pair_vector_features as torch_pair_vector_features,
+    )
+
+    class _Cfg:
+        noise_encoder = 0.0
+        eval = True
+        time_embedding = False
+        input_diffusion = False
+
+        local_size = 256
+        pair_size = 64
+
+        d_min = 0.0
+        d_max = 22.0
+        num_rbf = 16
+
+    data_np = dict(protein_data)
+    data_jax = {k: to_jax(v) for k, v in data_np.items()}
+    data_torch = {k: to_torch(v) for k, v in data_np.items()}
+
+    def jax_prepare_data_fn(d):
+        m = JaxAE(config=_Cfg())
+        return m.prepare_data(d)
+
+    jax_pd = hk.transform(jax_prepare_data_fn)
+    rng0 = jax.random.PRNGKey(rng_seed)
+    rng1 = jax.random.PRNGKey(rng_seed + 1)
+    params = jax_pd.init(rng0, data_jax)
+    out_jax_pd = jax_pd.apply(params, rng1, data_jax)
+
+    enc_in_jax = dict(out_jax_pd)
+    enc_in_jax["residue_index"] = data_jax["residue_index"]
+    enc_in_jax["batch_index"] = data_jax["batch_index"]
+
+    torch.manual_seed(rng_seed)  
+    torch_m = TorchAE(config=_Cfg())
+    torch_m.eval()
+    out_t_pd = torch_m.prepare_data(data_torch)
+
+    enc_in_torch = dict(out_t_pd)
+    enc_in_torch["residue_index"] = data_torch["residue_index"]
+    enc_in_torch["batch_index"] = data_torch["batch_index"]
+
+    # sanity: inputs used by pre-param computation 
+    _assert_allclose("pos_input", enc_in_torch["pos_input"], enc_in_jax["pos_input"], atol, rtol)
+    _assert_allclose("mask", enc_in_torch["mask"], enc_in_jax["mask"], atol, rtol)
+    _assert_array_equal("batch_index", enc_in_torch["batch_index"].cpu(), enc_in_jax["batch_index"])
+
+    # JAX: compute neighbours + raw components
+    
+    def jax_raw_components_fn(d):
+        pos = d["pos_input"]
+        resi = d["residue_index"]
+        chain = d["chain_index"]
+        batch = d["batch_index"]
+        mask = d["mask"]
+
+        pos_v = JaxVec3.from_array(pos)
+        neigh = jax_extract_neighbours(5, 5, 0)(pos_v, resi, chain, batch, mask)
+
+        relpos = jax_sequence_relative_position(8, one_hot=True, pseudo_chains=True)(
+            resi, chain, batch, neigh
+        )
+        dist = jax_distance_features(pos_v, neigh, d_min=0.0, d_max=22.0)
+        dire = jax_direction_features(pos_v, neigh)
+        rot  = jax_position_rotation_features(pos_v, neigh)
+        vec  = jax_pair_vector_features(pos_v, neigh)
+
+        return neigh, relpos, dist, dire, rot, vec, pos_v.to_array()
+
+    jax_raw = hk.transform(jax_raw_components_fn)
+
+    rng2 = jax.random.PRNGKey(123)
+    rng3 = jax.random.PRNGKey(124)
+
+    params_raw = jax_raw.init(rng2, enc_in_jax)
+    neigh_jax, relpos_jax, dist_jax, dire_jax, rot_jax, vec_jax, pos_jax = jax_raw.apply(params_raw, rng3, enc_in_jax)
+
+    pos_t = enc_in_torch["pos_input"]
+    resi_t = enc_in_torch["residue_index"].long()
+    chain_t = enc_in_torch["chain_index"].long()
+    batch_t = enc_in_torch["batch_index"].long()
+    mask_t = enc_in_torch["mask"]
+
+    pos_v_t = TorchVec3.from_array(pos_t)
+    neigh_t = torch_extract_neighbours(5, 5, 0)(pos_v_t, resi_t, chain_t, batch_t, mask_t)
+
+    relpos_t = torch_sequence_relative_position(8, one_hot=True, pseudo_chains=True)(
+        resi_t, chain_t, batch_t, neigh_t
+    )
+    dist_t = torch_distance_features(pos_v_t, neigh_t, d_min=0.0, d_max=22.0)
+    dire_t = torch_direction_features(pos_v_t, neigh_t)
+    rot_t = torch_position_rotation_features(pos_v_t, neigh_t)
+    vec_t = torch_pair_vector_features(pos_v_t, neigh_t)
+
+    _assert_allclose("pos_preparams", pos_v_t.to_tensor(), pos_jax, atol, rtol)
+    _assert_array_equal("neighbours", neigh_t, neigh_jax)
+
+    _assert_array_equal("relpos(onehot) exact", relpos_t, relpos_jax)  # one-hot должен совпадать в точности
+    _assert_allclose("distance_features", dist_t, dist_jax, atol, rtol)
+    _assert_allclose("direction_features", dire_t, dire_jax, atol, rtol)
+    _assert_allclose("position_rotation_features", rot_t, rot_jax, atol, rtol)
+    _assert_allclose("pair_vector_features", vec_t, vec_jax, atol, rtol)
