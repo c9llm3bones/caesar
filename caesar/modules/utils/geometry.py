@@ -12,6 +12,7 @@ from random import uniform
 from typing import Any, Optional, Union, Tuple, Iterable, Dict, List
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 
 import caesar.utils.geometry
@@ -20,6 +21,8 @@ from caesar.utils import geometry
 from caesar.utils.all_atom_multimer import (
     make_transform_from_reference, torsion_angles_to_frames,
     frames_and_literature_positions_to_atom14_pos)
+
+from caesar.utils.geometry import Vec3Array, Rigid3Array
 
 Float = Union[float, torch.Tensor]
 
@@ -322,8 +325,7 @@ def make_backbone_affine(
         atoms = ('N', 'CA', 'C')
     a, b, c = [residue_constants.atom_order[name] for name in atoms]
 
-    rigid_mask = (mask[..., a] * mask[..., b] * mask[..., c]).astype(
-        torch.float32)
+    rigid_mask = (mask[..., a] * mask[..., b] * mask[..., c]).to(dtype=torch.float32)
 
     rigid = make_transform_from_reference(
         a_xyz=positions[..., a],
@@ -331,31 +333,6 @@ def make_backbone_affine(
         c_xyz=positions[..., c])
 
     return rigid, rigid_mask
-
-def make_transform_from_reference(
-    a_xyz: geometry.Vec3Array,
-    b_xyz: geometry.Vec3Array,
-    c_xyz: geometry.Vec3Array) -> geometry.Rigid3Array:
-  """Returns rotation and translation matrices to convert from reference.
-
-  Note that this method does not take care of symmetries. If you provide the
-  coordinates in the non-standard way, the A atom will end up in the negative
-  y-axis rather than in the positive y-axis. You need to take care of such
-  cases in your code.
-
-  Args:
-    a_xyz: A Vec3Array.
-    b_xyz: A Vec3Array.
-    c_xyz: A Vec3Array.
-
-  Returns:
-    A Rigid3Array which, when applied to coordinates in a canonicalized
-    reference frame, will give coordinates approximately equal
-    the original coordinates (in the global frame).
-  """
-  rotation = geometry.Rot3Array.from_two_vectors(c_xyz - b_xyz,
-                                                 a_xyz - b_xyz)
-  return geometry.Rigid3Array(rotation, b_xyz)
 
 def extract_aa_frames(positions: Vec3Array) -> Tuple[Rigid3Array, Vec3Array]:
     """Extract frames from protein backbone positions.
@@ -365,7 +342,7 @@ def extract_aa_frames(positions: Vec3Array) -> Tuple[Rigid3Array, Vec3Array]:
     Returns:
         Rigid3Array of residue frames and Vec3Array of local-frame
         side chain atom positions.
-    """
+    """        
     rigids, _ = make_backbone_affine(positions, torch.ones((positions.shape[0], 14)), None)
     local_positions = rigids[..., None].apply_inverse_to_point(positions)
     return rigids, local_positions
@@ -398,66 +375,6 @@ def extract_aa_relmap(positions: Vec3Array, atom_mask: torch.Tensor):
     rel_mask = atom_mask[:, None, 1:2] * atom_mask[None, :]
     return relmap, rel_mask
 
-def sequence_relative_position(count: Optional[int] = 32,
-                               one_hot=False,
-                               cyclic=False,
-                               identify_ends=False,
-                               pseudo_chains=False):
-    """Compute sequence relative positions features for a protein chain.
-    
-    Args:
-        count: returns separate features for signed distances from -count to +count.
-        one_hot: return one-hot encoded features. Default: False.
-        cyclic: cyclise one or more chains. Default: False.
-        identify_ends: use the same representation for +count and -count. Default: False.
-        pseudo_chains: represent distances across chains by +count or -count
-            instead of a separate label. Default: False.
-    Returns:
-        A function computing relative position features given
-        residue, chain and batch indices (N,), as well a neighbour array (N, K)
-        and optionally a cyclic_mask (N,) which specifies which chains should
-        be cyclised.
-    """
-    def inner(resi, chain, batch, neighbours=None, cyclic_mask=None):
-        compare_index = (None, slice(None))
-        if neighbours is not None:
-            compare_index = neighbours
-        same_chain = chain[:, None] == chain[compare_index]
-        same_batch = batch[:, None] == batch[compare_index]
-        dist = resi[:, None] - resi[compare_index]
-        flat_resi = torch.arange(resi.shape[0], dtype=torch.int32)
-        if cyclic:
-            lengths = index_count(chain, torch.ones_like(chain, dtype=torch.bool))
-            wrap = abs(dist) > lengths[:, None] / 2
-            # control cyclic wrapping per residue/chain
-            if cyclic_mask is not None:
-                wrap = wrap * cyclic_mask[:, None]
-            dist = torch.where(
-                wrap,
-                torch.where(dist < 0,
-                         dist % lengths[:, None],
-                         dist % lengths[:, None] - lengths[:, None]),
-                dist)
-        dist = torch.clamp(dist, -count, count) + count
-        if identify_ends:
-            count_total = 2 * count - 2
-            dist = torch.where(dist == 0, 2 * count - 2, dist - 1)
-            dist = torch.where(same_chain, dist, 2 * count - 2)
-            dist = torch.where(same_batch, dist, 2 * count - 2)
-        elif pseudo_chains:
-            flat_dist = flat_resi[:, None] - flat_resi[compare_index]
-            flat_dist = torch.where(flat_dist >= 0, 0, 2 * count - 1)
-            count_total = 2 * count + 2
-            dist = torch.where(same_chain, dist, flat_dist)
-            dist = torch.where(same_batch, dist, 2 * count + 1)
-        else:
-            count_total = 2 * count + 2
-            dist = torch.where(same_chain, dist, 2 * count + 1)
-            dist = torch.where(same_batch, dist, 2 * count + 1)
-        if one_hot:
-            dist = torch.nn.functional.one_hot(dist, count_total, axis=-1)
-        return dist
-    return inner
 
 def single_protein_sidechains(aatype: torch.Tensor, frames: Rigid3Array, angles: torch.Tensor):
     """Compute side chain atom positions given backbone frames and dihedral angles.
@@ -675,8 +592,6 @@ def get_random_neighbours(count: int):
         mask = (mask[:, None] * mask[None, :] * same_item)
         return get_neighbours(count)(distance, mask, neighbours)
     return inner
-
-
 
 def get_contact_neighbours(count):
     """Extracts `count` neighbours with non-zero pair conditioning information."""
@@ -944,22 +859,6 @@ def index_std(data: torch.Tensor,
     """
     return torch.sqrt(index_var(data, index, mask, apply_mask) + eps)
 
-def index_count(index, mask, apply_mask=True):
-    """Count the number of entries with the same index value.
-    
-    Args:
-        index: integer index of shape (N,) with values between 0 and N-1.
-        mask: boolean entry mask of shape (N,).
-        apply_mask: restrict the output to entries where mask is True. Default: True.
-    Returns:
-        Count of index entries with the same value, broadcasted
-        to all entries with that index value.
-        E.g. for index [0, 0, 0, 1, 1] the result would be [3, 3, 3, 2, 2]
-    """
-    result = torch.zeros_like(index).at[index].add(mask.astype(index.dtype))
-    if not apply_mask:
-        return result[index]
-    return torch.where(mask, result[index], 0)
 
 def index_kabsch(x, y, index, mask, weight=None):
     device = x.device
@@ -986,8 +885,83 @@ def index_kabsch(x, y, index, mask, weight=None):
 
     return rot, x_center, y_center
 
-# meow meow meow 
+def sequence_relative_position(count: Optional[int] = 32,
+                               one_hot=False,
+                               cyclic=False,
+                               identify_ends=False,
+                               pseudo_chains=False):
+    """Compute sequence relative positions features for a protein chain.
+    
+    Args:
+        count: returns separate features for signed distances from -count to +count.
+        one_hot: return one-hot encoded features. Default: False.
+        cyclic: cyclise one or more chains. Default: False.
+        identify_ends: use the same representation for +count and -count. Default: False.
+        pseudo_chains: represent distances across chains by +count or -count
+            instead of a separate label. Default: False.
+    Returns:
+        A function computing relative position features given
+        residue, chain and batch indices (N,), as well a neighbour array (N, K)
+        and optionally a cyclic_mask (N,) which specifies which chains should
+        be cyclised.
+    """
+    def inner(resi, chain, batch, neighbours=None, cyclic_mask=None):
+        compare_index = (None, slice(None))
+        if neighbours is not None:
+            compare_index = neighbours
+        same_chain = chain[:, None] == chain[compare_index]
+        same_batch = batch[:, None] == batch[compare_index]
+        dist = resi[:, None] - resi[compare_index]
+        flat_resi = torch.arange(resi.shape[0], dtype=torch.int32)
+        if cyclic:
+            lengths = index_count(chain, torch.ones_like(chain, dtype=torch.bool))
+            wrap = abs(dist) > lengths[:, None] / 2
+            # control cyclic wrapping per residue/chain
+            if cyclic_mask is not None:
+                wrap = wrap * cyclic_mask[:, None]
+            dist = torch.where(
+                wrap,
+                torch.where(dist < 0,
+                         dist % lengths[:, None],
+                         dist % lengths[:, None] - lengths[:, None]),
+                dist)
+        dist = torch.clamp(dist, -count, count) + count
+        if identify_ends:
+            count_total = 2 * count - 2
+            dist = torch.where(dist == 0, 2 * count - 2, dist - 1)
+            dist = torch.where(same_chain, dist, 2 * count - 2)
+            dist = torch.where(same_batch, dist, 2 * count - 2)
+        elif pseudo_chains:
+            flat_dist = flat_resi[:, None] - flat_resi[compare_index]
+            flat_dist = torch.where(flat_dist >= 0, 0, 2 * count - 1)
+            count_total = 2 * count + 2
+            dist = torch.where(same_chain, dist, flat_dist)
+            dist = torch.where(same_batch, dist, 2 * count + 1)
+        else:
+            count_total = 2 * count + 2
+            dist = torch.where(same_chain, dist, 2 * count + 1)
+            dist = torch.where(same_batch, dist, 2 * count + 1)
+        if one_hot:
+            dist = F.one_hot(dist.long(), num_classes=int(count_total)).to(torch.float32)
+        return dist
+    return inner
 
+def index_count(index, mask, apply_mask=True):
+    """Count the number of entries with the same index value.
+    
+    Args:
+        index: integer index of shape (N,) with values between 0 and N-1.
+        mask: boolean entry mask of shape (N,).
+        apply_mask: restrict the output to entries where mask is True. Default: True.
+    Returns:
+        Count of index entries with the same value, broadcasted
+        to all entries with that index value.
+        E.g. for index [0, 0, 0, 1, 1] the result would be [3, 3, 3, 2, 2]
+    """
+    result = torch.zeros_like(index).at[index].add(mask.astype(index.dtype))
+    if not apply_mask:
+        return result[index]
+    return torch.where(mask, result[index], 0)
 
 def index_align(x, y, index, mask, weight=None):
     """Rigid align two structures x and y.
