@@ -206,3 +206,7 @@ class Rot3Array:
                 for name in field_names
             }
         )
+        
+    @property
+    def shape(self):
+        return self.xx.shape

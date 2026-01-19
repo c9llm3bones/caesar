@@ -469,6 +469,13 @@ def make_transform_from_reference(
         reference frame, will give coordinates approximately equal
         the original coordinates (in the global frame).
     """
+    # accept either Vec3Array or Tensor[...,3]
+    if isinstance(a_xyz, torch.Tensor):
+        a_xyz = geometry.Vec3Array.from_array(a_xyz)
+    if isinstance(b_xyz, torch.Tensor):
+        b_xyz = geometry.Vec3Array.from_array(b_xyz)
+    if isinstance(c_xyz, torch.Tensor):
+        c_xyz = geometry.Vec3Array.from_array(c_xyz)
     rotation = geometry.Rot3Array.from_two_vectors(
         c_xyz - b_xyz,
         a_xyz - b_xyz
