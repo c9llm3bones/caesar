@@ -8,21 +8,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import Optional, Dict
+from caesar.utils.geometry import Vec3Array, Rot3Array
+
+# from caesar.utils.all_atom_multimer import get_atom14_mask
 
 from caesar.modules.utils.geometry import distance_one_hot, get_spatial_neighbours, index_align
 from caesar.modules.basic import Linear, MLP, init_zeros
 from caesar.config import DecoderConfig
 
 from caesar.modules.basic import Linear, MLP, block_stack, init_linear
-from caesar.geometry import (
-    Vec3Array, 
+
+from caesar.modules.utils import (
     distance_rbf, 
-    index_mean,
-    get_neighbours,
-    get_random_neighbours,
-    extract_aa_frames,    
+    index_mean, 
+    get_random_neighbours, 
     index_sum,
-    single_protein_sidechains,
+    single_protein_sidechains
+)
+from caesar.modules.geometric import (
+    extract_aa_frames,
 )
 from caesar.config import EncoderConfig
 
@@ -343,21 +347,21 @@ class Decoder(nn.Module):
             losses["latent"] = weighted_loss
             total += c.latent_loss_scale * weighted_loss
         # AlphaFold violation loss. (not used in manuscript)
-        if c.violation_scale:
-            res_mask = data["mask"]
-            pred_mask = get_atom14_mask(data["aa_gt"]) * res_mask[:, None]
-            violation, _ = violation_loss(data["aa_gt"],
-                                          data["residue_index"],
-                                          result["atom_pos"],
-                                          pred_mask,
-                                          res_mask,
-                                          clash_overlap_tolerance=1.5,
-                                          violation_tolerance_factor=2.0,
-                                          chain_index=data["chain_index"],
-                                          batch_index=data["batch_index"],
-                                          per_residue=False)
-            losses["violation"] = violation.mean()
-            total += c.violation_scale * violation.mean()
+        # if c.violation_scale:
+        #     res_mask = data["mask"]
+        #     pred_mask = get_atom14_mask(data["aa_gt"]) * res_mask[:, None]
+        #     violation, _ = violation_loss(data["aa_gt"],
+        #                                   data["residue_index"],
+        #                                   result["atom_pos"],
+        #                                   pred_mask,
+        #                                   res_mask,
+        #                                   clash_overlap_tolerance=1.5,
+        #                                   violation_tolerance_factor=2.0,
+        #                                   chain_index=data["chain_index"],
+        #                                   batch_index=data["batch_index"],
+        #                                   per_residue=False)
+        #     losses["violation"] = violation.mean()
+        #     total += c.violation_scale * violation.mean()
 
         return total, losses
 
@@ -399,7 +403,7 @@ class AADecoder(nn.Module):
         self.proj = nn.Linear(config.local_size, 20, bias=False)
         nn.init.zeros_(self.proj.weight)
 
-        self.stack = AADecoderStack(config, depth=config.aa_decoder_depth)
+        # self.stack = AADecoderStack(config, depth=config.aa_decoder_depth)
 
     def forward(self, aa, local, pos, resi, chain, batch, mask):
         neighbours = get_spatial_neighbours(32)(

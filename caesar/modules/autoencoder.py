@@ -5,8 +5,10 @@ import torch.nn as nn
 from typing import Optional, Dict, Tuple
 
 from caesar.config import AutoencoderConfig, EncoderConfig, DecoderConfig
+from caesar.utils.geometry import Vec3Array 
+
 from caesar.modules.utils.geometry import (
-    Vec3Array, unique_chain, compute_pseudo_cb, positions_to_ncacocb, 
+    unique_chain, compute_pseudo_cb, positions_to_ncacocb, 
     index_mean)
 from caesar.modules.encoder import Encoder
 from caesar.modules.decoder import Decoder
