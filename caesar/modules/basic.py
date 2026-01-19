@@ -1,134 +1,159 @@
-"""PyTorch-compatible replacements for salad.modules.basic.
-
-This implements Linear, MLP, GatedMLP and a few initializer helpers.
-The goal is API parity sufficient for incremental porting of the autoencoder.
+"""PyTorch port of salad.modules.basic 
 """
 
-from typing import Optional, Callable
+from __future__ import annotations
+from typing import Optional, Callable, Union, Any
+import math
+import inspect
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Linear(nn.Module):
-    def __init__(self,
-                 in_features: int,
-                 out_features: int,
-                 bias: bool = True,
-                 initializer: Optional[str] = "linear",
-                 bias_init: float = 0.0):
-        super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.initializer = initializer
-        if bias:
-            nn.init.constant_(self.linear.bias, bias_init)
-        self._init_weights()
+@torch.no_grad()
+def _variance_scaling_(w: torch.Tensor, scale=1.0, mode="fan_in", dist="truncated_normal"):
+    fan_in, fan_out = w.shape[1], w.shape[0]  
+    denom = fan_in if mode == "fan_in" else fan_out if mode == "fan_out" else (fan_in + fan_out) / 2
+    var = float(scale) / max(1.0, float(denom))
+    std = math.sqrt(var)
 
-    def _init_weights(self):
-        if self.initializer == "relu":
-            gain = torch.nn.init.calculate_gain('relu')
-            nn.init.kaiming_uniform_(self.linear.weight, a=0, nonlinearity='relu')
-        elif self.initializer == "glorot":
-            nn.init.xavier_uniform_(self.linear.weight)
-        elif self.initializer == "zeros":
-            nn.init.constant_(self.linear.weight, 0.0)
-        else:  # linear or default
-            nn.init.kaiming_uniform_(self.linear.weight, a=0, nonlinearity='linear')
+    if dist == "uniform":
+        bound = math.sqrt(3.0) * std
+        w.uniform_(-bound, bound)
+    elif dist == "normal":
+        w.normal_(0.0, std)
+    else:  
+        nn.init.trunc_normal_(w, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
+
+
+def init_relu():   return lambda w: _variance_scaling_(w, scale=2.0, mode="fan_in", dist="truncated_normal")
+def init_linear(): return lambda w: _variance_scaling_(w, scale=1.0, mode="fan_in", dist="truncated_normal")
+def init_glorot(): return lambda w: _variance_scaling_(w, scale=1.0, mode="fan_avg", dist="uniform")
+def init_zeros():  return lambda w: nn.init.constant_(w, 0.0)
+
+def init_small(scale=1e-2):
+    @torch.no_grad()
+    def _init(w): w.uniform_(-scale, scale)
+    return _init
+
+def _resolve_init(initializer: Union[str, Callable[[torch.Tensor], None]]):
+    if callable(initializer): return initializer
+    return {"relu": init_relu(), "linear": init_linear(), "glorot": init_glorot(), "zeros": init_zeros()}.get(initializer, init_linear())
+
+
+class Linear(nn.Module):
+    def __init__(self, size: int = 128, bias: bool = True, bias_init: float = 0.0,
+                 initializer: Union[str, Callable[[torch.Tensor], None]] = "linear",
+                 name: Optional[str] = "linear"):
+        super().__init__()
+        self.bias_init = float(bias_init)
+        self.init = _resolve_init(initializer)
+        self.lin = nn.LazyLinear(int(size), bias=bool(bias))
+        self._inited = False
+
+    @torch.no_grad()
+    def _maybe_init(self):
+        if self._inited: return
+        self.init(self.lin.weight)
+        if self.lin.bias is not None:
+            nn.init.constant_(self.lin.bias, self.bias_init)
+        self._inited = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        y = self.lin(x)         
+        if not self._inited:     # overwrite init once, then recompute
+            self._maybe_init()
+            y = self.lin(x)
+        return y
 
 
 class MLP(nn.Module):
-    def __init__(self, 
-                 hidden: int,
-                 out_size: Optional[int] = None,
-                 depth: int = 2,
-                 activation: Callable = F.relu,
-                 bias: bool = True,
-                 init: str = "relu",
-                 final_init: str = "linear"):
+    def __init__(self, size=64, out_size=None, depth=2,
+                 activation: Callable = F.relu, bias=True,
+                 init="relu", final_init="linear",
+                 name: Optional[str] = "mlp"):
         super().__init__()
-        self.depth = depth
-        self.activation = activation
-        self.layers = nn.ModuleList()
-        for i in range(depth):
-            if i < depth - 1:
-                self.layers.append(Linear(hidden, hidden, bias=bias, initializer=init))
-            else:
-                out = out_size if out_size is not None else hidden
-                self.layers.append(Linear(hidden, out, bias=bias, initializer=final_init))
+        self.depth = int(depth)
+        self.act = activation
+        self.layers = nn.ModuleList([
+            Linear(size, bias=bias, initializer=init) if i < depth - 1
+            else Linear(out_size or size, bias=bias, initializer=final_init)
+            for i in range(depth)
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
         for i, layer in enumerate(self.layers):
             out = layer(out)
-            if i < (self.depth - 1):
-                out = self.activation(out)
+            if i < self.depth - 1:
+                out = self.act(out)
         return out
 
 
 class GatedMLP(nn.Module):
-    def __init__(self,
-                 hidden: int,
-                 out_size: Optional[int] = None,
+    def __init__(self, size=64, out_size=None,
                  activation: Callable = F.gelu,
-                 init: str = "relu",
-                 final_init: str = "zeros"):
+                 init="relu", final_init="zeros",
+                 name: Optional[str] = "gated_mlp"):
         super().__init__()
-        self.activation = activation
-        self.hidden = hidden
+        self.size = int(size)
         self.out_size = out_size
-        self.gate = Linear(hidden, hidden, bias=False, initializer=init)
-        self.hidden_lin = Linear(hidden, hidden, bias=False, initializer=init)
-        self.out_lin = Linear(hidden, out_size or hidden, bias=False, initializer=final_init)
+        self.act = activation
+        self.gate_lin = Linear(size, bias=False, initializer=init)
+        self.hid_lin  = Linear(size, bias=False, initializer=init)
+        self.out_lin: Optional[Linear] = Linear(out_size, bias=False, initializer=final_init) if out_size is not None else None
+        self.final_init = final_init
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.activation(self.gate(x))
-        hidden = gate * self.hidden_lin(x)
+        gate = self.act(self.gate_lin(x))
+        hidden = gate * self.hid_lin(x)
+        if self.out_lin is None:
+            self.out_lin = Linear(int(x.shape[-1]), bias=False, initializer=self.final_init).to(x.device)
         return self.out_lin(hidden)
 
 
-# helper initializers (for compatibility)
+class SmallLinear(nn.Module):
+    def __init__(self, size: int, scale: float = 1e-4, bias: bool = True, **kwargs: Any):
+        super().__init__()
+        self.lin = Linear(size, bias=bias, initializer=init_small(scale), **kwargs)
+        self.ln = nn.LayerNorm(int(size), elementwise_affine=False)
 
-def init_relu():
-    # wrapper returning a callable consistent with previous API 
-    return "relu"
-
-
-def init_linear():
-    return "linear"
-
-
-def init_zeros():
-    return "zeros"
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ln(self.lin(x))
 
 
-def init_glorot():
-    return "glorot"
+def small_linear(*args, scale=1e-4, **kwargs) -> nn.Module:
+    size = int(args[0]) if args else int(kwargs.pop("size"))
+    return SmallLinear(size=size, scale=scale, **kwargs)
 
 
-def small_linear(*args, scale=1e-4, **kwargs):
-    def inner(x: torch.Tensor) -> torch.Tensor:
-        lin = Linear(*args, initializer=init_glorot(), **kwargs)
-        y = lin(x)
-        return nn.LayerNorm(y.shape[-1])(y)
-    return inner
+# block_stack 
+
+class _Stack(nn.Module):
+    def __init__(self, n: int, factory: Callable, with_state: bool):
+        super().__init__()
+        self.with_state = with_state
+        takes_i = (len(inspect.signature(factory).parameters) >= 1)
+        self.blocks = nn.ModuleList([factory(i) if takes_i else factory() for i in range(int(n))])
+
+    def forward(self, x, state=None):
+        if self.with_state:
+            out, st = x, state
+            for b in self.blocks:
+                out, st = b(out, st)
+            return out, st
+        out = x
+        for b in self.blocks:
+            out = b(out)
+        return out
 
 
 def block_stack(depth: int, block_size: int = 1, with_state: bool = False):
-    """Return a function that applies `function` repeated `depth` times.
 
-    This is a simplified replacement for the Haiku block_stack + layer_stack.
-    It does not implement gradient checkpointing semantics; for that we can
-    add torch.utils.checkpoint later when necessary.
-    """
-    def inner(function: Callable):
-        def apply_fn(x):
-            out = x
-            for _ in range(depth):
-                out = function(out)
-            return out
-        return apply_fn
+    n = (int(depth) // int(block_size)) * int(block_size)
+
+    def inner(factory: Callable):
+        return _Stack(n=n, factory=factory, with_state=with_state)
+
     return inner
