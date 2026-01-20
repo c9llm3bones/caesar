@@ -9,12 +9,12 @@ from tests.utils import assert_allclose
 from tests.utils import to_jax 
 from tests.utils import to_torch
 
-@pytest.mark.parametrize("rng_seed", [0])
+
 def test_prepare_data_matches_jax_deterministic_parts(
     protein_data,
     atol,
     rtol,
-    rng_seed,
+    jax_keys,
 ):
     """
     SALAD prepare_data vs Torch prepare_data.
@@ -24,11 +24,9 @@ def test_prepare_data_matches_jax_deterministic_parts(
 
     from caesar.modules.autoencoder import StructureAutoencoder as TorchStructureAutoencoder
 
-    #  minimal config stub
     class _DummyCfg:
         pass
 
-    # protein_data from npz
     data_np = dict(protein_data)
 
     data_jax = {k: to_jax(v) for k, v in data_np.items()}
@@ -38,16 +36,16 @@ def test_prepare_data_matches_jax_deterministic_parts(
     def jax_fn(data):
         model = JaxStructureAutoencoder(config=_DummyCfg())
         return model.prepare_data(data)
+    
     jax_t = hk.transform(jax_fn)
-    rng = jax.random.PRNGKey(rng_seed)
-    params = jax_t.init(rng, data_jax)
-    rng_apply = jax.random.PRNGKey(rng_seed + 1)
-    out_jax = jax_t.apply(params, rng_apply, data_jax)
+    
+    key_init, key_apply = jax_keys
+    params = jax_t.init(key_init, data_jax)
+    out_jax = jax_t.apply(params, key_apply, data_jax)
     
     torch_model = TorchStructureAutoencoder(config=_DummyCfg())
     out_torch = torch_model.prepare_data(data_torch)
 
-    # keys that should match exactly (deterministic parts) 
     deterministic_keys = [
         "pos_gt",
         "pos_input",

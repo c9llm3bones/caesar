@@ -1,65 +1,60 @@
 import numpy as np
 import pytest
 import torch
+import haiku as hk
 
 import jax
 import jax.numpy as jnp
-import haiku as hk
-from salad.modules.geometric import distance_features as jax_distance_features
-from salad.aflib.model.geometry import Vec3Array as JaxVec3
 
+from salad.aflib.model.geometry import Vec3Array as JaxVec3
+from salad.modules.utils.geometry import extract_neighbours as jax_extract_neighbours
+from salad.modules.geometric import distance_features as jax_distance_features
+
+from caesar.utils.geometry import Vec3Array as TorchVec3  
 from caesar.modules.geometric import distance_features as torch_distance_features
-from caesar.geometry import Vec3Array as TorchVec3
+
 
 @pytest.mark.parametrize(
     "num_index,num_spatial,num_random",
     [
         (8, 8, 0),   # deterministic
-        (8, 8, 8),   # stochastic
+        (8, 8, 8),   # stochastic, but neighbours from jax
     ],
 )
-def test_distance_features_matches_jax(
+def test_distance_features_matches_jax_using_real_extract_neighbours(
     protein_data,
     num_index,
     num_spatial,
     num_random,
     atol,
     rtol,
+    seed,   
 ):
-    
-    """
-    Compare distance_features between JAX-SALAD and PyTorch implementation.
-
-    - num_random = 0:  strict numerical equivalence
-    - num_random > 0:  shape + statistical equivalence (stochastic case)
-    """
-
-    from salad.modules.utils.geometry import extract_neighbours as jax_extract_neighbours
-    
-    from caesar.geometry import extract_neighbours as torch_extract_neighbours
-    pos_np = protein_data["all_atom_positions"]  # (N=113, M=14, 3)
+    pos_np = protein_data["all_atom_positions"].astype(np.float32)  
     mask_np = protein_data["residue_mask"]
-    resi = protein_data["residue_index"]
-    chain = protein_data["chain_index"]
-    batch = protein_data["batch_index"]
-    
-    # jax perverted syntax for hk.transform
+    resi_np = protein_data["residue_index"]
+    chain_np = protein_data["chain_index"]
+    batch_np = protein_data["batch_index"]
+
     def jax_neigh_fn(pos, resi, chain, batch, mask):
-        return jax_extract_neighbours(
-            num_index,
-            num_spatial,
-            num_random,
-        )(pos, resi, chain, batch, mask)
+        return jax_extract_neighbours(num_index, num_spatial, num_random)(
+            pos, resi, chain, batch, mask
+        )
 
     jax_neigh = hk.transform(jax_neigh_fn)
 
+    key = jax.random.PRNGKey(seed)
+    key = jax.random.fold_in(key, num_index)
+    key = jax.random.fold_in(key, num_spatial)
+    key = jax.random.fold_in(key, num_random)
+
     neighbours_jax = jax_neigh.apply(
         params=None,
-        rng=jax.random.PRNGKey(0),
+        rng=key,
         pos=JaxVec3.from_array(pos_np),
-        resi=resi,
-        chain=chain,
-        batch=batch,
+        resi=resi_np,
+        chain=chain_np,
+        batch=batch_np,
         mask=mask_np,
     )
 
@@ -69,54 +64,17 @@ def test_distance_features_matches_jax(
         d_min=0.0,
         d_max=22.0,
     )
-    jax_out = np.asarray(jax_out)
+    jax_out_np = np.asarray(jax_out)
 
-    pos_torch = TorchVec3.from_array(
-        torch.tensor(pos_np, dtype=torch.float32)
-    )
-
-    neighbours_torch = torch_extract_neighbours(
-        num_index,
-        num_spatial,
-        num_random,
-    )(
-        pos_torch,
-        torch.tensor(resi),
-        torch.tensor(chain),
-        torch.tensor(batch),
-        torch.tensor(mask_np),
-    )
+    pos_t = TorchVec3.from_array(torch.tensor(pos_np, dtype=torch.float32))
+    neighbours_t = torch.tensor(np.asarray(neighbours_jax), dtype=torch.long)
 
     torch_out = torch_distance_features(
-        pos_torch,
-        neighbours_torch,
+        pos_t,
+        neighbours_t,
         d_min=0.0,
         d_max=22.0,
-    )
-    torch_out = torch_out.detach().cpu().numpy()
+    ).detach().cpu().numpy()
 
-    assert jax_out.shape == torch_out.shape
-
-
-    if num_random == 0: # deterministic case
-        np.testing.assert_allclose(
-            torch_out,
-            jax_out,
-            rtol=rtol,
-            atol=atol,
-            err_msg="distance_features mismatch (deterministic case)",
-        )
-    # TODO: change stoch case for determenistic randomization.
-    else: # stochastic case
-        np.testing.assert_allclose(
-            torch_out.mean(),
-            jax_out.mean(),
-            atol=1e-3,
-            err_msg="mean mismatch (stochastic case)",
-        )
-        np.testing.assert_allclose(
-            torch_out.std(),
-            jax_out.std(),
-            atol=1e-3,
-            err_msg="std mismatch (stochastic case)",
-        )
+    assert torch_out.shape == jax_out_np.shape
+    np.testing.assert_allclose(torch_out, jax_out_np, atol=atol, rtol=rtol)
