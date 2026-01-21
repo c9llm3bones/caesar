@@ -7,9 +7,8 @@ Adapted from SALAD structure_autoencoder.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Any
 
-from caesar.utils.geometry import Vec3Array, Rot3Array
+from caesar.utils.geometry import Vec3Array
 
 from caesar.modules.basic import Linear, MLP, block_stack, init_linear, init_relu, init_zeros
 from caesar.modules.utils import (
@@ -238,10 +237,9 @@ class AADecoderPairFeatures(nn.Module):
     def forward(self, pos, neighbours, resi, chain, batch, mask):
         neighbours = neighbours.to(torch.long)
 
-        valid = (neighbours != -1)
-        neigh = neighbours.clamp_min(0)
-
-        pair_mask = (mask[:, None] * mask[neigh]).to(torch.bool) & valid
+        pair_mask = mask[:, None] * mask[neighbours]
+        pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
+        pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
 
         pair  = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
         pair += self.p_dist(distance_features(pos, neighbours, d_min=0.0, d_max=22.0))
@@ -276,10 +274,14 @@ class InitLocalFeatures(nn.Module):
     def forward(self, pos, neighbours, resi, chain, batch, mask):
         neighbours = neighbours.to(torch.long)
 
-        valid = (neighbours != -1)
-        neigh = neighbours.clamp_min(0)
-
-        pair_mask = (mask[:, None] * mask[neigh]).to(torch.bool) & valid  # bool mask
+        ### safe gather for neighbours (handle -1)
+        # valid = (neighbours != -1)
+        # neigh = neighbours.clamp_min(0)
+        # pair_mask = (mask[:, None] * mask[neigh]).to(torch.bool) & valid  # bool mask
+  
+        pair_mask = mask[:, None] * mask[neighbours]
+        pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
+        pair_mask = pair_mask.to(torch.bool)
 
         pair  = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
         pair += self.p_dist(distance_features(pos, neighbours, d_min=0.0, d_max=22.0))
