@@ -37,6 +37,9 @@ from caesar.modules.geometric import (
     position_rotation_features,
 )
 
+from caesar.utils.loss import violation_loss
+from caesar.utils.all_atom_multimer import get_atom14_mask
+
 class DecoderBlock(nn.Module):
     """Standard equivariant decoder block."""
 
@@ -429,21 +432,21 @@ class Decoder(nn.Module):
             losses["latent"] = weighted_loss
             total += c.latent_loss_scale * weighted_loss
         # AlphaFold violation loss. (not used in manuscript)
-        # if c.violation_scale:
-        #     res_mask = data["mask"]
-        #     pred_mask = get_atom14_mask(data["aa_gt"]) * res_mask[:, None]
-        #     violation, _ = violation_loss(data["aa_gt"],
-        #                                   data["residue_index"],
-        #                                   result["atom_pos"],
-        #                                   pred_mask,
-        #                                   res_mask,
-        #                                   clash_overlap_tolerance=1.5,
-        #                                   violation_tolerance_factor=2.0,
-        #                                   chain_index=data["chain_index"],
-        #                                   batch_index=data["batch_index"],
-        #                                   per_residue=False)
-        #     losses["violation"] = violation.mean()
-        #     total += c.violation_scale * violation.mean()
+        if c.violation_scale:
+            res_mask = data["mask"]
+            pred_mask = get_atom14_mask(data["aa_gt"]) * res_mask[:, None]
+            violation, _ = violation_loss(data["aa_gt"],
+                                          data["residue_index"],
+                                          result["atom_pos"],
+                                          pred_mask,
+                                          res_mask,
+                                          clash_overlap_tolerance=1.5,
+                                          violation_tolerance_factor=2.0,
+                                          chain_index=data["chain_index"],
+                                          batch_index=data["batch_index"],
+                                          per_residue=False)
+            losses["violation"] = violation.mean()
+            total += c.violation_scale * violation.mean()
 
         return total, losses
 
