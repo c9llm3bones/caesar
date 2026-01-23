@@ -38,6 +38,3 @@ python_files = "test_*.py"
 
 [tool.setuptools]
 packages = ["caesar"]
-
-[tool.setuptools.package-dir]
-"" = "src"
