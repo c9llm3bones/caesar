@@ -1,16 +1,14 @@
-from typing import Optional, Union, Any
-
+from typing import Optional
 import torch
 import numpy as np
 import torch.nn.functional as F
 import torch.nn as nn
 from caesar.utils.geometry import Vec3Array
-from caesar.modules.basic import Linear, MLP, init_glorot, init_linear
-from caesar.modules.transformer import Transition
+from caesar.modules.basic import Linear, MLP, init_linear
 from caesar.modules.utils.geometry import (
-    distance_rbf, extract_aa_frames, extract_neighbours,
-    sequence_relative_position, get_neighbours,
-    index_mean, axis_index
+    distance_rbf, extract_aa_frames, 
+    sequence_relative_position, 
+    index_mean
 )
 from caesar.utils.all_atom_multimer import make_transform_from_reference
 
@@ -830,8 +828,7 @@ class SparseInvariantPointAttention(nn.Module):
         self.qkv = Linear(self.heads * 3 * self.size, bias=False, name="qkv")
 
         self.qkv_global = LinearToPoints(
-            self.heads * (2 * self.query_points + self.value_points),
-            name="qkv_global",
+            self.heads * (2 * self.query_points + self.value_points)
         )
 
         self.bias = Linear(self.heads, bias=False, name="bias")

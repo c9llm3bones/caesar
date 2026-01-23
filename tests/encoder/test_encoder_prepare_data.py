@@ -9,14 +9,13 @@ import haiku as hk
 from tests.utils import to_jax, to_torch, assert_allclose, assert_array_equal
 
 
-
-
 def test_encoder_prepare_features_preparams_matches_jax(
     protein_data,
     atol,
     rtol,
     seed,
-    jax_keys):
+    jax_keys,
+    cfg):
     """
       - pos_input (without noise_encoder for deterministic features)
       - neighbours = extract_neighbours(5,5,0)
@@ -37,6 +36,7 @@ def test_encoder_prepare_features_preparams_matches_jax(
     )
 
     from caesar.modules.autoencoder import StructureAutoencoder as TorchAE
+    from caesar.modules.autoencoder import prepare_data as torch_prepare_data
     from caesar.utils.geometry import Vec3Array as TorchVec3
     from caesar.modules.utils import extract_neighbours as torch_extract_neighbours
     from caesar.modules.utils.geometry import sequence_relative_position as torch_sequence_relative_position
@@ -46,26 +46,14 @@ def test_encoder_prepare_features_preparams_matches_jax(
         position_rotation_features as torch_position_rotation_features,
         pair_vector_features as torch_pair_vector_features,
     )
-
-    class _Cfg:
-        noise_encoder = 0.0
-        eval = True
-        time_embedding = False
-        input_diffusion = False
-
-        local_size = 256
-        pair_size = 64
-
-        d_min = 0.0
-        d_max = 22.0
-        num_rbf = 16
+    c = cfg 
 
     data_np = dict(protein_data)
     data_jax = {k: to_jax(v) for k, v in data_np.items()}
     data_torch = {k: to_torch(v) for k, v in data_np.items()}
 
     def jax_prepare_data_fn(d):
-        m = JaxAE(config=_Cfg())
+        m = JaxAE(config=c)
         return m.prepare_data(d)
 
     jax_pd = hk.transform(jax_prepare_data_fn)
@@ -78,9 +66,9 @@ def test_encoder_prepare_features_preparams_matches_jax(
     enc_in_jax["residue_index"] = data_jax["residue_index"]
     enc_in_jax["batch_index"] = data_jax["batch_index"]
 
-    torch_m = TorchAE(config=_Cfg())
+    torch_m = TorchAE(config=c)
     torch_m.eval()
-    out_t_pd = torch_m.prepare_data(data_torch)
+    out_t_pd = torch_prepare_data(data_torch)
 
     enc_in_torch = dict(out_t_pd)
     enc_in_torch["residue_index"] = data_torch["residue_index"]
@@ -143,7 +131,7 @@ def test_encoder_prepare_features_preparams_matches_jax(
     assert_allclose("pos_preparams", pos_v_t.to_tensor(), pos_jax, atol, rtol)
     assert_array_equal("neighbours", neigh_t, neigh_jax)
 
-    assert_array_equal("relpos(onehot) exact", relpos_t, relpos_jax)  # one-hot должен совпадать в точности
+    assert_array_equal("relpos(onehot) exact", relpos_t, relpos_jax) 
     assert_allclose("distance_features", dist_t, dist_jax, atol, rtol)
     assert_allclose("direction_features", dire_t, dire_jax, atol, rtol)
     assert_allclose("position_rotation_features", rot_t, rot_jax, atol, rtol)

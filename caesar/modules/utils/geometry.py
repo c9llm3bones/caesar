@@ -2,7 +2,6 @@
 
 Adapted from OpenFold (https://github.com/aqlaboratory/openfold)
 and SALAD (https://github.com/mjendrusch/salad)
-Provides Vec3Array and rotation utilities needed for structure manipulation.
 """
 # IN PROGRESS
 from __future__ import annotations
@@ -610,21 +609,12 @@ def get_contact_neighbours(count):
     return inner
 
 def distance_rbf(distance, min_distance=0.0, max_distance=22.0, bins=64):
-    """Computes Gaussian RBF features of continuous inputs.
-    
-    Args:
-        distance: array of distances to embed.
-        min_distance: minimum distance to place RBFs.
-        max_distance: maximum distance to place RBFs.
-        bins: number of radial basis functions.
-
-    Returns:
-        Gaussian RBF embedding of `distance` with `bins` centers.
-    """
     step = (max_distance - min_distance) / bins
-    centers = min_distance + torch.arange(bins) * step + step / 2
-    rbf = torch.exp(-(distance[..., None] - centers) ** 2 / step ** 2)
-    return rbf
+    centers = min_distance + (
+        torch.arange(bins, device=distance.device, dtype=distance.dtype) * step + step / 2
+    )
+    return torch.exp(-((distance[..., None] - centers) ** 2) / (step ** 2))
+
 
 def distance_one_hot(distance, min_distance=0.0, max_distance=22.0, bins=64):
     """Computes one-hot encoding of continuous inputs.

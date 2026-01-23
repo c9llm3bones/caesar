@@ -15,6 +15,7 @@ def test_prepare_data_matches_jax_deterministic_parts(
     atol,
     rtol,
     jax_keys,
+    cfg,
 ):
     """
     SALAD prepare_data vs Torch prepare_data.
@@ -22,10 +23,7 @@ def test_prepare_data_matches_jax_deterministic_parts(
 
     from salad.modules.structure_autoencoder import StructureAutoencoder as JaxStructureAutoencoder
 
-    from caesar.modules.autoencoder import StructureAutoencoder as TorchStructureAutoencoder
-
-    class _DummyCfg:
-        pass
+    from caesar.modules.autoencoder import prepare_data as torch_prepare_data
 
     data_np = dict(protein_data)
 
@@ -34,7 +32,7 @@ def test_prepare_data_matches_jax_deterministic_parts(
     data_torch = {k: to_torch(v) for k, v in data_np.items()}
 
     def jax_fn(data):
-        model = JaxStructureAutoencoder(config=_DummyCfg())
+        model = JaxStructureAutoencoder(config=cfg)
         return model.prepare_data(data)
     
     jax_t = hk.transform(jax_fn)
@@ -43,8 +41,7 @@ def test_prepare_data_matches_jax_deterministic_parts(
     params = jax_t.init(key_init, data_jax)
     out_jax = jax_t.apply(params, key_apply, data_jax)
     
-    torch_model = TorchStructureAutoencoder(config=_DummyCfg())
-    out_torch = torch_model.prepare_data(data_torch)
+    out_torch = torch_prepare_data(data_torch)
 
     deterministic_keys = [
         "pos_gt",

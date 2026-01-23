@@ -233,7 +233,7 @@ class Decoder(nn.Module):
                 )
             result["predicted_latent"] = predicted_latent
 
-        aa_logits, decoder_features, corrupt_aa = self.aa_decoder.train(
+        aa_logits, decoder_features, corrupt_aa = self.aa_decoder.decode_train(
             data["aa_gt"], local, pos, resi, chain, batch, mask
         )
 
@@ -630,7 +630,7 @@ class AADecoder(nn.Module):
         logits = self.proj(local)
         return logits, local
 
-    def train(self, aa, local, pos, resi, chain, batch, mask):
+    def decode_train(self, aa, local, pos, resi, chain, batch, mask):
         aa = torch.full_like(aa, 20)
         logits, features = self.forward(
             aa, local, pos, resi, chain, batch, mask

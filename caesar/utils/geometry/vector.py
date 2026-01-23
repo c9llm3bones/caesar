@@ -160,6 +160,7 @@ class Vec3Array:
 
     @classmethod
     def from_array(cls, tensor):
+        assert tensor.shape[-1] == 3, f"Vec3Array.from_array expects [...,3], got {tuple(tensor.shape)}" # (c)
         return cls(*torch.unbind(tensor, dim=-1))
 
     @classmethod

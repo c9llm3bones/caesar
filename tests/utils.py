@@ -1,6 +1,7 @@
 import numpy as np
 import jax.numpy as jnp
 import torch
+from dataclasses import dataclass
 
 def to_jax(x):
     # np -> jax array, torch -> np -> jax
@@ -20,3 +21,10 @@ def assert_allclose(name, torch_x, jax_x, atol, rtol):
     jx = np.asarray(jax_x)
     assert tx.shape == jx.shape, f"{name}: shape mismatch torch={tx.shape} jax={jx.shape}"
     np.testing.assert_allclose(tx, jx, atol=atol, rtol=rtol, err_msg=f"{name}: mismatch")
+
+def assert_array_equal(name, torch_x, jax_x):
+    tx = torch_x.detach().cpu().numpy() if isinstance(torch_x, torch.Tensor) else np.asarray(torch_x)
+    jx = np.asarray(jax_x)
+    assert tx.shape == jx.shape, f"{name}: shape mismatch torch={tx.shape} jax={jx.shape}"
+    assert np.array_equal(tx, jx), f"{name}: mismatch"
+    
