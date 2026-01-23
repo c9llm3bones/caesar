@@ -10,7 +10,6 @@ import torch.nn.functional as F
 from typing import Callable, Optional, Tuple
 from caesar.utils.geometry import Vec3Array, Rot3Array
 
-# from caesar.utils.all_atom_multimer import get_atom14_mask
 from caesar.modules.encoder import (
     EncoderUpdate, 
     AADecoderPairFeatures

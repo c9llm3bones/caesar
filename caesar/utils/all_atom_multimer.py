@@ -23,6 +23,7 @@ import torch
 from caesar.aflib.common import residue_constants as rc
 from caesar.utils import geometry, tensor_utils
 from caesar.utils.geometry.rigid_matrix_vector import Rigid3Array
+
 import numpy as np
 
 
@@ -99,6 +100,18 @@ def get_alt_atom14(aatype, positions: torch.Tensor, mask):
 
     return alternative_positions, alternative_mask
 
+def _make_restype_atom14_mask(residue_constants) -> np.ndarray:
+    """Mask of which atoms are present for which residue type in atom14."""
+    restype_atom14_mask = []
+    for rt in residue_constants.restypes:
+        atom_names = residue_constants.restype_name_to_atom14_names[
+            residue_constants.restype_1to3[rt]
+        ]
+        restype_atom14_mask.append([1.0 if name else 0.0 for name in atom_names])
+
+    # unknown residue type
+    restype_atom14_mask.append([0.0] * 14)
+    return np.asarray(restype_atom14_mask, dtype=np.float32)
 
 def atom37_to_frames(
     aatype: torch.Tensor,    # (...)
@@ -210,6 +223,14 @@ def atom37_to_frames(
             'rigidgroups_alt_gt_frames': alt_gt_frames,    # Rigid (..., 8)
     }
 
+
+RESTYPE_ATOM14_MASK = _make_restype_atom14_mask()
+
+# FIXME
+def get_atom14_mask(aatype):
+    aatype = aatype.to(torch.long)
+    table = RESTYPE_ATOM14_MASK.to(device=aatype.device)
+    return tensor_utils.batched_gather(table, aatype, dim=0, no_batch_dims=0)
 
 def torsion_angles_to_frames(
     aatype: torch.Tensor,    # (N)
