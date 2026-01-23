@@ -9,20 +9,28 @@ description = ""
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "torch>=1.13",
-    "numpy",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-cov",
+  "torch>=2.0",
+  "numpy",
+  "scipy",
+  "tqdm",
+  "biopython",
+  "chex",
+  "immutabledict",
+  "ml-collections",
+  "pydssp",
+  "dm-tree",
+  "jax[cpu]==0.5.0",
+  "dm-haiku==0.0.16",
+  "flexloop @ git+https://github.com/mjendrusch/flexloop.git",
+  "gemmi",
+  "pytest>=7.0",
+  "pytest-cov",
 ]
 
 [project.urls]
-"Homepage" = ""
-"Source" = "https://github.com/c9llm3bones/caesar"
-"Issues" = "https://github.com/c9llm3bones/caesar/issues"
+Homepage = "https://github.com/c9llm3bones/caesar"
+Source = "https://github.com/c9llm3bones/caesar"
+Issues = "https://github.com/c9llm3bones/caesar/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
