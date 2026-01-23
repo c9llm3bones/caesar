@@ -100,12 +100,12 @@ def get_alt_atom14(aatype, positions: torch.Tensor, mask):
 
     return alternative_positions, alternative_mask
 
-def _make_restype_atom14_mask(residue_constants) -> np.ndarray:
+def _make_restype_atom14_mask() -> np.ndarray:
     """Mask of which atoms are present for which residue type in atom14."""
     restype_atom14_mask = []
-    for rt in residue_constants.restypes:
-        atom_names = residue_constants.restype_name_to_atom14_names[
-            residue_constants.restype_1to3[rt]
+    for rt in rc.restypes:
+        atom_names = rc.restype_name_to_atom14_names[
+            rc.restype_1to3[rt]
         ]
         restype_atom14_mask.append([1.0 if name else 0.0 for name in atom_names])
 
