@@ -85,6 +85,13 @@ class Vec3Array:
     def shape(self):
         return self.x.shape
 
+    @property
+    def device(self):
+        return self.x.device
+  
+    def dim(self):
+        return self.x.dim()
+    
     def map_tensor_fn(self, fn) -> Vec3Array:
         return Vec3Array(
             fn(self.x),
@@ -157,6 +164,9 @@ class Vec3Array:
 
     def to_tensor(self) -> torch.Tensor:
         return torch.stack([self.x, self.y, self.z], dim=-1)
+
+    def stack(vecs, dim=0):
+        return Vec3Array.cat([v.unsqueeze(dim) for v in vecs], dim=dim)
 
     @classmethod
     def from_array(cls, tensor):

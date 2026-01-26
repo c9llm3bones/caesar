@@ -100,7 +100,7 @@ def get_alt_atom14(aatype, positions: torch.Tensor, mask):
 
     return alternative_positions, alternative_mask
 
-def _make_restype_atom14_mask() -> np.ndarray:
+def _make_restype_atom14_mask() -> torch.Tensor:
     """Mask of which atoms are present for which residue type in atom14."""
     restype_atom14_mask = []
     for rt in rc.restypes:
@@ -111,7 +111,9 @@ def _make_restype_atom14_mask() -> np.ndarray:
 
     # unknown residue type
     restype_atom14_mask.append([0.0] * 14)
-    return np.asarray(restype_atom14_mask, dtype=np.float32)
+    
+    arr = np.array(restype_atom14_mask, dtype=np.float32)  # [21,14]
+    return torch.from_numpy(arr)
 
 def atom37_to_frames(
     aatype: torch.Tensor,    # (...)
@@ -229,8 +231,9 @@ RESTYPE_ATOM14_MASK = _make_restype_atom14_mask()
 # FIXME
 def get_atom14_mask(aatype):
     aatype = aatype.to(torch.long)
+    aatype = aatype.clamp(0, RESTYPE_ATOM14_MASK.shape[0] - 1)
     table = RESTYPE_ATOM14_MASK.to(device=aatype.device)
-    return tensor_utils.batched_gather(table, aatype, dim=0, no_batch_dims=0)
+    return table[aatype]
 
 def torsion_angles_to_frames(
     aatype: torch.Tensor,    # (N)

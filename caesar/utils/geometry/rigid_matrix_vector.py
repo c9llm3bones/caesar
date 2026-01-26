@@ -179,3 +179,6 @@ class Rigid3Array:
 
     def cuda(self) -> Rigid3Array:
         return Rigid3Array.from_tensor_4x4(self.to_tensor_4x4().cuda())
+    
+    def stack(rigids, dim=0):
+        return Rigid3Array.cat([r.unsqueeze(dim) for r in rigids], dim=dim)
