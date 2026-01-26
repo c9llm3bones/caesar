@@ -1,13 +1,16 @@
 """Autoencoder combining Encoder and Decoder."""
 
+import pickle
 import math
 import torch
 import torch.nn as nn
-from typing import Any, Optional, Dict, Tuple
+import torch.distributed as dist
+from typing import Any, Callable, List, Optional, Dict, Tuple
 
 import torch.nn.functional as F
 from caesar.utils.geometry import Vec3Array 
 
+from caesar.modules.basic import Linear
 from caesar.modules.utils.geometry import (
     unique_chain, compute_pseudo_cb, positions_to_ncacocb, 
     index_mean, index_align)
@@ -273,82 +276,207 @@ def prepare_data(data):
         all_atom_mask=atom_mask_out,
     )
         
-class StructureDecoder(nn.Module):
-    """Wrapper for training a structure autoencoder with a fixed encoder."""
+class StructureDecoderInference(nn.Module):
+    """Wrapper class for StructureDecoder evaluation. (Torch port)"""
 
-    def __init__(self, config, name: Optional[str] = "structure_decoder"):
+    def __init__(
+        self,
+        config,
+        prepare_data_fn,  # external function
+        *,
+        device: Optional[torch.device] = None,
+        strict: bool = True,
+    ):
         super().__init__()
         self.config = config
         c = self.config
 
-        # fixed encoder (loaded from params)
-        self.encoder = assign_state_torch(c, c.param_path)
-        self.encoder.eval()
-        for p in self.encoder.parameters():
-            p.requires_grad_(False)
+        # fixed encoder apply fn (returns (latent, codebook_index))
+        self.encoder_apply = assign_state(
+            c,
+            c.param_path,
+            prepare_data_fn=prepare_data_fn,
+            device=device,
+            strict=strict,
+        )
 
-        # learnable decoder
+        # learnable decoder 
         self.decoder = Decoder(c)
+        if device is not None:
+            self.decoder = self.decoder.to(device)
 
-    def add_noise(self, latent: torch.Tensor, batch: torch.Tensor, *, generator: Optional[torch.Generator] = None):
-        """Add noise to latents."""
-        batch = batch.to(torch.long)
-        noise_level = torch.randn(batch.shape, device=latent.device, dtype=latent.dtype, generator=generator)[batch]
-        noise_level = torch.exp(noise_level)
-        noise = torch.randn(latent.shape, device=latent.device, dtype=latent.dtype, generator=generator) * noise_level
-        return latent + noise
+    @torch.no_grad()
+    def forward(self, data: Dict[str, Any], *, generator: Optional[torch.Generator] = None) -> Dict[str, Any]:
+        c = self.config
+        data = dict(data)
+
+        # data.update(self.prepare_data(data))
+        
+        latent, codebook_index = self.encoder_apply(data, generator=generator)
+        latent = latent.detach()
+        data["latent"] = latent
+
+        prev = dict(
+            pos=data["pos"],
+            local=torch.zeros(
+                (data["pos"].shape[0], c.local_size),
+                device=data["pos"].device,
+                dtype=torch.float32,
+            ),
+        )
+
+        count = int(c.num_recycle)
+        for _ in range(count):
+            result_i = self.decoder(data, prev)
+            prev = {
+                "pos": result_i["pos"].detach(),
+                "local": result_i["local"].detach(),
+            }
+
+        result = self.decoder(data, prev)
+
+        mask = data["mask"].to(torch.bool)
+        aa_gt = data["aa_gt"].to(torch.long)
+
+        aa_pred = result["aa"]  
+        aa_onehot = F.one_hot(aa_gt, 20).to(dtype=aa_pred.dtype)
+
+        aa_nll = -(aa_pred * aa_onehot).sum(dim=-1)
+        aa_nll = torch.where(mask, aa_nll, torch.zeros_like(aa_nll))
+        aa_nll = aa_nll.sum() / torch.clamp(mask.sum().to(aa_nll.dtype), min=1.0)
+
+        perplexity = torch.exp(aa_nll)
+        aatype = torch.argmax(aa_pred, dim=-1)
+        recovery = ((aa_gt == aatype) & mask).sum().to(torch.float32) / torch.clamp(mask.sum().to(torch.float32), min=1.0)
+
+        pos_gt = data["pos_gt"]
+        pos = result["pos"]
+
+        pos_gt = index_align(pos_gt, pos, data["batch_index"], mask)
+
+        di2 = ((pos[:, 1] - pos_gt[:, 1]) ** 2).sum(dim=-1)
+        rmsd_ca = torch.sqrt((di2 * mask.to(di2.dtype)).sum() / torch.clamp(mask.sum().to(di2.dtype), min=1.0))
+
+        L = torch.clamp(mask.sum().to(torch.float32), min=1.0)
+        d02 = (1.24 * torch.pow(torch.clamp(L - 15.0, min=0.0), 1.0 / 3.0) - 1.8) ** 2
+        inner = (1.0 / (1.0 + di2 / torch.clamp(d02, min=1e-8))) * mask.to(di2.dtype)
+        tm = inner.sum() / torch.clamp(mask.sum().to(inner.dtype), min=1.0)
+
+        dca_gt = torch.linalg.norm(pos_gt[:, None, 1] - pos_gt[None, :, 1], dim=-1)
+        dca = torch.linalg.norm(pos[:, None, 1] - pos[None, :, 1], dim=-1)
+
+        pair_mask = (mask[:, None] & mask[None, :])
+        derr = (dca_gt - dca).abs() * pair_mask.to(dca.dtype)
+
+        threshold = torch.tensor([0.5, 1.0, 2.0, 4.0], device=derr.device, dtype=derr.dtype)
+        Rinc = 15.0
+        pair_mask = pair_mask & (dca_gt < Rinc)
+
+        in_threshold = (derr[..., None] < threshold) & pair_mask[..., None]
+        denom = torch.clamp(pair_mask[..., None].sum(dim=1).to(torch.float32), min=1.0)
+        lddt_ca = (in_threshold.sum(dim=1).to(torch.float32) / denom).mean(dim=-1)
+        lddt_ca = torch.where(mask, lddt_ca, torch.zeros_like(lddt_ca))
+
+        out = dict(
+            atom_pos=result["atom_pos"],
+            aatype=aatype,
+            latent=data["latent"],
+            local=result["local"],
+            perplexity=perplexity,
+            recovery=recovery,
+            rmsd_ca=rmsd_ca,
+            tm=tm,
+            lddt=lddt_ca,
+            dssp=data["dssp"],
+        )
+        if getattr(c, "codebook_size", 0):
+            out["codebook_index"] = codebook_index
+
+        return out
+
+class AssignState(nn.Module):
+    """Fixed encoder wrapper."""
+
+    def __init__(
+        self,
+        config,
+        prepare_data_fn: Callable[[Dict[str, Any]], Dict[str, Any]],
+    ):
+        super().__init__()
+        self.config = config
+        self.prepare_data_fn = prepare_data_fn
+
+        c = self.config
+        self.encoder = Encoder(c)
+
+        self.quantize = None
+        if getattr(c, "codebook_size", 0):
+            vq_cls = VQState if getattr(c, "state", False) else VQ
+            self.quantize = vq_cls(c.codebook_size)
 
     def forward(
         self,
         data: Dict[str, Any],
         *,
         generator: Optional[torch.Generator] = None,
-        running_init: bool = False,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         c = self.config
 
         data = dict(data)
-        data.update(prepare_data(data, generator=generator))
+        data.update(self.prepare_data_fn(data) if generator is None else self.prepare_data_fn(data, generator=generator))
 
-        with torch.no_grad():
-            enc_out = self.encoder(data)
+        latent = self.encoder(data)
 
-        if isinstance(enc_out, (tuple, list)) and len(enc_out) >= 1:
-            latent = enc_out[0]
-            codebook_index = enc_out[1] if len(enc_out) > 1 else None
-        else:
-            latent = enc_out
-            codebook_index = None
+        if getattr(c, "codebook_size", 0):
+            latent, codebook_index, _ = self.quantize(latent, data["mask"])
+            return latent, codebook_index
 
-        latent = latent.detach()
-        data["latent"] = latent
-        if codebook_index is not None:
-            data["codebook_index"] = codebook_index
+        return latent, None
 
-        prev = dict(
-            pos=data["pos"],
-            local=torch.zeros((data["pos"].shape[0], c.local_size), device=latent.device, dtype=torch.float32),
+def assign_state(
+    config,
+    param_path: str,
+    prepare_data_fn: Callable[..., Dict[str, Any]],
+    *,
+    device: Optional[torch.device] = None,
+    strict: bool = True,
+) -> Callable[..., Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """
+    Construct a fixed encoder from config and a parameter path.
+    """
+    model = AssignState(config, prepare_data_fn=prepare_data_fn)
+
+    state_obj = None
+    try:
+        state_obj = torch.load(param_path, map_location="cpu")
+    except Exception:
+        with open(param_path, "rb") as f:
+            state_obj = pickle.load(f)
+
+    if isinstance(state_obj, dict) and "state_dict" in state_obj and isinstance(state_obj["state_dict"], dict):
+        state_dict = state_obj["state_dict"]
+    elif isinstance(state_obj, dict):
+        state_dict = state_obj
+    else:
+        raise TypeError(
+            "Checkpoint is not a dict/state_dict. "
+            "If this is a Haiku params pickle, you need a JAX->Torch converter."
         )
 
-        if not running_init:
-            if getattr(c, "eval", False):
-                count = int(c.num_recycle)
-            else:
-                count = int(torch.randint(0, 4, (), device=latent.device, generator=generator).item())
+    model.load_state_dict(state_dict, strict=strict)
 
-            for _ in range(count):
-                result_i = self.decoder(data, prev)
-                prev = {
-                    "pos": result_i["pos"].detach(),
-                    "local": result_i["local"].detach(),
-                }
+    if device is not None:
+        model = model.to(device)
 
-        result = self.decoder(data, prev)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
 
-        total, losses = self.decoder.loss(data, result)
+    @torch.no_grad()
+    def inner(data: Dict[str, Any], *, generator: Optional[torch.Generator] = None):
+        return model(data, generator=generator)
 
-        out_dict = dict(results=result, losses=losses)
-        return total, out_dict
+    return inner
 
 class StructureAutoencoderInference(StructureAutoencoder):
     """Wrapper class for autoencoder evaluation."""
@@ -504,3 +632,298 @@ class StructureAutoencoderInference(StructureAutoencoder):
             out["codebook_index"] = codebook_index
 
         return out
+
+
+class VQ(nn.Module):
+    """Vector quantization module."""
+
+    def __init__(
+        self,
+        codebook_size: int = 4096,
+        affine=None,
+        mapped_axes: Optional[List[str]] = None,  
+        name: Optional[str] = "vq",
+    ):
+        super().__init__()
+        self.codebook_size = int(codebook_size)
+        self.affine = affine
+        self.mapped_axes = list(mapped_axes) if mapped_axes else []
+
+        self.codebook_raw = nn.Parameter(torch.empty(0))  
+
+        if self.affine:
+            self.codebook_mean = nn.Parameter(torch.empty(0))  
+            self.codebook_scale = nn.Parameter(torch.empty(0)) 
+        else:
+            self.codebook_mean = None
+            self.codebook_scale = None
+
+    @staticmethod
+    def _replace_gradient(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return x.detach() + y - y.detach()
+
+    def _lazy_init_params(self, features: torch.Tensor):
+        if self.codebook_raw.numel() != 0:
+            return
+        K = self.codebook_size
+        D = int(features.shape[-1])
+        device, dtype = features.device, features.dtype
+
+        raw = torch.empty((K, D), device=device, dtype=dtype)
+        nn.init.uniform_(raw, a=-0.1, b=0.1)
+        self.codebook_raw = nn.Parameter(raw)
+
+        if self.affine:
+            mean = torch.zeros((1, D), device=device, dtype=dtype)
+            scale = torch.zeros((1, D), device=device, dtype=dtype)
+            self.codebook_mean = nn.Parameter(mean)
+            self.codebook_scale = nn.Parameter(scale)
+
+    def _maybe_psum(self, x: torch.Tensor) -> torch.Tensor:
+        """JAX lax.psum over mapped_axes."""
+        if not self.mapped_axes:
+            return x
+        if dist is None or (not dist.is_available()) or (not dist.is_initialized()):
+            return x
+        y = x.clone()
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+        return y
+
+    def forward(
+        self,
+        features: torch.Tensor,   
+        mask: torch.Tensor,       
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        self._lazy_init_params(features)
+
+        codebook = 10.0 * self.codebook_raw
+
+        if self.affine:
+            codebook_scale = torch.exp(self.codebook_scale)
+            codebook = self.codebook_mean + codebook_scale * codebook
+
+        mask_bool = mask.to(torch.bool)
+        mask_f = mask.to(torch.float32)
+
+        distance = (features[:, None, :] - codebook[None, :, :]).pow(2).sum(dim=-1)
+        distance = torch.where(mask_bool[:, None], distance, torch.full_like(distance, float("inf")))
+
+        assign_fwd = torch.argmin(distance, dim=1)  # (N,)
+        assign_rev = torch.argmin(distance, dim=0)  # (K,)
+
+        features_fwd = codebook[assign_fwd]  # (N, D)
+        features_rev = features[assign_rev]  # (K, D)
+
+        out_features = self._replace_gradient(features_fwd, features)
+
+        total = torch.clamp(mask_f.sum(), min=1.0)
+
+        codebook_loss_per = (features_fwd - features.detach()).pow(2).mean(dim=-1)
+        codebook_loss = torch.where(mask_bool, codebook_loss_per, torch.zeros_like(codebook_loss_per)).sum() / total
+
+        commitment_loss_per = (features_fwd.detach() - features).pow(2).mean(dim=-1)
+        commitment_loss = torch.where(mask_bool, commitment_loss_per, torch.zeros_like(commitment_loss_per)).sum() / total
+        # if we are mapping over one or more axes
+        # sum assignment_count over all of them
+        local_assignment_count = torch.zeros((self.codebook_size,), device=features.device, dtype=torch.float32)
+        local_assignment_count.scatter_add_(0, assign_fwd, mask_f)
+
+        assignment_count = self._maybe_psum(local_assignment_count)
+
+        assignment_mask = local_assignment_count < 1.0 
+
+        unassigned_loss_per = (codebook - features_rev.detach()).pow(2).mean(dim=-1)
+        unassigned_loss_per = unassigned_loss_per * assignment_mask.to(unassigned_loss_per.dtype)
+        unassigned_loss = unassigned_loss_per.sum() / torch.clamp(assignment_mask.to(torch.float32).sum(), min=1.0)
+
+        losses = dict(
+            codebook=codebook_loss,
+            commitment=commitment_loss,
+            unassigned=unassigned_loss,
+            unassigned_percent=(assignment_count > 0).to(torch.float32).mean(),
+        )
+        return out_features, assign_fwd, losses
+
+class FSQ(nn.Module):
+    """Finite scalar quantization module.
+    
+    Not used in the manuscript.
+    """
+
+    def __init__(self, name: Optional[str] = "fsq"):
+        super().__init__()
+        self.downcast = Linear(7, bias=False)
+
+        self.upcast: Optional[Linear] = None
+        self._out_dim: Optional[int] = None
+
+    def _ensure_upcast(self, out_dim: int, device: torch.device, dtype: torch.dtype):
+        if self.upcast is not None:
+            if self._out_dim != out_dim:
+                raise ValueError(f"FSQ initialized with out_dim={self._out_dim}, got out_dim={out_dim}")
+            return
+        self.upcast = Linear(int(out_dim), bias=False).to(device=device, dtype=dtype)
+        self._out_dim = int(out_dim)
+
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        downcast = self.downcast(features)  
+
+        half_l = (3.0 * (1.0 - 1e-3)) / 2.0
+        offset = 0.5
+
+        half_l_t = torch.as_tensor(half_l, device=downcast.device, dtype=downcast.dtype)
+        offset_t = torch.as_tensor(offset, device=downcast.device, dtype=downcast.dtype)
+        shift = torch.tan(offset_t / half_l_t)
+
+        downcast = torch.tanh(downcast + shift) * half_l_t - offset_t
+
+        rounded = torch.round(downcast.detach())
+        rounded = rounded.detach() + (downcast - downcast.detach())  
+
+        D = int(features.shape[-1])
+        self._ensure_upcast(D, device=features.device, dtype=features.dtype)
+
+        upcast = self.upcast(rounded / 2.0) 
+        return upcast, rounded
+
+class VQState(nn.Module):
+    """Vector quantization module with state."""
+
+    def __init__(
+        self,
+        codebook_size: int = 4096,
+        gamma: float = 0.99,
+        mapped_axes: Optional[List[str]] = None,  
+        name: Optional[str] = "vq",
+    ):
+        super().__init__()
+        self.codebook_size = int(codebook_size)
+        self.gamma = float(gamma)
+        self.mapped_axes = list(mapped_axes) if mapped_axes else []
+
+        self.register_buffer("codebook", torch.empty(0), persistent=True)  
+        self.register_buffer("count", torch.empty(0), persistent=True)    
+        self.register_buffer("avg", torch.empty(0), persistent=True)      
+
+    def _maybe_psum_(self, x: torch.Tensor) -> torch.Tensor:
+        """JAX lax.psum analogue over replicas."""
+        if not self.mapped_axes:
+            return x
+        if dist is None or (not dist.is_available()) or (not dist.is_initialized()):
+            return x
+        y = x.clone()
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+        return y
+
+    def _maybe_pmean_(self, x: torch.Tensor) -> torch.Tensor:
+        """JAX lax.pmean analogue over replicas."""
+        if not self.mapped_axes:
+            return x
+        if dist is None or (not dist.is_available()) or (not dist.is_initialized()):
+            return x
+        y = x.clone()
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+        y /= float(dist.get_world_size())
+        return y
+
+    def _lazy_init_state(self, features: torch.Tensor):
+        if self.codebook.numel() != 0:
+            return
+        K = self.codebook_size
+        D = int(features.shape[-1])
+        device = features.device
+        dtype = features.dtype
+
+        self.codebook = torch.randn((K, D), device=device, dtype=dtype)
+        self.count = torch.zeros((K,), device=device, dtype=torch.float32)
+        self.avg = torch.zeros((K,), device=device, dtype=torch.float32)
+
+    @staticmethod
+    def _replace_gradient(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return x.detach() + y - y.detach()
+
+    def forward(
+        self,
+        features: torch.Tensor,         
+        mask: torch.Tensor,             
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        Returns:
+            out_features: (N, D) straight-through output
+            assign_fwd: (N,) indices into codebook
+            losses: dict(commitment=..., unassigned_percent=...)
+            state_update: dict(count=..., avg=..., codebook=...)  (new state)
+        """
+        self._lazy_init_state(features)
+
+        codebook = self.codebook
+        prev_codebook = codebook
+        count = self.count
+        avg = self.avg
+
+        mask_bool = mask.to(torch.bool)
+        mask_f = mask.to(torch.float32)
+
+        distance = (features[:, None, :] - codebook[None, :, :]).pow(2).sum(dim=-1)
+        distance = torch.where(mask_bool[:, None], distance, torch.full_like(distance, float("inf")))
+
+        assign_fwd = torch.argmin(distance, dim=1)  
+        assign_rev = torch.argmin(distance, dim=0)  
+
+        features_fwd = codebook[assign_fwd]         
+        features_rev = features[assign_rev]         
+
+        out_features = self._replace_gradient(features_fwd, features)
+
+        total = torch.clamp(mask_f.sum(), min=1.0)
+
+        codebook_loss_per = (features_fwd - features.detach()).pow(2).mean(dim=-1)
+        codebook_loss = torch.where(mask_bool, codebook_loss_per, torch.zeros_like(codebook_loss_per)).sum() / total
+
+        commitment_loss_per = (features_fwd.detach() - features).pow(2).mean(dim=-1)
+        commitment_loss = torch.where(mask_bool, commitment_loss_per, torch.zeros_like(commitment_loss_per)).sum() / total
+
+        assignment_count = torch.zeros((self.codebook_size,), device=features.device, dtype=torch.float32)
+        assignment_count.scatter_add_(0, assign_fwd, mask_f)
+
+        assignment_count = self._maybe_psum_(assignment_count)
+
+        assignment_mask = assignment_count < 1.0
+
+        gamma = self.gamma
+        count_new = (1.0 - gamma) * assignment_count + gamma * count
+        avg_new = (1.0 - gamma) * (assignment_count / total) + gamma * avg
+
+        alpha = torch.exp(-avg_new * codebook.shape[0] * 10.0 / (1.0 - gamma) - 1e-3)  # (K,)
+
+        accum = torch.zeros_like(codebook)
+        accum.scatter_add_(0, assign_fwd[:, None].expand(-1, codebook.shape[-1]), features)
+        assigned_update = gamma * codebook + (1.0 - gamma) * accum
+        assigned_update = assigned_update / torch.clamp(count_new[:, None], min=1.0)
+
+        unassigned_update = (1.0 - alpha)[:, None] * codebook + alpha[:, None] * features_rev
+
+        codebook_new = torch.where(assignment_mask[:, None], assigned_update, unassigned_update)
+
+        codebook_delta = prev_codebook - codebook_new
+        codebook_delta = self._maybe_pmean_(codebook_delta)
+        codebook_new = prev_codebook + codebook_delta
+
+        losses = dict(
+            commitment=commitment_loss,
+            unassigned_percent=(assignment_count > 0).to(torch.float32).mean(),
+        )
+        state_update = dict(
+            count=count_new,
+            avg=avg_new,
+            codebook=codebook_new,
+        )
+
+        self.count = count_new.detach()
+        self.avg = avg_new.detach()
+        self.codebook = codebook_new.detach()
+
+        return out_features, assign_fwd, losses, state_update
+    
+    
+    
