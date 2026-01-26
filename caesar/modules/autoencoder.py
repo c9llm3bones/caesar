@@ -51,7 +51,7 @@ class StructureAutoencoder(nn.Module):
             data = dict(data)
             
             # convert coordinates, center & add encoded features
-            data.update(prepare_data(data, generator=generator))
+            data.update(prepare_data(data))
 
             # optionally apply noise to the inputs
             if getattr(c, "input_diffusion", False):
@@ -277,7 +277,7 @@ def prepare_data(data):
     )
         
 class StructureDecoderInference(nn.Module):
-    """Wrapper class for StructureDecoder evaluation. (Torch port)"""
+    """Wrapper class for StructureDecoder evaluation."""
 
     def __init__(
         self,
@@ -477,6 +477,111 @@ def assign_state(
         return model(data, generator=generator)
 
     return inner
+
+class StructureDecoder(StructureAutoencoder):
+    """Wrapper class for training a structure autoencoder with a fixed encoder.
+    
+    Not used in the manuscript.
+    """
+
+    def __init__(
+        self,
+        config,
+        prepare_data_fn: Callable[..., Dict[str, Any]],
+        *,
+        device: Optional[torch.device] = None,
+        strict: bool = True,
+        name: Optional[str] = "structure_decoder",
+    ):
+        super().__init__(config=config)
+        self.config = config
+        self.prepare_data_fn = prepare_data_fn
+
+        self.encoder_apply = assign_state(
+            config,
+            config.param_path,
+            prepare_data_fn=prepare_data_fn,
+            device=device,
+            strict=strict,
+        )
+
+        self.decoder = Decoder(config)
+        if device is not None:
+            self.decoder = self.decoder.to(device)
+
+    def forward(
+        self,
+        data: Dict[str, Any],
+        *,
+        generator: Optional[torch.Generator] = None,
+        running_init: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        c = self.config
+        data = dict(data)
+
+        data.update(self.prepare_data_fn(data) if generator is None else self.prepare_data_fn(data, generator=generator))
+
+        latent, codebook_index = self.encoder_apply(data, generator=generator)
+
+        latent = latent.detach()
+        data["latent"] = latent
+
+        prev = dict(
+            pos=data["pos"],
+            local=torch.zeros(
+                (data["pos"].shape[0], c.local_size),
+                device=data["pos"].device,
+                dtype=torch.float32,
+            ),
+        )
+
+        if not running_init:
+            if getattr(c, "eval", False):
+                count = int(c.num_recycle)
+            else:
+                if generator is None:
+                    count = int(torch.randint(0, 4, (1,), device="cpu").item())
+                else:
+                    count = int(torch.randint(0, 4, (1,), generator=generator, device="cpu").item())
+
+            for _ in range(count):
+                result_i = self.decoder(data, prev)
+                prev = dict(
+                    pos=result_i["pos"].detach(),
+                    local=result_i["local"].detach(),
+                )
+
+        result = self.decoder(data, prev)
+
+        total, losses = self.decoder.loss(data, result)
+
+        out_dict = dict(
+            results=result,
+            losses=losses,
+        )
+        return total, out_dict
+
+    def add_noise(
+        self,
+        latent: torch.Tensor,
+        batch: torch.Tensor,
+        *,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Add noise to latents."""
+        batch = batch.to(torch.long)
+
+        if generator is None:
+            noise_level_table = torch.randn(batch.shape, device=latent.device, dtype=latent.dtype)
+            noise = torch.randn(latent.shape, device=latent.device, dtype=latent.dtype)
+        else:
+            noise_level_table = torch.randn(batch.shape, generator=generator, device=latent.device, dtype=latent.dtype)
+            noise = torch.randn(latent.shape, generator=generator, device=latent.device, dtype=latent.dtype)
+
+        noise_level = noise_level_table[batch]
+        noise_level = torch.exp(noise_level)
+
+        return latent + noise * noise_level[..., None]
 
 class StructureAutoencoderInference(StructureAutoencoder):
     """Wrapper class for autoencoder evaluation."""

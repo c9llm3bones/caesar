@@ -51,7 +51,7 @@ class DecoderBlock(nn.Module):
             self.distogram = QuickDistogram(c)
         elif c.distogram_block == "inner":
             self.distogram = InnerDistogram(c)
-        elif c.distogram_block == "none":
+        elif c.distogram_block == None or c.distogram_block == "none":
             self.distogram = None
         else:
             raise ValueError(f"Unknown distogram_block={c.distogram_block}")
@@ -280,7 +280,7 @@ class Decoder(nn.Module):
         _, local_pos = extract_aa_frames(Vec3Array.from_array(pos))
 
         local_features = [
-            local_pos.to_array().reshape(local_pos.shape[0], -1),
+            local_pos.to_tensor().reshape(local_pos.shape[0], -1),
             distance_rbf(local_pos.norm(), 0.0, 22.0).reshape(local_pos.shape[0], -1),
             latent
         ]
@@ -353,10 +353,10 @@ class Decoder(nn.Module):
         if c.no_fape2:
             # use FAPE instead of FAPE ** 2
             fape_clipped = torch.sqrt(torch.maximum(fape_clipped, 1e-6))
-        fape_traj = fape_clipped.mean(axis=-1)
+        fape_traj = fape_clipped.mean(dim=-1)
         fape_traj = torch.where(mask_neighbours[None], fape_traj, 0)
-        fape_traj = fape_traj.sum(axis=-1) / torch.maximum(mask_neighbours.sum(axis=1)[None], 1)
-        fape_traj = (fape_traj * base_weight).sum(axis=-1)
+        fape_traj = fape_traj.sum(dim=-1) / torch.maximum(mask_neighbours.sum(dim=1)[None], 1)
+        fape_traj = (fape_traj * base_weight).sum(dim=-1)
         losses["fape"] = fape_traj[-1] / 3
         losses["fape_trajectory"] = fape_traj.mean() / 3
         fape_loss = (c.fape_weight * fape_traj[-1] + c.fape_trajectory_weight * fape_traj.mean()) / 3
@@ -369,10 +369,10 @@ class Decoder(nn.Module):
             sup_mask = (sup_neighbours != -1) * mask[:, None] * mask[sup_neighbours]
             dist_gt = (cb_gt[:, None] - cb_gt[sup_neighbours]).norm()
             dist_one_hot = distance_one_hot(dist_gt, 0, 22.0, 16)
-            distogram_nll = -(result["sup_distogram"] * dist_one_hot[None]).sum(axis=-1)
-            distogram_nll = torch.where(sup_mask, distogram_nll, 0).sum(axis=-1)
-            distogram_nll /= torch.maximum(sup_mask.sum(axis=1), 1)
-            distogram_nll = (distogram_nll * base_weight).sum(axis=1)
+            distogram_nll = -(result["sup_distogram"] * dist_one_hot[None]).sum(dim=-1)
+            distogram_nll = torch.where(sup_mask, distogram_nll, 0).sum(dim=-1)
+            distogram_nll /= torch.maximum(sup_mask.sum(dim=1), 1)
+            distogram_nll = (distogram_nll * base_weight).sum(dim=1)
             losses["distogram"] = distogram_nll[-1]
             losses["distogram_trajectory"] = distogram_nll.mean()
             total += 10.0 * distogram_nll[-1] + 5.0 * distogram_nll.mean()
@@ -386,9 +386,9 @@ class Decoder(nn.Module):
             pos_loss = pos_loss_clipped
             if c.unclipped_weight:
                 pos_loss = pos_loss_unclipped * c.unclipped_weight + pos_loss
-            pos_loss = pos_loss.mean(axis=-1)
+            pos_loss = pos_loss.mean(dim=-1)
             pos_loss *= base_weight[None]
-            pos_loss = pos_loss.sum(axis=-1)
+            pos_loss = pos_loss.sum(dim=-1)
             losses["kabsch_rmsd"] = pos_loss[-1] / 3
             losses["kabsch_rmsd_trajectory"] = pos_loss.mean() / 3
             pos_loss = (c.fape_weight * pos_loss[-1] + c.fape_trajectory_weight * pos_loss.mean()) / 3
@@ -405,8 +405,8 @@ class Decoder(nn.Module):
         atom_pos_gt = frames_gt[:, None, None].apply_inverse_to_point(atom_pos_gt[local_neighbours])
         frames, _ = extract_aa_frames(atom_pos)
         atom_pos = frames[:, None, None].apply_inverse_to_point(atom_pos[local_neighbours])
-        local_loss = torch.where(mask_gt, (atom_pos - atom_pos_gt).norm2(), 0).sum(axis=(1, 2))
-        local_loss /= torch.maximum(mask_gt.sum(axis=(1, 2)), 1)
+        local_loss = torch.where(mask_gt, (atom_pos - atom_pos_gt).norm2(), 0).sum(dim=(1, 2))
+        local_loss /= torch.maximum(mask_gt.sum(dim=(1, 2)), 1)
         local_loss = (torch.where(mask, local_loss, 0) * base_weight).sum() / 3
         losses["local"] = local_loss
         total += c.local_weight * local_loss
@@ -421,7 +421,7 @@ class Decoder(nn.Module):
 
         # additional denoising losses (not used in manuscript)
         if (c.input_diffusion or c.latent_diffusion) and c.latent_loss_scale:
-            raw_loss = ((data["clean_latent"] - result["predicted_latent"]) ** 2).mean(axis=-1)
+            raw_loss = ((data["clean_latent"] - result["predicted_latent"]) ** 2).mean(dim=-1)
             if c.vp_diffusion:
                 weighted_loss = (torch.where(mask, raw_loss, 0) * base_weight).sum()
             else:
@@ -478,7 +478,7 @@ class DecoderUpdate(nn.Module):
         c = self.config
 
         _, local_pos = extract_aa_frames(Vec3Array.from_array(pos))
-        local_pos = local_pos.to_tensor() if hasattr(local_pos, "to_tensor") else local_pos.to_array()
+        local_pos = local_pos.to_tensor() if hasattr(local_pos, "to_tensor") else local_pos.to_tensor()
         local_pos = local_pos.reshape(local_pos.shape[0], -1)
 
         local = local + self.pos_mlp(local_pos)
@@ -496,30 +496,24 @@ class DecoderUpdate(nn.Module):
         return result
     
 def get_angle_positions(aa_gt, local, pos):
-    """Construct side chain atom positions from amino acid sequence and features."""
     frames, local_positions = extract_aa_frames(Vec3Array.from_array(pos))
     features = [
         local,
-        local_positions.to_array().reshape(local_positions.shape[0], -1),
-        distance_rbf(local_positions.norm(),
-                     0.0, 10.0, 16).reshape(local_positions.shape[0], -1),
-        torch.nn.one_hot(aa_gt, 21, axis=-1)
+        local_positions.to_tensor().reshape(local_positions.shape[0], -1),
+        distance_rbf(local_positions.norm(), 0.0, 10.0, 16).reshape(local_positions.shape[0], -1),
+        F.one_hot(aa_gt.to(torch.long), num_classes=21).to(local.dtype),
     ]
     raw_angles = MLP(
         local.shape[-1] * 2, 7 * 2, bias=False,
-        activation=torch.nn.gelu, final_init="linear")(
-            torch.cat(features, axis=-1))
+        activation=F.gelu, final_init="linear"
+    )(torch.cat(features, dim=-1))
 
     raw_angles = raw_angles.reshape(-1, 7, 2)
-    angles = raw_angles / torch.sqrt(torch.maximum(
-        (raw_angles ** 2).sum(axis=-1, keepdims=True), 1e-6))
-    angle_pos, _ = single_protein_sidechains(
-        aa_gt, frames, angles)
-    angle_pos = angle_pos.to_array().reshape(-1, 14, 3)
-    angle_pos = torch.cat((
-        pos[..., :4, :],
-        angle_pos[..., 4:, :]
-    ), axis=-2)
+    angles = raw_angles / torch.sqrt(torch.clamp((raw_angles ** 2).sum(dim=-1, keepdim=True), min=1e-6))
+
+    angle_pos, _ = single_protein_sidechains(aa_gt, frames, angles)
+    angle_pos = angle_pos.to_tensor().reshape(-1, 14, 3)
+    angle_pos = torch.cat((pos[..., :4, :], angle_pos[..., 4:, :]), dim=-2)
     return raw_angles, angles, angle_pos
 
 
@@ -939,7 +933,7 @@ class HybridDecoderPairFeatures(nn.Module):
 
         pair = pair + self.p_dist(distance_features(pos_v, neighbours, d_min=0.0, d_max=22.0))
 
-        pos_arr = pos_v.to_tensor() if hasattr(pos_v, "to_tensor") else pos_v.to_array()  # (N, A, 3)
+        pos_arr = pos_v.to_tensor() if hasattr(pos_v, "to_tensor") else pos_v.to_tensor()  # (N, A, 3)
         K = neighbours.shape[1]
 
         local_neighbourhood = torch.cat(
@@ -952,14 +946,14 @@ class HybridDecoderPairFeatures(nn.Module):
 
         center_neighbourhood = local_neighbourhood - pos_arr[:, None, 1, None]
         center_neighbourhood = (Vec3Array.from_array(center_neighbourhood).normalized())
-        center_neighbourhood = center_neighbourhood.to_tensor() if hasattr(center_neighbourhood, "to_tensor") else center_neighbourhood.to_array()
+        center_neighbourhood = center_neighbourhood.to_tensor() if hasattr(center_neighbourhood, "to_tensor") else center_neighbourhood.to_tensor()
 
         local_neighbourhood = local_neighbourhood.reshape(*neighbours.shape, -1)
         center_neighbourhood = center_neighbourhood.reshape(*neighbours.shape, -1)
 
         pair = pair + self.p_neigh(torch.cat((local_neighbourhood, center_neighbourhood), dim=-1))
 
-        dirs = (pos_v[:, None, :, None] - pos_v[neighbours, None, :]).to_array()
+        dirs = (pos_v[:, None, :, None] - pos_v[neighbours, None, :]).to_tensor()
         dirs = dirs.reshape(*neighbours.shape, -1)
         pair = pair + self.p_dirs(dirs)
 
@@ -1035,7 +1029,7 @@ def apply_structure_augmentation(pos, center, translation, rotation):
     # center positions
     pos -= center[:, None]
     # apply transformation
-    pos = rotation[:, None].apply_to_point(Vec3Array.from_array(pos)).to_array()
+    pos = rotation[:, None].apply_to_point(Vec3Array.from_array(pos)).to_tensor()
     pos += translation[:, None]
     return pos
 
@@ -1044,7 +1038,7 @@ def apply_inverse_structure_augmentation(pos, center, translation, rotation):
     # invert translation
     pos -= translation[:, None]
     # invert rotation
-    pos = rotation[:, None].apply_inverse_to_point(Vec3Array.from_array(pos)).to_array()
+    pos = rotation[:, None].apply_inverse_to_point(Vec3Array.from_array(pos)).to_tensor()
     # move to center
     pos += center[:, None]
     return pos
@@ -1392,7 +1386,7 @@ def update_positions(
     local_pos = local_pos + pos_update
 
     pos = frames[..., None].apply_to_point(local_pos)
-    pos = pos.to_tensor() if hasattr(pos, "to_tensor") else pos.to_array()
+    pos = pos.to_tensor() if hasattr(pos, "to_tensor") else pos.to_tensor()
     return pos
 
 

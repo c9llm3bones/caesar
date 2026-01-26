@@ -289,7 +289,6 @@ def rot_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         dim=-2
     )
 
-
 def rot_vec_mul(r: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     """Apply rotation matrix r to vector t: r @ t."""
     x, y, z = torch.unbind(t, dim=-1)
@@ -373,7 +372,6 @@ def extract_aa_relmap(positions: Vec3Array, atom_mask: torch.Tensor):
     relmap = frames[:, None, None].apply_inverse_to_point(positions[None])
     rel_mask = atom_mask[:, None, 1:2] * atom_mask[None, :]
     return relmap, rel_mask
-
 
 def single_protein_sidechains(aatype: torch.Tensor, frames: Rigid3Array, angles: torch.Tensor):
     """Compute side chain atom positions given backbone frames and dihedral angles.
@@ -494,9 +492,6 @@ def dihedral_angle(a, b, c, d):
                          (torch.cross(x, y) * torch.cross(y, z)).sum(dim=-1))
     return result / torch.pi * 180
 
-
-
-
 def batch_pairwise_dist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Pairwise distances between points in a and b.
     
@@ -508,7 +503,6 @@ def batch_pairwise_dist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     diff = a.unsqueeze(2) - b.unsqueeze(1)  # (batch, n, m, 3)
     return torch.sqrt((diff ** 2).sum(-1) + 1e-8)
-
 
 def pairwise_dist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Pairwise distances (non-batched).
@@ -567,7 +561,6 @@ def get_neighbours(count: int):
 
     return inner
 
-
 def get_random_neighbours(count: int):
     """Extracts `count` neighbours with probability 1 / d^3."""
     def inner(pos: Any, item, mask, neighbours=None):
@@ -615,7 +608,6 @@ def distance_rbf(distance, min_distance=0.0, max_distance=22.0, bins=64):
     )
     return torch.exp(-((distance[..., None] - centers) ** 2) / (step ** 2))
 
-
 def distance_one_hot(distance, min_distance=0.0, max_distance=22.0, bins=64):
     """Computes one-hot encoding of continuous inputs.
 
@@ -632,7 +624,6 @@ def distance_one_hot(distance, min_distance=0.0, max_distance=22.0, bins=64):
     centers = min_distance + torch.arange(bins) * step + step / 2
     argmin = torch.argmin(abs(distance[..., None] - centers), dim=-1)
     return torch.nn.functional.one_hot(argmin, bins, dim=-1)
-
 
 def hl_gaussian(data, minimum=0.0, maximum=22.0, bins=64, sigma_ratio=1.0):
     """Computes HL-Gauss multihot encoding of continuous inputs.
@@ -713,11 +704,18 @@ def index_sum(data: torch.Tensor,
         E.g. for values [1, 2, 3, 4, 5] and index [0, 0, 0, 1, 1]
         the result would be [6, 6, 6, 9, 9].
     """
-    data = torch.where(mask, data, 0)
-    result = torch.zeros_like(data).at[index].add(data)
+    N = data.shape[0]
+    index = index.to(dtype=torch.long)
+    # (c) torch.where needs boolean condition; jax allows numeric masks
+    mask_bool = mask if mask.dtype == torch.bool else (mask > 0)
+    mask_b = mask_bool.view(N, *([1] * (data.ndim - 1)))
+    data_masked = torch.where(mask_b, data, torch.zeros_like(data))
+    result = torch.zeros_like(data)
+    result.index_add_(0, index, data_masked)
+    gathered = result.index_select(0, index)  
     if not apply_mask:
-        return result[index]
-    return torch.where(mask, result[index], 0)
+        return gathered
+    return torch.where(mask_b, gathered, torch.zeros_like(gathered))
 
 def index_max(data: torch.Tensor,
               index: torch.Tensor,
@@ -736,12 +734,26 @@ def index_max(data: torch.Tensor,
         E.g. for values [1, 2, 3, 4, 5] and index [0, 0, 0, 1, 1]
         the result would be [3, 3, 3, 5, 5].
     """
-    dmin = data.min()
-    data = torch.where(mask, data, dmin)
-    result = torch.full_like(data, dmin).at[index].max(data)
+    N = data.shape[0]
+    index = index.to(dtype=torch.long)
+    mask_bool = mask if mask.dtype == torch.bool else (mask > 0)
+    mask_b = mask_bool.view(N, *([1] * (data.ndim - 1)))
+    dmin = data.amin()  
+    data_masked = torch.where(mask_b, data, dmin)
+    result = torch.full_like(data, dmin)
+    if hasattr(result, "scatter_reduce_"):
+        idx = index.view(N, *([1] * (data.ndim - 1))).expand_as(data_masked)
+        result.scatter_reduce_(0, idx, data_masked, reduce="amax", include_self=True)
+    else:
+        for i in range(N):
+            j = int(index[i].item())
+            result[j] = torch.maximum(result[j], data_masked[i])
+    gathered = result.index_select(0, index)  
+
     if not apply_mask:
-        return result[index]
-    return torch.where(mask, result[index], dmin)
+        return gathered
+
+    return torch.where(mask_b, gathered, torch.full_like(gathered, dmin))
 
 # Helper functions to broadcast mask and weight to data shape
 def _broadcast_mask_to_data(mask: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
