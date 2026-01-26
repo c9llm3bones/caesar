@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.nn.parameter import UninitializedParameter
 
 @torch.no_grad()
 def _variance_scaling_(w: torch.Tensor, scale=1.0, mode="fan_in", dist="truncated_normal"):
@@ -53,19 +54,30 @@ class Linear(nn.Module):
         self._inited = False
 
     @torch.no_grad()
-    def _maybe_init(self):
-        if self._inited: return
+    def _apply_init(self):
         self.init(self.lin.weight)
         if self.lin.bias is not None:
             nn.init.constant_(self.lin.bias, self.bias_init)
-        self._inited = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.lin(x)         
-        if not self._inited:     # overwrite init once, then recompute
-            self._maybe_init()
-            y = self.lin(x)
+        was_uninitialized = isinstance(self.lin.weight, UninitializedParameter)
+
+        y = self.lin(x) 
+
+        if not self._inited:
+            if was_uninitialized:
+                with torch.no_grad():
+                    self._apply_init()
+                y = self.lin(x)  
+            self._inited = True
+
         return y
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+        self._inited = True
 
 
 class MLP(nn.Module):
