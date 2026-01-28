@@ -26,7 +26,7 @@ config = deepcopy(getattr(config_choices, CONFIG_NAME))
 PDB_PATH = "salad/data/afdb1024/test.cif"
 SEED = 42
 NUM_RECYCLE = 0
-
+DEBUG = False
 config.eval = True
 config.num_recycle = NUM_RECYCLE
 
@@ -99,10 +99,40 @@ def load_pdb(pdb_path):
     atom_pos_14, atom_mask_14 = atom37_to_atom14(
         aatype, Vec3Array.from_array(atom_pos_37), atom_mask_37
     )
+    atom_pos_14_arr = np.array(atom_pos_14.to_array(), dtype=np.float32)  
+    atom_mask_14_arr = np.array(atom_mask_14, dtype=np.float32)           
+
+    N_pos  = atom_pos_14_arr[:, 0, :]
+    CA_pos = atom_pos_14_arr[:, 1, :]
+    C_pos  = atom_pos_14_arr[:, 2, :]
+    O_pos  = atom_pos_14_arr[:, 3, :]
+    CB_pos = atom_pos_14_arr[:, 4, :]
+
+    CA_mask = atom_mask_14_arr[:, 1].astype(np.float32)  
+    CB_mask = atom_mask_14_arr[:, 4].astype(np.float32)
+
+    CB_pos_fixed = np.where(CB_mask[:, None] > 0.0, CB_pos, CA_pos)
+
+    pos_gt = np.stack([N_pos, CA_pos, C_pos, O_pos, CB_pos_fixed], axis=1).astype(np.float32)
+
+    mask = (CA_mask > 0.0).astype(np.float32)
+
+    cb = pos_gt[:, 4, :]  
+    diff = cb[:, None, :] - cb[None, :, :]
+    dmap = np.sqrt((diff * diff).sum(axis=-1)).astype(np.float32)
+
+    pos = pos_gt.copy()
+    latent_size = int(getattr(config, "latent_size", 20))
     
     data = {
-        "all_atom_positions": np.array(atom_pos_14.to_array()),
-        "all_atom_mask": np.array(atom_mask_14),
+        "all_atom_positions": atom_pos_14_arr,        
+        "all_atom_mask": atom_mask_14_arr,            
+        "atom_pos": atom_pos_14_arr,   
+        "atom_mask": atom_mask_14_arr, 
+        "mask": mask,                           
+        "pos_gt": pos_gt,                       
+        "pos": pos,                             
+        "dmap": dmap,  
         "aa_gt": aatype,
         "residue_index": residue_index,
         "chain_index": chain_index,
@@ -114,7 +144,11 @@ def load_pdb(pdb_path):
         "dssp": np.zeros(num_aa, dtype=np.int32), 
         "latent": np.zeros(20, dtype=np.float32), 
     }
-    
+    if DEBUG:
+        print(data['all_atom_positions'].shape)
+        print(data['all_atom_mask'].shape)
+        print(data['aa_gt'])
+        print(data['aa_gt'].shape)
     return data, num_aa
 
 import os
@@ -135,7 +169,7 @@ except Exception as e:
     data = None
     
     
-OUT = "tests/data/test_structure.npz"
+OUT = "tests/data/test_structure_extended.npz"
 
 np.savez(
     OUT,
