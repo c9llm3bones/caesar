@@ -33,7 +33,7 @@ class StructureAutoencoder(nn.Module):
         self.quantize = None
         if getattr(c, "codebook_size", 0):
             vq_cls = VQState if getattr(c, "state", False) else VQ
-            # mapped_axes is Haiku-specific; ignored here
+            # (c) mapped_axes is Haiku-specific; ignored here
             self.quantize = vq_cls(c.codebook_size, c.affine)
             
         # or FSQ (not used in the manuscript)
@@ -104,13 +104,13 @@ class StructureAutoencoder(nn.Module):
                     count = int(torch.randint(0, 4, (), device=latent.device, generator=generator).item())
 
                 for _ in range(count):
-                    result_i = self.decoder(data, prev)
+                    result_i = self.decoder(data, prev, generator=generator)
                     prev = {
                         "pos": result_i["pos"].detach(),
                         "local": result_i["local"].detach(),
                     }
 
-            result = self.decoder(data, prev)
+            result = self.decoder(data, prev, generator=generator)
 
             if getattr(c, "codebook_size", 0):
                 result["codebook_losses"] = codebook_losses
@@ -327,13 +327,13 @@ class StructureDecoderInference(nn.Module):
 
         count = int(c.num_recycle)
         for _ in range(count):
-            result_i = self.decoder(data, prev)
+            result_i = self.decoder(data, prev, generator=generator)
             prev = {
                 "pos": result_i["pos"].detach(),
                 "local": result_i["local"].detach(),
             }
 
-        result = self.decoder(data, prev)
+        result = self.decoder(data, prev, generator=generator)
 
         mask = data["mask"].to(torch.bool)
         aa_gt = data["aa_gt"].to(torch.long)
@@ -545,13 +545,13 @@ class StructureDecoder(StructureAutoencoder):
                     count = int(torch.randint(0, 4, (1,), generator=generator, device="cpu").item())
 
             for _ in range(count):
-                result_i = self.decoder(data, prev)
+                result_i = self.decoder(data, prev, generator=generator)
                 prev = dict(
                     pos=result_i["pos"].detach(),
                     local=result_i["local"].detach(),
                 )
 
-        result = self.decoder(data, prev)
+        result = self.decoder(data, prev, generator=generator)
 
         total, losses = self.decoder.loss(data, result)
 
@@ -644,13 +644,13 @@ class StructureAutoencoderInference(StructureAutoencoder):
 
         count = int(c.num_recycle)
         for _ in range(count):
-            result_i = self.decoder(data, prev)
+            result_i = self.decoder(data, prev, generator=generator)
             prev = {
                 "pos": result_i["pos"].detach(),
                 "local": result_i["local"].detach(),
             }
 
-        result = self.decoder(data, prev)
+        result = self.decoder(data, prev, generator=generator)
 
         mask = data["mask"].to(torch.bool)
 

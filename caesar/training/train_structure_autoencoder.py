@@ -5,8 +5,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 from pathlib import Path
 import torch
+from torch.nn.parameter import UninitializedParameter
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+
+DEBUG = True
 
 def cast_float(batch: Dict[str, Any], dtype: torch.dtype = torch.float32) -> Dict[str, Any]:
     """Like flexloop.loop.cast_float: cast only floating tensors."""
@@ -86,6 +89,7 @@ def rebatch_call(
         out_last: Dict[str, Any] = {}
 
         for i in range(rebatch):
+            generator, micro_gen = split_generator(generator) if generator is not None else (None, None)
             sl = slice(i * m, (i + 1) * m)
             micro = {}
             for k, v in data.items():
@@ -94,7 +98,7 @@ def rebatch_call(
                 else:
                     micro[k] = v
 
-            loss_i, out_i = fn(micro, generator)
+            loss_i, out_i = fn(micro, micro_gen)
             out_last = out_i
 
             loss_sum = loss_i if loss_sum is None else (loss_sum + loss_i)
@@ -260,6 +264,14 @@ def make_training_inner(
 ):
     accumulate = int(accumulate)
     clip = float(clip)
+    if DEBUG:
+        bad = []
+        for k, v in model.state_dict().items():
+            if isinstance(v, UninitializedParameter):
+                bad.append(k)
+
+        print("Uninitialized params:", bad)
+        assert len(bad) == 0, "Found uninitialized params; run a forward that touches them before EMA."
     ema_weight = float(ema_weight)
 
     ema = EMA(model, decay=ema_weight) if ema_weight is not None else None
@@ -310,7 +322,8 @@ def make_training_inner(
         log_sum: Dict[str, torch.Tensor] = {}
         loss_sum = 0.0
         for ch in chunks:
-            loss, logs = step_fn(ch, subkey)
+            subkey, ch_key = split_generator(subkey) # (c) gen for each chunk
+            loss, logs = step_fn(ch, ch_key)
             (loss / float(len(chunks))).backward()
             loss_sum = loss_sum + loss.detach()
             for k, v in logs.items():
@@ -424,7 +437,7 @@ if __name__ == "__main__":
     opt = parse_options(
         "train a distance-to-structure decoder on PDB.",
         path="network/",
-        config="default",
+        config="small_inner",
         data_path="",
         num_aa=1024,
         p_complex=0.5,
@@ -554,7 +567,7 @@ if __name__ == "__main__":
     total_steps = int(opt.warmup_steps + opt.decay_steps + 1)
 
     print("Initializing optimizer state...")
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(opt.lr),
         betas=(float(opt.b1), float(opt.b2)),

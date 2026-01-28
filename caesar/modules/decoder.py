@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import Callable, Optional, Tuple
-from caesar.utils.geometry import Vec3Array, Rot3Array
+from caesar.utils.geometry import Vec3Array, Rot3Array, Rigid3Array
 
 from caesar.modules.encoder import (
     EncoderUpdate, 
@@ -17,16 +17,14 @@ from caesar.modules.encoder import (
 from caesar.modules.utils.geometry import (
     distance_one_hot, get_spatial_neighbours, index_align,
     sequence_relative_position, extract_neighbours,
-    get_neighbours)
-from caesar.modules.basic import Linear, MLP, init_zeros, init_linear
-
-from caesar.modules.utils import (
-    distance_rbf, 
+    get_neighbours, distance_rbf, 
     index_mean, 
     get_random_neighbours, 
     index_sum,
-    single_protein_sidechains
-)
+    single_protein_sidechains)
+
+from caesar.modules.basic import Linear, MLP, init_zeros, init_linear
+
 from caesar.modules.geometric import (
     SparseStructureAttention, SparseAttention, SparseSemiEquivariantPointAttention,
     direction_features,
@@ -39,6 +37,15 @@ from caesar.modules.geometric import (
 from caesar.utils.loss import violation_loss
 from caesar.utils.all_atom_multimer import get_atom14_mask
 
+DEBUG = True
+
+def stop_gradient(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach()
+    if hasattr(x, "map_tensor_fn"):
+        return x.map_tensor_fn(lambda t: t.detach())
+    raise TypeError(f"stop_gradient: unsupported type {type(x)}")
+    
 class DecoderBlock(nn.Module):
     """Standard equivariant decoder block."""
 
@@ -87,7 +94,8 @@ class DecoderBlock(nn.Module):
         batch: torch.Tensor,                    # (N,)
         mask: torch.Tensor,                     # (N,)
         sup_neighbours: Optional[torch.Tensor] = None,  # (N, Ksup)
-        pos_gt: Optional[torch.Tensor] = None,          # (N, A, 3) 
+        pos_gt: Optional[torch.Tensor] = None,  
+        generator: Optional[torch.Generator] = None,  # (N, A, 3) 
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         c = self.config
         N = features.shape[0]
@@ -120,6 +128,7 @@ class DecoderBlock(nn.Module):
             dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask)
         else:
             distogram_logits = torch.zeros((1,), dtype=torch.float32, device=features.device)
+            dmap = None
 
         current_neighbours = self.current_neigh(
             Vec3Array.from_array(pos), resi, chain, batch, mask
@@ -193,8 +202,8 @@ class Decoder(nn.Module):
                 activation=F.gelu,
                 final_init=init_zeros(),
             )
-
-    def forward(self, data, prev):
+            
+    def forward(self, data, prev, generator=None):
         c = self.config
 
         local, pos, resi, chain, batch, mask = self.prepare_features(data, prev)
@@ -205,7 +214,8 @@ class Decoder(nn.Module):
         )
 
         local, pos, trajectory, sup_distogram = self.decoder_stack(
-            local, pos, resi, chain, batch, mask, sup_neighbours
+            local, pos, resi, chain, batch, mask, sup_neighbours, 
+            generator=generator
         )
 
         result = {
@@ -256,7 +266,7 @@ class Decoder(nn.Module):
         })
 
         return result
-
+    
     def init_prev(self, data):
         c = self.config
         return {
@@ -306,146 +316,210 @@ class Decoder(nn.Module):
         local = nn.LayerNorm(local.shape[-1]).to(local.device)(local)
 
         return local, pos, resi, chain, batch, mask
-
+    
     def loss(self, data, result):
+        """Compute Decoder losses from the input data and Decoder results."""
         c = self.config
+
         resi = data["residue_index"]
         chain = data["chain_index"]
-        mask = data["mask"]
         batch = data["batch_index"]
+        mask = data["mask"]  
+        mask_bool = mask.bool()
+        mask_f = mask.to(dtype=torch.float32)
 
         losses = {}
-        total = 0.0
+        total = torch.zeros((), device=mask.device, dtype=torch.float32)
 
-        # AA NLL
-        aa_mask = mask * (data["aa_gt"] != 20)
-        aa_nll = -(result["aa"] * F.one_hot(data["aa_gt"], 20)).sum(dim=-1)
-        aa_nll = torch.where(aa_mask, aa_nll, torch.zeros_like(aa_nll))
-        aa_nll = aa_nll.sum() / torch.clamp(aa_mask.sum(), min=1)
-
+        # AA NLL loss
+        aa_gt = data["aa_gt"]
+        aa_predict_mask = mask * (aa_gt != 20)
+       
+        aa_logp = result["aa"] 
+        
+        aa_gt_long = aa_gt.to(torch.long)
+        # (c) jax-equivalent one-hot semantics
+        valid = (aa_gt_long >= 0) & (aa_gt_long < 20)
+        aa_one_hot = F.one_hot(aa_gt_long.clamp(0, 19), num_classes=20).to(aa_logp.dtype)
+        aa_one_hot = aa_one_hot * valid.unsqueeze(-1).to(aa_one_hot.dtype)
+     
+        aa_nll = -(aa_logp * aa_one_hot).sum(dim=-1)
+        aa_nll = torch.where(aa_predict_mask.to(torch.bool), aa_nll, torch.zeros_like(aa_nll))
+        aa_nll = aa_nll.sum() / torch.clamp(aa_predict_mask.to(torch.float32).sum(), min=1.0)
         losses["aa"] = aa_nll
-        total += c.aa_weight * aa_nll
+        total = total + float(c.aa_weight) * aa_nll
 
         # position losses
-        base_weight = mask / torch.maximum(index_sum(mask.astype(torch.float32), batch, mask), 1) / (batch.max() + 1)
-
+        base_weight = mask / torch.clamp(index_sum(mask.to(torch.float32), batch, mask), min=1.0) / (batch.max() + 1)
+        
         # sparse neighbour FAPE ** 2
-        pair_mask = batch[:, None] == batch[None, :]
-        pair_mask *= mask[:, None] * mask[None, :]
+        pair_mask = (batch[:, None] == batch[None, :])
+        pair_mask = pair_mask * (mask[:, None] * mask[None, :])
+
         pos_gt = data["pos_gt"]
-        pos_gt = torch.where(mask[:, None, None], pos_gt, 0)
+        pos_gt = torch.where(mask[:, None, None].to(torch.bool), pos_gt, torch.zeros_like(pos_gt))
         pos_gt = Vec3Array.from_array(pos_gt)
-        frames_gt, _ = extract_aa_frames(torch.lax.stop_gradient(pos_gt))
-        # CB distance
+
+        frames_gt, _ = extract_aa_frames(stop_gradient(pos_gt))
+
+        # CB distance 
         distance = data["dmap"]
-        distance = torch.where(pair_mask, distance, torch.inf)
+        distance = torch.where(pair_mask.to(torch.bool), distance, torch.full_like(distance, float("inf")))
         # get random neighbours to compute sparse FAPE on
         neighbours = get_random_neighbours(c.fape_neighbours)(distance, batch, mask)
         mask_neighbours = (neighbours != -1) * mask[:, None] * mask[neighbours]
         pos_gt_local = frames_gt[:, None, None].apply_inverse_to_point(pos_gt[neighbours])
-        traj = Vec3Array.from_array(result["trajectory"])
-        frames, _ = torch.vmap(extract_aa_frames)(traj)
-        traj_local = frames[:, :, None, None].apply_inverse_to_point(traj[:, neighbours])
-        fape_base = (traj_local - pos_gt_local).norm2()
-        fape_clipped = torch.clip(fape_base, 0.0, c.clip_fape)
-        if c.unclipped_weight:
-            fape_clipped = fape_base * c.unclipped_weight + fape_clipped
-        if c.no_fape2:
-            # use FAPE instead of FAPE ** 2
-            fape_clipped = torch.sqrt(torch.maximum(fape_clipped, 1e-6))
-        fape_traj = fape_clipped.mean(dim=-1)
-        fape_traj = torch.where(mask_neighbours[None], fape_traj, 0)
-        fape_traj = fape_traj.sum(dim=-1) / torch.maximum(mask_neighbours.sum(dim=1)[None], 1)
-        fape_traj = (fape_traj * base_weight).sum(dim=-1)
-        losses["fape"] = fape_traj[-1] / 3
-        losses["fape_trajectory"] = fape_traj.mean() / 3
-        fape_loss = (c.fape_weight * fape_traj[-1] + c.fape_trajectory_weight * fape_traj.mean()) / 3
-        total += fape_loss
+        
+        traj = result["trajectory"]  # tensor, (T, N, A, 3)
+        T = traj.shape[0]
 
+        fape_base_list = []
+        # (c) torch equivalent for jax.vmap
+        for t in range(T):
+            traj_t = Vec3Array.from_array(traj[t])      # (N, A, 3)
+            frames_t, _ = extract_aa_frames(traj_t)            # (N,) Rigid3Array
+            traj_local_t = frames_t[:, None, None].apply_inverse_to_point(traj_t[neighbours])  # (N, K, A)
+
+            fape_base_t = (traj_local_t - pos_gt_local).norm2()  # (N, K)
+            fape_base_list.append(fape_base_t)
+        fape_base = torch.stack(fape_base_list, dim=0)  # (T, N, K)
+
+        fape_clipped = torch.clamp(fape_base, 0.0, float(c.clip_fape))
+
+        if getattr(c, "unclipped_weight", 0):
+            fape_clipped = fape_base * float(c.unclipped_weight) + fape_clipped
+
+        if getattr(c, "no_fape2", False):
+            # use FAPE instead of FAPE ** 2
+            fape_clipped = torch.sqrt(torch.clamp(fape_clipped, min=1e-6))
+
+        fape_traj = fape_clipped.mean(dim=-1)  # [T,N,K] 
+        fape_traj = torch.where(
+            mask_neighbours[None].to(torch.bool),
+            fape_traj,
+            torch.zeros_like(fape_traj),
+        )
+
+        fape_traj = fape_traj.sum(dim=-1) / torch.clamp(mask_neighbours.sum(dim=1)[None], min=1.0)
+        fape_traj = (fape_traj * base_weight).sum(dim=-1)
+        losses["fape"] = fape_traj[-1] / 3.0
+        losses["fape_trajectory"] = fape_traj.mean() / 3.0
+        fape_loss = (float(c.fape_weight) * fape_traj[-1] + float(c.fape_trajectory_weight) * fape_traj.mean()) / 3.0
+        total = total + fape_loss
+       
         # sup distogram loss
-        if c.distogram_block != "none":
-            cb_gt = pos_gt[:, -1]
+        if getattr(c, "distogram_block", None) not in (None, "none"):
+            cb_gt = pos_gt[:, -1]  
             sup_neighbours = result["sup_neighbours"]
             sup_mask = (sup_neighbours != -1) * mask[:, None] * mask[sup_neighbours]
             dist_gt = (cb_gt[:, None] - cb_gt[sup_neighbours]).norm()
-            dist_one_hot = distance_one_hot(dist_gt, 0, 22.0, 16)
+            dist_one_hot = distance_one_hot(dist_gt, 0.0, 22.0, 16)
             distogram_nll = -(result["sup_distogram"] * dist_one_hot[None]).sum(dim=-1)
-            distogram_nll = torch.where(sup_mask, distogram_nll, 0).sum(dim=-1)
-            distogram_nll /= torch.maximum(sup_mask.sum(dim=1), 1)
+            distogram_nll = torch.where(sup_mask.to(torch.bool), distogram_nll, torch.zeros_like(distogram_nll)).sum(dim=-1)
+            distogram_nll = distogram_nll / torch.clamp(sup_mask.sum(dim=1), min=1.0)
             distogram_nll = (distogram_nll * base_weight).sum(dim=1)
             losses["distogram"] = distogram_nll[-1]
             losses["distogram_trajectory"] = distogram_nll.mean()
-            total += 10.0 * distogram_nll[-1] + 5.0 * distogram_nll.mean()
-
+            total = total + 10.0 * distogram_nll[-1] + 5.0 * distogram_nll.mean()
+            if DEBUG:
+                print("kabsch_rmsd loss:", distogram_nll[-1].item())
+ 
         # Kabsch RMSD loss
-        if c.kabsch_rmsd:
+        if getattr(c, "kabsch_rmsd", False):
+            traj = Vec3Array.from_array(result["trajectory"])
             last = traj[-1]
-            pos_gt = torch.lax.stop_gradient(index_align(pos_gt, last, batch, mask))
+            pos_gt = stop_gradient(index_align(pos_gt, last, batch, mask))
             pos_loss_unclipped = (pos_gt[None] - traj).norm2()
-            pos_loss_clipped = torch.clip(pos_loss_unclipped, 0, 100.0)
+            pos_loss_clipped = torch.clamp(pos_loss_unclipped, 0.0, 100.0)
             pos_loss = pos_loss_clipped
             if c.unclipped_weight:
-                pos_loss = pos_loss_unclipped * c.unclipped_weight + pos_loss
+                pos_loss = pos_loss_unclipped * float(c.unclipped_weight) + pos_loss
             pos_loss = pos_loss.mean(dim=-1)
-            pos_loss *= base_weight[None]
+            pos_loss = pos_loss * base_weight[None]
             pos_loss = pos_loss.sum(dim=-1)
-            losses["kabsch_rmsd"] = pos_loss[-1] / 3
-            losses["kabsch_rmsd_trajectory"] = pos_loss.mean() / 3
-            pos_loss = (c.fape_weight * pos_loss[-1] + c.fape_trajectory_weight * pos_loss.mean()) / 3
-            total += pos_loss
+            losses["kabsch_rmsd"] = pos_loss[-1] / 3.0
+            losses["kabsch_rmsd_trajectory"] = pos_loss.mean() / 3.0
+            pos_loss = (float(c.fape_weight) * pos_loss[-1] + float(c.fape_trajectory_weight) * pos_loss.mean()) / 3.0
+            total = total + pos_loss
+            if DEBUG:
+                print("kabsch_rmsd loss:", pos_loss.item())
 
         # local loss
         atom_pos = Vec3Array.from_array(result["atom_pos"])
         atom_pos_gt = Vec3Array.from_array(data["atom_pos"])
-        local_neighbours = get_spatial_neighbours(
-            count=c.local_neighbours)(
-                pos_gt[:, -1], batch, mask)
+
+        local_neighbours = get_spatial_neighbours(count=c.local_neighbours)(
+            pos_gt[:, -1], batch, mask
+        )
+
         mask_gt = data["atom_mask"][local_neighbours]
+
         frames_gt, _ = extract_aa_frames(atom_pos_gt)
         atom_pos_gt = frames_gt[:, None, None].apply_inverse_to_point(atom_pos_gt[local_neighbours])
+
         frames, _ = extract_aa_frames(atom_pos)
         atom_pos = frames[:, None, None].apply_inverse_to_point(atom_pos[local_neighbours])
-        local_loss = torch.where(mask_gt, (atom_pos - atom_pos_gt).norm2(), 0).sum(dim=(1, 2))
-        local_loss /= torch.maximum(mask_gt.sum(dim=(1, 2)), 1)
-        local_loss = (torch.where(mask, local_loss, 0) * base_weight).sum() / 3
+
+        local_loss = torch.where(
+            mask_gt.to(torch.bool),
+            (atom_pos - atom_pos_gt).norm2(),
+            torch.zeros_like((atom_pos - atom_pos_gt).norm2()),
+        ).sum(dim=(1, 2))
+
+        local_loss = local_loss / torch.clamp(mask_gt.sum(dim=(1, 2)), min=1)
+
+        local_loss = (torch.where(mask.to(torch.bool), local_loss, torch.zeros_like(local_loss)) * base_weight).sum() / 3.0
+
         losses["local"] = local_loss
-        total += c.local_weight * local_loss
+        total = total + float(c.local_weight) * local_loss
 
         # VQ losses
-        if c.codebook_size and not c.is_decoder:
+        if getattr(c, "codebook_size", 0) and (not getattr(c, "is_decoder", False)):
             cl = result["codebook_losses"]
             losses.update(cl)
-            if not c.state:
-                total += c.codebook_loss_scale * (cl["codebook"] + cl["unassigned"])
-            total += c.codebook_loss_scale * c.codebook_b * cl["commitment"]
-
+            if not getattr(c, "state", False):
+                total = total + float(c.codebook_loss_scale) * (cl["codebook"] + cl["unassigned"])
+            total = total + float(c.codebook_loss_scale) * float(c.codebook_b) * cl["commitment"]
+            if DEBUG:
+                print("codebook loss:", (cl["codebook"] + cl["unassigned"]).item())
+                print("commitment loss:", cl["commitment"].item())
+                
         # additional denoising losses (not used in manuscript)
-        if (c.input_diffusion or c.latent_diffusion) and c.latent_loss_scale:
-            raw_loss = ((data["clean_latent"] - result["predicted_latent"]) ** 2).mean(dim=-1)
-            if c.vp_diffusion:
-                weighted_loss = (torch.where(mask, raw_loss, 0) * base_weight).sum()
+        if (getattr(c, "input_diffusion", False) or getattr(c, "latent_diffusion", False)) and getattr(c, "latent_loss_scale", 0):
+            raw_loss = ((data["clean_latent"] - result["predicted_latent"]) ** 2).mean(dim=-1)  # [N]
+            if getattr(c, "vp_diffusion", False):
+                weighted_loss = (torch.where(mask_bool, raw_loss, torch.zeros_like(raw_loss)) * base_weight).sum()
             else:
-                time = torch.maximum(data["time"], 1e-2)
-                raw_loss = raw_loss * (1 + time ** 2) / torch.maximum(time ** 2, 1e-6)
-                weighted_loss = (torch.where(mask, raw_loss, 0) * base_weight).sum()
+                time = torch.clamp(data["time"], min=1e-2)
+                raw_loss = raw_loss * (1.0 + time ** 2) / torch.clamp(time ** 2, min=1e-6)
+                weighted_loss = (torch.where(mask_bool, raw_loss, torch.zeros_like(raw_loss)) * base_weight).sum()
+
             losses["latent"] = weighted_loss
-            total += c.latent_loss_scale * weighted_loss
+            total = total + float(c.latent_loss_scale) * weighted_loss
+            if DEBUG:
+                print("latent loss:", weighted_loss.item())
+
         # AlphaFold violation loss. (not used in manuscript)
-        if c.violation_scale:
-            res_mask = data["mask"]
-            pred_mask = get_atom14_mask(data["aa_gt"]) * res_mask[:, None]
-            violation, _ = violation_loss(data["aa_gt"],
-                                          data["residue_index"],
-                                          result["atom_pos"],
-                                          pred_mask,
-                                          res_mask,
-                                          clash_overlap_tolerance=1.5,
-                                          violation_tolerance_factor=2.0,
-                                          chain_index=data["chain_index"],
-                                          batch_index=data["batch_index"],
-                                          per_residue=False)
+        if getattr(c, "violation_scale", 0):
+            res_mask = data["mask"].bool()
+            pred_mask = get_atom14_mask(data["aa_gt"]).to(res_mask.device).to(torch.float32) * res_mask[:, None].to(torch.float32)
+
+            violation, _ = violation_loss(
+                data["aa_gt"],
+                data["residue_index"],
+                result["atom_pos"],
+                pred_mask,
+                res_mask,
+                clash_overlap_tolerance=1.5,
+                violation_tolerance_factor=2.0,
+                chain_index=data["chain_index"],
+                batch_index=data["batch_index"],
+                per_residue=False,
+            )
             losses["violation"] = violation.mean()
-            total += c.violation_scale * violation.mean()
+            total = total + float(c.violation_scale) * violation.mean()
+            if DEBUG:
+                print("violation loss:", violation.mean().item())
 
         return total, losses
 
@@ -515,7 +589,6 @@ def get_angle_positions(aa_gt, local, pos):
     angle_pos = angle_pos.to_tensor().reshape(-1, 14, 3)
     angle_pos = torch.cat((pos[..., :4, :], angle_pos[..., 4:, :]), dim=-2)
     return raw_angles, angles, angle_pos
-
 
 class AADecoderBlock(nn.Module):
     """Amino acid sequence decoder block."""
@@ -639,7 +712,7 @@ class DecoderStack(nn.Module):
             block_cls(config) for _ in range(config.depth)
         ])
 
-    def forward(self, local, pos, resi, chain, batch, mask, sup_neighbours):
+    def forward(self, local, pos, resi, chain, batch, mask, sup_neighbours, generator=None):
         trajectory = []
         sup_distograms = []
 
@@ -682,8 +755,8 @@ class SemiEquivariantDecoderBlock(nn.Module):
         self.pair_feat_main = HybridDecoderPairFeatures(c, center_features=False)
         self.pair_feat_dist = HybridDecoderPairFeatures(c, center_features=False) if self.has_dist else None
 
-        self.attn_main = SparseSemiEquivariantPointAttention(c.key_size, c.heads)
-        self.attn_dist = SparseSemiEquivariantPointAttention(c.key_size, c.heads) if self.has_dist else None
+        self.attn_main = SparseSemiEquivariantPointAttention(config=c, size=c.key_size, heads=c.heads)
+        self.attn_dist = SparseSemiEquivariantPointAttention(config=c, size=c.key_size, heads=c.heads) if self.has_dist else None
 
         self.update = NonEquivariantDecoderUpdate(c)
 
@@ -797,12 +870,12 @@ class SemiEquivariantDecoderStack(nn.Module):
 
     def forward(self, local, pos,
                 resi, chain, batch, mask,
-                sup_neighbours):
+                sup_neighbours, generator=None):
         c = self.config
 
         # apply data augmentation when training non-equivariant Decoders
         pos = structure_augmentation(
-            pos / c.sigma_data, batch, mask
+            pos / c.sigma_data, batch, mask, generator=generator
         ) * c.sigma_data
 
         trajectory = []
@@ -839,16 +912,16 @@ class NonEquivariantDecoderStack(nn.Module):
             bias=False
         )
 
-        self.pos_proj = nn.Linear(5 * 3, 5 * 3, bias=False)
-        self.norm = nn.LayerNorm(5 * 3)
+        self.pos_proj = nn.Linear(config.local_size, 5 * 3, bias=False)
+        self.norm = nn.LayerNorm(config.local_size)
 
     def forward(self, local, pos,
                 resi, chain, batch, mask,
-                sup_neighbours):
+                sup_neighbours, generator=None):
         c = self.config
 
         aug_pos = structure_augmentation(
-            pos / c.sigma_data, batch, mask
+            pos / c.sigma_data, batch, mask, generator=generator
         )
 
         localpos = torch.cat(
@@ -1014,52 +1087,54 @@ class NonequivariantDecoderPairFeatures(nn.Module):
         pair = self.mlp(pair)
         return pair, pair_mask
     
-def structure_augmentation_params(pos, batch, mask):
+def structure_augmentation_params(pos, batch, mask, generator=None):
     """Sample random rotation and translation parameters for data augmentation."""
     # center positions
-    center = index_mean(pos[:, 1], batch, mask[:, None])
+    batch_l = batch.to(torch.long)
+    center = index_mean(pos[:, 1], batch_l, mask[:, None])
     # centering + random translation
-    translation = torch.rnd.normal(torch.next_rng_key(), pos[:, 1].shape)[batch]
+    noise = torch.randn((batch.shape[0], 3), device=pos.device, dtype=pos.dtype, generator=generator)
+    translation = noise[batch_l]
     # random rotation
-    rotation = random_rotation(batch)
+    rotation = random_rotation(batch, device=pos.device, dtype=pos.dtype, generator=generator)
     return center, translation, rotation
 
 def apply_structure_augmentation(pos, center, translation, rotation):
     """Apply a rotation and translation to an array of atom positions."""
     # center positions
-    pos -= center[:, None]
+    pos = pos - center[:, None]
     # apply transformation
     pos = rotation[:, None].apply_to_point(Vec3Array.from_array(pos)).to_tensor()
-    pos += translation[:, None]
+    pos = pos + translation[:, None]
     return pos
 
 def apply_inverse_structure_augmentation(pos, center, translation, rotation):
     """Apply the inverse of a rotation and translation to an array of atom positions."""
     # invert translation
-    pos -= translation[:, None]
+    pos = pos - translation[:, None]
     # invert rotation
     pos = rotation[:, None].apply_inverse_to_point(Vec3Array.from_array(pos)).to_tensor()
     # move to center
-    pos += center[:, None]
+    pos = pos + center[:, None]
     return pos
 
-def structure_augmentation(pos, batch, mask):
+def structure_augmentation(pos, batch, mask, generator=None):
     """Randomly rotate and translate an array of atom positions."""
     # get random augmentation parameters
-    center, translation, rotation = structure_augmentation_params(pos, batch, mask)
+    center, translation, rotation = structure_augmentation_params(pos, batch, mask, generator=generator)
     # apply random augmentation
     pos = apply_structure_augmentation(pos, center, translation, rotation)
     return pos
 
-def random_rotation(batch):
+def random_rotation(batch, device=None, dtype=None, generator=None):
     """Sample a random rotation."""
-    x = torch.randn(batch.shape[0], 3)[batch]
-    y = torch.randn(batch.shape[0], 3)[batch]
-    result = Rot3Array.from_two_vectors(
-        Vec3Array.from_array(x),
-        Vec3Array.from_array(y))
-    return result
-
+    batch = batch.long()
+    N = batch.shape[0]
+    x0 = torch.randn((N, 3), device=device, dtype=dtype, generator=generator)
+    y0 = torch.randn((N, 3), device=device, dtype=dtype, generator=generator)
+    x = x0[batch]
+    y = y0[batch]
+    return Rot3Array.from_two_vectors(Vec3Array.from_array(x), Vec3Array.from_array(y))
 
 def extract_dmap_neighbours(count: int = 32):
     """Extract nearest neighbours from a distance map."""
@@ -1091,6 +1166,7 @@ def extract_dmap_neighbours(count: int = 32):
         return get_neighbours(count)(distance2, mask2)
 
     return inner
+
 class DecoderPairFeatures(nn.Module):
     """Pair features for the equivariant Decoder."""
 
@@ -1100,7 +1176,7 @@ class DecoderPairFeatures(nn.Module):
         self.relpos = sequence_relative_position(32, one_hot=True, pseudo_chains=True)
 
         self.p_relpos = Linear(c.pair_size, bias=False, initializer="linear")
-        self.p_dmap   = Linear(c.pair_size, bias=False, initializer="linear")
+        self.p_dmap   = Linear(c.pair_size, bias=False, initializer="linear") if c.distogram_block else None
         self.p_dist   = Linear(c.pair_size, bias=False, initializer="linear")
         self.p_dir    = Linear(c.pair_size, bias=False, initializer="linear")
         self.p_rot    = Linear(c.pair_size, bias=False, initializer="linear")
