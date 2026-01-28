@@ -78,7 +78,7 @@ class DecoderBlock(nn.Module):
         self.attn_dist = SparseStructureAttention(c) if self.distogram is not None else None
 
         self.update = DecoderUpdate(c)
-
+        self.pos_update = UpdatePositions()
         self.current_neigh = extract_neighbours(num_index=16, num_spatial=16, num_random=32)
         self.dmap_neigh = extract_dmap_neighbours(count=32)
 
@@ -162,12 +162,8 @@ class DecoderBlock(nn.Module):
         )
 
         local_norm = self.ln_pos(features)
-        pos = update_positions(
-            pos, local_norm,
-            scale=c.sigma_data,
-            symm=c.symm
-        )
-
+        symm = getattr(c, "symm", None)  
+        pos = self.pos_update(pos, local_norm, scale=float(c.sigma_data), symm=symm)
         return features, pos.to(local_norm.dtype), distogram_logits
     
 class Decoder(nn.Module):
@@ -202,8 +198,22 @@ class Decoder(nn.Module):
                 activation=F.gelu,
                 final_init=init_zeros(),
             )
-            
+        self.prev_local_ln = nn.LayerNorm(c.local_size, elementwise_affine=True)
+
+        self.local_mlp = MLP(
+            size=4 * c.local_size,
+            out_size=c.local_size,
+            bias=False,
+            activation=F.gelu,
+            final_init=init_linear(),
+        )
+
+        self.local_ln = nn.LayerNorm(c.local_size, elementwise_affine=True)
+        self.angle_pos = GetAnglePositions(local_dim=c.local_size)
+        
     def forward(self, data, prev, generator=None):
+        if prev is None:
+            prev = self.init_prev(data)
         c = self.config
 
         local, pos, resi, chain, batch, mask = self.prepare_features(data, prev)
@@ -257,7 +267,7 @@ class Decoder(nn.Module):
         if c.eval:  
             aatype = aa_logits.argmax(dim=-1)
 
-        raw_angles, angles, atom_pos = get_angle_positions(aatype, local, pos)
+        raw_angles, angles, atom_pos = self.angle_pos(aatype, local, pos)
 
         result.update({
             "raw_angles": raw_angles,
@@ -266,15 +276,16 @@ class Decoder(nn.Module):
         })
 
         return result
-    
+
     def init_prev(self, data):
         c = self.config
         return {
             "pos": data["pos"],
             "local": torch.zeros(
                 (data["pos"].shape[0], c.local_size),
-                device=data["pos"].device
-            )
+                device=data["pos"].device,
+                dtype=torch.float32,
+            ),
         }
 
     def prepare_features(self, data, prev):
@@ -299,21 +310,12 @@ class Decoder(nn.Module):
             time = distance_rbf(data["time"], 0, 80.0, bins=200)
             local_features.append(time)
 
-        local_features.append(
-            nn.LayerNorm(prev["local"].shape[-1]).to(prev["local"].device)(prev["local"])
-        )
+        local_features.append(self.prev_local_ln(prev["local"]))
 
         local_features = torch.cat(local_features, dim=-1)
 
-        local = MLP(
-            4 * c.local_size,
-            c.local_size,
-            activation=F.gelu,
-            bias=False,
-            final_init=init_linear()
-        )(local_features)
-
-        local = nn.LayerNorm(local.shape[-1]).to(local.device)(local)
+        local = self.local_mlp(local_features)
+        local = self.local_ln(local)
 
         return local, pos, resi, chain, batch, mask
     
@@ -568,27 +570,45 @@ class DecoderUpdate(nn.Module):
 
         result = self.out(hidden)
         return result
-    
-def get_angle_positions(aa_gt, local, pos):
-    frames, local_positions = extract_aa_frames(Vec3Array.from_array(pos))
-    features = [
-        local,
-        local_positions.to_tensor().reshape(local_positions.shape[0], -1),
-        distance_rbf(local_positions.norm(), 0.0, 10.0, 16).reshape(local_positions.shape[0], -1),
-        F.one_hot(aa_gt.to(torch.long), num_classes=21).to(local.dtype),
-    ]
-    raw_angles = MLP(
-        local.shape[-1] * 2, 7 * 2, bias=False,
-        activation=F.gelu, final_init="linear"
-    )(torch.cat(features, dim=-1))
 
-    raw_angles = raw_angles.reshape(-1, 7, 2)
-    angles = raw_angles / torch.sqrt(torch.clamp((raw_angles ** 2).sum(dim=-1, keepdim=True), min=1e-6))
+class GetAnglePositions(nn.Module):
+    def __init__(self, local_dim):
+        super().__init__()
 
-    angle_pos, _ = single_protein_sidechains(aa_gt, frames, angles)
-    angle_pos = angle_pos.to_tensor().reshape(-1, 14, 3)
-    angle_pos = torch.cat((pos[..., :4, :], angle_pos[..., 4:, :]), dim=-2)
-    return raw_angles, angles, angle_pos
+        self.mlp = MLP(
+            local_dim * 2,
+            7 * 2,
+            bias=False,
+            activation=F.gelu,
+            final_init="linear"
+        )
+
+    def forward(self, aa_gt, local, pos):
+        frames, local_positions = extract_aa_frames(Vec3Array.from_array(pos))
+
+        features = [
+            local,
+            local_positions.to_tensor().reshape(local_positions.shape[0], -1),
+            distance_rbf(
+                local_positions.norm(), 0.0, 10.0, 16
+            ).reshape(local_positions.shape[0], -1),
+            F.one_hot(aa_gt.to(torch.long), num_classes=21).to(local.dtype),
+        ]
+
+        raw_angles = self.mlp(torch.cat(features, dim=-1))
+
+        raw_angles = raw_angles.reshape(-1, 7, 2)
+        angles = raw_angles / torch.sqrt(
+            torch.clamp((raw_angles ** 2).sum(dim=-1, keepdim=True), min=1e-6)
+        )
+
+        angle_pos, _ = single_protein_sidechains(aa_gt, frames, angles)
+        angle_pos = angle_pos.to_tensor().reshape(-1, 14, 3)
+        angle_pos = torch.cat(
+            (pos[..., :4, :], angle_pos[..., 4:, :]), dim=-2
+        )
+
+        return raw_angles, angles, angle_pos
 
 class AADecoderBlock(nn.Module):
     """Amino acid sequence decoder block."""
@@ -798,17 +818,6 @@ class SemiEquivariantDecoderBlock(nn.Module):
             sup_neighbours = sup_neighbours.long()
             idx = torch.arange(N, device=sup_neighbours.device)[:, None]
 
-
-            ### safe -1 processing
-            # if self.strict_minus1_indexing:
-            #    
-            #     distogram_logits = dist_full_logits[idx, sup_neighbours]
-            # else:
-            #     valid = sup_neighbours != -1
-            #     neigh = sup_neighbours.clamp_min(0)
-            #     distogram_logits = dist_full_logits[idx, neigh]
-            #     distogram_logits = distogram_logits.masked_fill(~valid[..., None], 0.0)
-            
             distogram_logits = dist_full_logits[idx, sup_neighbours]
             
             dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask)
@@ -1442,29 +1451,45 @@ class NonEquivariantDecoderUpdate(nn.Module):
         result = self.out(hidden)
         return result
     
-def update_positions(
-    pos: torch.Tensor,
-    local_norm: torch.Tensor,
-    scale: float = 10.0,
-    symm: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-) -> torch.Tensor:
+
+class UpdatePositions(nn.Module):
     """Equivariant position update."""
+    def __init__(self):
+        super().__init__()
+        self.proj: Optional[Linear] = None
+        self._A: Optional[int] = None
 
-    frames, local_pos = extract_aa_frames(Vec3Array.from_array(pos))
-    pos_update = float(scale) * Linear(
-        pos.shape[-2] * 3, initializer="zeros", bias=False
-    )(local_norm)
+    def forward(
+        self,
+        pos: torch.Tensor,  
+        local_norm: torch.Tensor, 
+        *,
+        scale: float = 10.0,
+        symm: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        A = int(pos.shape[-2])
 
-    if symm is not None:
-        pos_update = symm(pos_update)
+        if self.proj is None:
+            self._A = A
+            self.proj = Linear(A * 3, initializer="zeros", bias=False)
+        else:
+            if self._A != A:
+                raise ValueError(
+                    f"UpdatePositions initialized with A={self._A}, but got A={A}. "
+                )
 
-    pos_update = Vec3Array.from_array(pos_update.reshape(*pos_update.shape[:-1], -1, 3))
-    local_pos = local_pos + pos_update
+        frames, local_pos = extract_aa_frames(Vec3Array.from_array(pos))
 
-    pos = frames[..., None].apply_to_point(local_pos)
-    pos = pos.to_tensor() if hasattr(pos, "to_tensor") else pos.to_tensor()
-    return pos
+        pos_update = float(scale) * self.proj(local_norm)
 
+        if symm is not None:
+            pos_update = symm(pos_update)
+
+        pos_update = Vec3Array.from_array(pos_update.view(pos_update.shape[0], A, 3))
+        local_pos = local_pos + pos_update
+
+        pos_out = frames[..., None].apply_to_point(local_pos).to_tensor()
+        return pos_out
 
 def semiequivariant_update_positions(
     pos: torch.Tensor,

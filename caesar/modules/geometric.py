@@ -226,25 +226,27 @@ class SparseStructureMessage(nn.Module):
     def __init__(self, config,):
         super().__init__()
         self.config = config
-        self._pair_mlp: Optional[nn.Module] = None 
+        self.pair_mlp = MLP(
+            2 * int(config.pair_size),
+            out_size=None,
+            depth=3,
+            activation=F.gelu,
+            final_init="zeros",
+        )
 
     def forward(self, local, pos, pair, pair_mask, neighbours, resi, chain, batch, mask):
         c = self.config
 
         pos = Vec3Array.from_array(pos.to(dtype=torch.float32))
 
-        if self._pair_mlp is None:
-            self._pair_mlp = MLP(
-                2 * int(c.pair_size),
-                int(local.shape[-1]),
-                depth=3,
-                activation=F.gelu,
-                final_init="zeros",
-            ).to(pair.device)
+        pair = self.pair_mlp(pair)
 
-        pair = self._pair_mlp(pair)
+        local_update = torch.where(
+            pair_mask[..., None].bool(),
+            pair,
+            torch.zeros_like(pair)
+        ).sum(dim=1)
 
-        local_update = torch.where(pair_mask[..., None].to(torch.bool), pair, torch.zeros_like(pair)).sum(dim=1)
         local_update = local_update / pair.shape[1]
         return local_update
     

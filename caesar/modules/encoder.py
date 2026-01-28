@@ -18,6 +18,7 @@ from caesar.modules.utils import (
     extract_neighbours,
 )
 from caesar.modules.geometric import (
+    SparseStructureAttention,
     extract_aa_frames, 
     rotation_features,
     distance_features,
@@ -46,7 +47,7 @@ class EncoderBlock(nn.Module):
             final_init=init_linear()
         )
         # no attn for now. will be added later
-        # self.attn = SparseStructureAttention(c)
+        self.attn = SparseStructureAttention(c)
         self.update = EncoderUpdate(c)
 
         self.ln_attn = nn.LayerNorm(c.local_size)
@@ -67,11 +68,11 @@ class EncoderBlock(nn.Module):
 
         pair = self.pair_mlp(pair)
 
-        # features = features + self.attn(
-        #     self.ln_attn(features),
-        #     pos, pair, pair_mask,
-        #     neighbours, resi, chain, batch, mask
-        # )
+        features = features + self.attn(
+             self.ln_attn(features),
+             pos, pair, pair_mask,
+             neighbours, resi, chain, batch, mask
+        )
 
         features = features + self.update(
             self.ln_update(features),
@@ -88,7 +89,6 @@ class EncoderUpdate(nn.Module):
         self.config = config
         c = config
 
-        # salad: MLP(local_dim*2 -> local_dim, gelu, final_init=zeros)(local_pos_flat)
         self.localpos_mlp = MLP(
             size=c.local_size * 2,
             out_size=c.local_size,
@@ -274,11 +274,6 @@ class InitLocalFeatures(nn.Module):
     def forward(self, pos, neighbours, resi, chain, batch, mask):
         neighbours = neighbours.to(torch.long)
 
-        ### safe gather for neighbours (handle -1)
-        # valid = (neighbours != -1)
-        # neigh = neighbours.clamp_min(0)
-        # pair_mask = (mask[:, None] * mask[neigh]).to(torch.bool) & valid  # bool mask
-  
         pair_mask = mask[:, None] * mask[neighbours]
         pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
         pair_mask = pair_mask.to(torch.bool)

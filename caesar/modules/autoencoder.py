@@ -1029,6 +1029,3 @@ class VQState(nn.Module):
         self.codebook = codebook_new.detach()
 
         return out_features, assign_fwd, losses, state_update
-    
-    
-    
