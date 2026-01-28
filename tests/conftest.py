@@ -21,11 +21,13 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from caesar.modules.utils.collections import deepcopy
 
-from tests.configs import test_deterministic
+from caesar.modules.config import distance_to_structure_decoder
 @pytest.fixture
 def cfg():
-    return deepcopy(test_deterministic)
-                    
+    return deepcopy(distance_to_structure_decoder.small_inner)
+
+from tests.configs import test_deterministic
+
 @pytest.fixture(scope="function")
 def seed():
     # this seed stands as an initializer for torch & jax rngs
@@ -59,7 +61,8 @@ def torch_device():
 @pytest.fixture(scope="session")
 def protein_data():
     """Load reference protein structure for all tests."""
-    path = TEST_DIR / "data" / "test_structure.npz"
+    # path = TEST_DIR / "data" / "test_structure.npz"
+    path = TEST_DIR / "data" / "test_structure_extended.npz"
     data = dict(np.load(path))
     return data
 
