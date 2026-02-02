@@ -20,6 +20,13 @@ from caesar.modules.utils.dssp import assign_dssp
 from caesar.utils.all_atom_multimer import get_atom14_mask
 from caesar.utils.loss import violation_loss
 
+DEBUG = True
+
+def _stat(t: torch.Tensor):
+    t = t.detach()
+    return dict(mean=float(t.mean()), std=float(t.std()), max=float(t.abs().max()))
+
+
 class StructureAutoencoder(nn.Module):
     """Wrapper class for protein structure autoencoder training"""
     def __init__(self, config, name: Optional[str] = "structure_autoencoder"):
@@ -45,14 +52,21 @@ class StructureAutoencoder(nn.Module):
             *,
             generator: Optional[torch.Generator] = None,
             running_init: bool = False,
+            return_trace=False
         ):
             c = self.config
 
             data = dict(data)
             
             # convert coordinates, center & add encoded features
-            data.update(prepare_data(data))
-
+            data.update(prepare_data(data, generator=generator))
+            if DEBUG:
+                trace = {}
+                trace["prep/mask_sum"] = float(data["mask"].detach().sum())
+                trace["prep/pos_gt"] = _stat(data["pos_gt"])
+                trace["prep/pos_init"] = _stat(data["pos"])
+                trace["prep/dmap"] = _stat(data["dmap"])
+                
             # optionally apply noise to the inputs
             if getattr(c, "input_diffusion", False):
                 clean_latent = self.encoder(data)
@@ -60,6 +74,9 @@ class StructureAutoencoder(nn.Module):
                 data.update(self.prepare_input_diffusion(data))
 
             latent = self.encoder(data)
+            if DEBUG:
+                trace["enc/latent"] = _stat(latent)
+                trace["enc/latent_slice"] = latent[:2, :5].detach().cpu()
             # optionally apply noise to the latents (not used in the manuscript)
             if getattr(c, "latent_diffusion", False):
                 # NOTE(from authors): constraining latents is necessary for diffusion to work
@@ -110,17 +127,20 @@ class StructureAutoencoder(nn.Module):
                         "local": result_i["local"].detach(),
                     }
 
+            local0, pos0, resi, chain, batch, mask = self.decoder.prepare_features(data, prev)
+            trace["dec/local0"] = _stat(local0)
+            
             result = self.decoder(data, prev, generator=generator)
 
             if getattr(c, "codebook_size", 0):
                 result["codebook_losses"] = codebook_losses
 
-            total, losses = self.decoder.loss(data, result)
-
+            total, losses = self.decoder.loss(data, result, generator=generator)
             out_dict = dict(results=result, losses=losses)
             if getattr(c, "codebook_size", 0) and getattr(c, "state", False):
                 out_dict["_state_update"] = state_update
-
+            if return_trace:
+                return total, out_dict, trace
             return total, out_dict
     
     def add_noise(self, latent: torch.Tensor, batch: torch.Tensor, *, generator: torch.Generator | None = None):
@@ -191,7 +211,7 @@ class StructureAutoencoder(nn.Module):
 
         return latent, time
 
-def prepare_data(data):
+def prepare_data(data, generator=None):
     """Prepare model inputs from a batch of data."""
     pos = data["all_atom_positions"]   # [N, M, 3]
     atom_mask = data["all_atom_mask"]  # [N, M]
@@ -245,7 +265,7 @@ def prepare_data(data):
     pos_ncacocb = positions_to_ncacocb(pos)  
 
     cb = Vec3Array.from_array(pos_ncacocb[:, -1, :])    
-    noise = 0.3 * torch.randn(list(cb.shape) + [3], device=pos_ncacocb.device, dtype=pos_ncacocb.dtype)
+    noise = 0.3 * torch.randn(list(cb.shape) + [3], device=pos_ncacocb.device, dtype=pos_ncacocb.dtype, generator=generator)
     cb = cb + Vec3Array.from_array(noise)                
     dmap = (cb[:, None] - cb[None, :]).norm()            
 
@@ -259,7 +279,7 @@ def prepare_data(data):
     dssp, _, _ = assign_dssp(atom_pos, batch.long(), mask)
 
     # set initial backbone positions (decoder init)
-    pos_init = torch.randn_like(pos_ncacocb)
+    pos_init = torch.randn(pos_ncacocb.shape, device=pos_ncacocb.device, dtype=pos_ncacocb.dtype, generator=generator) 
 
     return dict(
         pos=pos_init,
@@ -553,7 +573,7 @@ class StructureDecoder(StructureAutoencoder):
 
         result = self.decoder(data, prev, generator=generator)
 
-        total, losses = self.decoder.loss(data, result)
+        total, losses = self.decoder.loss(data, result, generator=generator)
 
         out_dict = dict(
             results=result,

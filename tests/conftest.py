@@ -24,10 +24,13 @@ from caesar.modules.utils.collections import deepcopy
 from caesar.modules.config import distance_to_structure_decoder
 @pytest.fixture
 def cfg():
+    """A small_inner autoencdoer config"""
     return deepcopy(distance_to_structure_decoder.small_inner)
 
-from tests.configs import test_deterministic
-
+from tests.configs import test_deterministic as _test_deterministic
+@pytest.fixture
+def cfg_deterministic():
+    return deepcopy(_test_deterministic)
 @pytest.fixture(scope="function")
 def seed():
     # this seed stands as an initializer for torch & jax rngs

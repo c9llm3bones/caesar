@@ -12,6 +12,9 @@ import torch.nn.functional as F
 
 from torch.nn.parameter import UninitializedParameter
 
+def gelu_salad(x):
+    return F.gelu(x, approximate="tanh")
+
 @torch.no_grad()
 def _variance_scaling_(w: torch.Tensor, scale=1.0, mode="fan_in", dist="truncated_normal"):
     fan_in, fan_out = w.shape[1], w.shape[0]  
@@ -105,7 +108,7 @@ class MLP(nn.Module):
 
 class GatedMLP(nn.Module):
     def __init__(self, size=64, out_size=None,
-                 activation: Callable = F.gelu,
+                 activation: Callable = gelu_salad,
                  init="relu", final_init="zeros",
                  name: Optional[str] = "gated_mlp"):
         super().__init__()

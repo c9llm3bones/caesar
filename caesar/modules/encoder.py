@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from caesar.utils.geometry import Vec3Array
 
-from caesar.modules.basic import Linear, MLP, block_stack, init_linear, init_relu, init_zeros
+from caesar.modules.basic import Linear, MLP, gelu_salad, init_linear, init_relu, init_zeros
 from caesar.modules.utils import (
     distance_rbf, 
     index_mean,
@@ -43,7 +43,7 @@ class EncoderBlock(nn.Module):
         self.pair_mlp = MLP(
             2 * c.pair_size,
             c.pair_size,
-            activation=F.gelu,
+            activation=gelu_salad,
             final_init=init_linear()
         )
         # no attn for now. will be added later
@@ -55,8 +55,8 @@ class EncoderBlock(nn.Module):
 
     def forward(self, features, pos, resi, chain, batch, mask):
         c = self.config
-
-        neighbours = extract_neighbours(16, 16, 32)(
+        nr = int(getattr(c, "num_random_neighbours", 32))
+        neighbours = extract_neighbours(16, 16, nr)(
             Vec3Array.from_array(pos),
             resi, chain, batch, mask
         )
@@ -92,7 +92,7 @@ class EncoderUpdate(nn.Module):
         self.localpos_mlp = MLP(
             size=c.local_size * 2,
             out_size=c.local_size,
-            activation=F.gelu,    
+            activation=gelu_salad,    
             final_init=init_zeros()
         )
 
@@ -119,7 +119,7 @@ class EncoderUpdate(nn.Module):
         local = local + self.localpos_mlp(local_pos_flat)
 
         upd = self.update_proj(local)
-        gate = F.gelu(self.gate_proj(local))
+        gate = gelu_salad(self.gate_proj(local))
         local_local = gate * upd
 
         return self.out_proj(local_local)
@@ -162,7 +162,7 @@ class Encoder(nn.Module):
         self.local_mlp = MLP(
             size=4 * c.local_size,
             out_size=c.local_size,
-            activation=F.gelu,
+            activation=gelu_salad,
             bias=False,
             final_init=init_linear(),   
         )
@@ -267,7 +267,7 @@ class InitLocalFeatures(nn.Module):
         # hk.LayerNorm([-1], True, True) equivalent
         self.ln = nn.LayerNorm(c.pair_size, elementwise_affine=True)
 
-        self.mlp = MLP(size=c.pair_size * 2, out_size=c.pair_size, activation=F.gelu)
+        self.mlp = MLP(size=c.pair_size * 2, out_size=c.pair_size, activation=gelu_salad)
 
         self.to_local = Linear(c.local_size, bias=False)
 

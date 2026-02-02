@@ -198,30 +198,6 @@ def get_spatial_neighbours(count: int):
         return get_neighbours(count)(distance, mask, neighbours)
     return inner
 
-def get_random_neighbours(count: int):
-    """Extracts `count` neighbours with probability 1 / d^3."""
-    def inner(pos: Any, item, mask, neighbours=None):
-        distance = None
-        if isinstance(pos, torch.Tensor):
-            assert(pos.ndim == 2)
-            if pos.shape[0] == pos.shape[1]:
-                distance = pos
-            else:
-                pos = Vec3Array.from_array(pos)
-        if distance is None:
-            distance = (pos[:, None] - pos[None, :]).norm()
-        same_item = item[:, None] == item[None, :]
-        # apply gumbel topk trick to select random neighbours
-        weight = -3 * torch.log(distance + 1e-6)
-        uniform = torch.empty_like(weight).uniform_(1e-6, 1.0 - 1e-6) #(c) avoid log(0)
-        gumbel = torch.log(-torch.log(uniform))
-        weight = weight - gumbel
-        distance = -weight
-        distance = torch.where(same_item, distance, torch.full_like(distance, float('inf')))
-        mask = (mask[:, None] * mask[None, :] * same_item)
-        return get_neighbours(count)(distance, mask, neighbours)
-    return inner
-
 def bond_angle(x, y, z):
     """Compute the bond angle between three atoms x, y and z.
     
@@ -322,7 +298,7 @@ def get_neighbours(count: int):
 
 def get_random_neighbours(count: int):
     """Extracts `count` neighbours with probability 1 / d^3."""
-    def inner(pos: Any, item, mask, neighbours=None):
+    def inner(pos: Any, item, mask, neighbours=None, generator=None):
         distance = None
         if isinstance(pos, torch.Tensor):
             assert(pos.ndim == 2)
@@ -335,7 +311,7 @@ def get_random_neighbours(count: int):
         same_item = item[:, None] == item[None, :]
         # apply gumbel topk trick to select random neighbours
         weight = -3 * torch.log(distance + 1e-6)
-        uniform = torch.rand(weight.shape, dtype=weight.dtype, device=weight.device)
+        uniform = torch.rand(weight.shape, dtype=weight.dtype, device=weight.device, generator=generator)
         gumbel = torch.log(-torch.log(uniform))
         weight = weight - gumbel
         distance = -weight
@@ -722,10 +698,13 @@ def index_count(index, mask, apply_mask=True):
         to all entries with that index value.
         E.g. for index [0, 0, 0, 1, 1] the result would be [3, 3, 3, 2, 2]
     """
-    result = torch.zeros_like(index).at[index].add(mask.astype(index.dtype))
+    index = index.to(torch.long)
+    mask = mask.to(torch.bool)
+    result = torch.zeros_like(index)
+    result.scatter_add_(0, index, mask.to(result.dtype))
     if not apply_mask:
         return result[index]
-    return torch.where(mask, result[index], 0)
+    return torch.where(mask, result[index], torch.zeros_like(result[index]))
 
 def index_align(x, y, index, mask, weight=None):
     """Rigid align two structures x and y.

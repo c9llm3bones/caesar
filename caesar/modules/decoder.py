@@ -23,7 +23,7 @@ from caesar.modules.utils.geometry import (
     index_sum,
     single_protein_sidechains)
 
-from caesar.modules.basic import Linear, MLP, init_zeros, init_linear
+from caesar.modules.basic import Linear, MLP, init_zeros, init_linear, gelu_salad
 
 from caesar.modules.geometric import (
     SparseStructureAttention, SparseAttention, SparseSemiEquivariantPointAttention,
@@ -79,7 +79,8 @@ class DecoderBlock(nn.Module):
 
         self.update = DecoderUpdate(c)
         self.pos_update = UpdatePositions()
-        self.current_neigh = extract_neighbours(num_index=16, num_spatial=16, num_random=32)
+        nr = int(getattr(c, "num_random_neighbours", 32))
+        self.current_neigh = extract_neighbours(num_index=16, num_spatial=16, num_random=nr)
         self.dmap_neigh = extract_dmap_neighbours(count=32)
 
         self.pair_features_main = DecoderPairFeatures(c)
@@ -95,7 +96,7 @@ class DecoderBlock(nn.Module):
         mask: torch.Tensor,                     # (N,)
         sup_neighbours: Optional[torch.Tensor] = None,  # (N, Ksup)
         pos_gt: Optional[torch.Tensor] = None,  
-        generator: Optional[torch.Generator] = None,  # (N, A, 3) 
+        generator: Optional[torch.Generator] = None,  
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         c = self.config
         N = features.shape[0]
@@ -125,7 +126,7 @@ class DecoderBlock(nn.Module):
                 idx = torch.arange(sup_neighbours.shape[0], device=sup_neighbours.device, dtype=torch.long)[:, None]
                 distogram_logits = dist_full_logits[idx, sup_neighbours]
 
-            dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask)
+            dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask, generator=generator)
         else:
             distogram_logits = torch.zeros((1,), dtype=torch.float32, device=features.device)
             dmap = None
@@ -195,7 +196,7 @@ class Decoder(nn.Module):
                 size=c.local_size * 2,
                 out_size=out_dim,
                 bias=False,
-                activation=F.gelu,
+                activation=gelu_salad,
                 final_init=init_zeros(),
             )
         self.prev_local_ln = nn.LayerNorm(c.local_size, elementwise_affine=True)
@@ -204,7 +205,7 @@ class Decoder(nn.Module):
             size=4 * c.local_size,
             out_size=c.local_size,
             bias=False,
-            activation=F.gelu,
+            activation=gelu_salad,
             final_init=init_linear(),
         )
 
@@ -220,7 +221,7 @@ class Decoder(nn.Module):
 
         # supervision neighbours (FAPE)
         sup_neighbours = get_random_neighbours(c.fape_neighbours)(
-            Vec3Array.from_array(data["pos_gt"][:, -1]), batch, mask
+            Vec3Array.from_array(data["pos_gt"][:, -1]), batch, mask, generator=generator
         )
 
         local, pos, trajectory, sup_distogram = self.decoder_stack(
@@ -274,7 +275,6 @@ class Decoder(nn.Module):
             "angles": angles,
             "atom_pos": atom_pos,
         })
-
         return result
 
     def init_prev(self, data):
@@ -319,7 +319,7 @@ class Decoder(nn.Module):
 
         return local, pos, resi, chain, batch, mask
     
-    def loss(self, data, result):
+    def loss(self, data, result, generator=None):
         """Compute Decoder losses from the input data and Decoder results."""
         c = self.config
 
@@ -368,7 +368,7 @@ class Decoder(nn.Module):
         distance = data["dmap"]
         distance = torch.where(pair_mask.to(torch.bool), distance, torch.full_like(distance, float("inf")))
         # get random neighbours to compute sparse FAPE on
-        neighbours = get_random_neighbours(c.fape_neighbours)(distance, batch, mask)
+        neighbours = get_random_neighbours(c.fape_neighbours)(distance, batch, mask, generator=generator)
         mask_neighbours = (neighbours != -1) * mask[:, None] * mask[neighbours]
         pos_gt_local = frames_gt[:, None, None].apply_inverse_to_point(pos_gt[neighbours])
         
@@ -538,7 +538,7 @@ class DecoderUpdate(nn.Module):
         self.pos_mlp = MLP(
             local_size * 2,
             local_size,
-            activation=F.gelu,
+            activation=gelu_salad,
             final_init="zeros",
         )
 
@@ -560,9 +560,9 @@ class DecoderUpdate(nn.Module):
         local = local + self.pos_mlp(local_pos)
 
         local_update = self.local_update(local)
-        local_gate = F.gelu(self.local_gate(local))
-        chain_gate = F.gelu(self.chain_gate(local))
-        batch_gate = F.gelu(self.batch_gate(local))
+        local_gate = gelu_salad(self.local_gate(local))
+        chain_gate = gelu_salad(self.chain_gate(local))
+        batch_gate = gelu_salad(self.batch_gate(local))
 
         hidden = index_mean(batch_gate * local_update, batch, mask[..., None])
         hidden = hidden + index_mean(chain_gate * local_update, chain, mask[..., None])
@@ -579,7 +579,7 @@ class GetAnglePositions(nn.Module):
             local_dim * 2,
             7 * 2,
             bias=False,
-            activation=F.gelu,
+            activation=gelu_salad,
             final_init="linear"
         )
 
@@ -626,7 +626,7 @@ class AADecoderBlock(nn.Module):
         self.pair_mlp = MLP(
             2 * int(c.pair_size),
             int(c.pair_size),
-            activation=F.gelu,
+            activation=gelu_salad,
             final_init="linear",
         )
 
@@ -738,7 +738,9 @@ class DecoderStack(nn.Module):
 
         for block in self.blocks:
             local, pos, sup_dist = block(
-                local, pos, resi, chain, batch, mask, sup_neighbours
+                local, pos, resi, chain, batch, mask,
+                sup_neighbours=sup_neighbours,
+                generator=generator,
             )
             trajectory.append(pos)
             sup_distograms.append(sup_dist)
@@ -770,7 +772,8 @@ class SemiEquivariantDecoderBlock(nn.Module):
             raise ValueError(f"Unknown distogram_block: {c.distogram_block}")
 
         self.dmap_neigh = extract_dmap_neighbours(count=32)
-        self.current_neigh = extract_neighbours(num_index=16, num_spatial=16, num_random=32)
+        nr = int(getattr(c, "num_random_neighbours", 32))
+        self.current_neigh = extract_neighbours(num_index=16, num_spatial=16, num_random=nr)
 
         self.pair_feat_main = HybridDecoderPairFeatures(c, center_features=False)
         self.pair_feat_dist = HybridDecoderPairFeatures(c, center_features=False) if self.has_dist else None
@@ -798,6 +801,7 @@ class SemiEquivariantDecoderBlock(nn.Module):
         mask: torch.Tensor,
         sup_neighbours: Optional[torch.Tensor] = None,
         pos_gt: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         c = self.config
         N = features.shape[0]
@@ -820,7 +824,7 @@ class SemiEquivariantDecoderBlock(nn.Module):
 
             distogram_logits = dist_full_logits[idx, sup_neighbours]
             
-            dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask)
+            dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask, generator=generator)
 
         current_neighbours = self.current_neigh(
             Vec3Array.from_array(pos),
@@ -894,7 +898,8 @@ class SemiEquivariantDecoderStack(nn.Module):
             local, pos, sup_dist = block(
                 local, pos,
                 resi, chain, batch, mask,
-                sup_neighbours
+                sup_neighbours=sup_neighbours,
+                generator=generator,
             )
             trajectory.append(pos)
             sup_distograms.append(sup_dist)
@@ -982,7 +987,7 @@ class HybridDecoderPairFeatures(nn.Module):
         self.p_dirs   = Linear(c.pair_size, bias=False, initializer="linear")
 
         self.ln = nn.LayerNorm(c.pair_size, elementwise_affine=True)
-        self.mlp = MLP(c.pair_size * 2, c.pair_size, activation=F.gelu, final_init="linear")
+        self.mlp = MLP(c.pair_size * 2, c.pair_size, activation=gelu_salad, final_init="linear")
 
     def forward(
         self,
@@ -1059,7 +1064,7 @@ class NonequivariantDecoderPairFeatures(nn.Module):
         self.p_local_j = Linear(c.pair_size, bias=False)
 
         self.ln = nn.LayerNorm(c.pair_size, elementwise_affine=True)
-        self.mlp = MLP(c.pair_size * 2, c.pair_size, activation=F.gelu, final_init="linear")
+        self.mlp = MLP(c.pair_size * 2, c.pair_size, activation=gelu_salad, final_init="linear")
 
     def forward(
         self,
@@ -1185,7 +1190,11 @@ class DecoderPairFeatures(nn.Module):
         self.relpos = sequence_relative_position(32, one_hot=True, pseudo_chains=True)
 
         self.p_relpos = Linear(c.pair_size, bias=False, initializer="linear")
-        self.p_dmap   = Linear(c.pair_size, bias=False, initializer="linear") if c.distogram_block else None
+        self.p_dmap = (
+            Linear(c.pair_size, bias=False, initializer="linear")
+            if getattr(c, "distogram_block", "none") != "none"
+            else None
+        )
         self.p_dist   = Linear(c.pair_size, bias=False, initializer="linear")
         self.p_dir    = Linear(c.pair_size, bias=False, initializer="linear")
         self.p_rot    = Linear(c.pair_size, bias=False, initializer="linear")
@@ -1193,7 +1202,7 @@ class DecoderPairFeatures(nn.Module):
 
         self.ln = nn.LayerNorm(c.pair_size, elementwise_affine=True)
 
-        self.mlp = MLP(c.pair_size * 2, c.pair_size, activation=F.gelu, final_init="linear")
+        self.mlp = MLP(c.pair_size * 2, c.pair_size, activation=gelu_salad, final_init="linear")
 
     def forward(
         self,
@@ -1251,7 +1260,7 @@ class QuickDistogram(nn.Module):
         self.relpos_proj = Linear(32, bias=False)
 
         self.ln = nn.LayerNorm(32, elementwise_affine=True)
-        self.head = MLP(size=64, out_size=self.bins, depth=2, activation=F.gelu, final_init="zeros")
+        self.head = MLP(size=64, out_size=self.bins, depth=2, activation=gelu_salad, final_init="zeros")
 
         step = (stop - start) / self.bins
         bin_centers = torch.arange(self.bins, dtype=torch.float32) * step + step / 2.0
@@ -1326,7 +1335,7 @@ class InnerDistogram(nn.Module):
 
         dcode = self.code_proj(features).reshape(N, self.heads, self.bins)  # (N,8,16)
         dgate = self.gate_proj(features).reshape(N, self.heads, self.bins)  # (N,8,16)
-        dgate = F.gelu(dgate)
+        dgate = gelu_salad(dgate)
 
         logits = torch.einsum("iax,jbx,abx->ijx", dcode, dgate, self.inner_weight)
 
@@ -1440,9 +1449,9 @@ class NonEquivariantDecoderUpdate(nn.Module):
 
     def forward(self, local, chain, batch, mask):
         local_update = self.local_update(local)
-        local_gate = F.gelu(self.local_gate(local))
-        chain_gate = F.gelu(self.chain_gate(local))
-        batch_gate = F.gelu(self.batch_gate(local))
+        local_gate = gelu_salad(self.local_gate(local))
+        chain_gate = gelu_salad(self.chain_gate(local))
+        batch_gate = gelu_salad(self.batch_gate(local))
 
         hidden = index_mean(batch_gate * local_update, batch, mask[..., None])
         hidden = hidden + index_mean(chain_gate * local_update, chain, mask[..., None])

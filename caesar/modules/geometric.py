@@ -4,7 +4,7 @@ import numpy as np
 import torch.nn.functional as F
 import torch.nn as nn
 from caesar.utils.geometry import Vec3Array
-from caesar.modules.basic import Linear, MLP, init_linear
+from caesar.modules.basic import Linear, MLP, init_linear, gelu_salad
 from caesar.modules.utils.geometry import (
     distance_rbf, extract_aa_frames, 
     sequence_relative_position, 
@@ -72,7 +72,7 @@ def type_position_features(local, pos, batch, mask, size=32, scale=10.0,
         return torch.concatenate((type_dir, type_dist, type_pos), axis=-1)
     # compute type weight
     base_type_weight = Linear(size, bias=False, initializer="linear")(local)
-    base_type_weight = torch.nn.functional.gelu(base_type_weight)
+    base_type_weight = gelu_salad(base_type_weight)
     # local type positions
     type_weight = base_type_weight[neighbours]
     type_weight = torch.where((neighbours != -1)[..., None], type_weight, 0)
@@ -230,7 +230,7 @@ class SparseStructureMessage(nn.Module):
             2 * int(config.pair_size),
             out_size=None,
             depth=3,
-            activation=F.gelu,
+            activation=gelu_salad,
             final_init="zeros",
         )
 
