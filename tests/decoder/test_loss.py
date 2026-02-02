@@ -10,7 +10,7 @@ from tests.utils import to_jax, to_torch, assert_allclose
 
 # deterministic helpers (no RNG)
 def det_random_neighbours_jax(K: int, eps: float = 1e-6):
-    def fn(distance, batch, mask):
+    def fn(distance, batch, mask, **kwargs):
         # distance: (N,N) with inf for invalid pairs
         N = distance.shape[0]
         tie = (jnp.arange(N, dtype=distance.dtype)[None, :] * jnp.asarray(eps, distance.dtype))
@@ -24,7 +24,7 @@ def det_random_neighbours_jax(K: int, eps: float = 1e-6):
 
 
 def det_random_neighbours_torch(K: int, eps: float = 1e-6):
-    def fn(distance, batch, mask):
+    def fn(distance, batch, mask, **kwargs):
         N = distance.shape[0]
         tie = torch.arange(N, device=distance.device, dtype=distance.dtype)[None, :] * eps
         dist_sort = distance + tie
@@ -131,7 +131,8 @@ def make_max_cfg():
     # ensure local neighbours fields
     cfg.local_neighbours = getattr(cfg, "local_neighbours", 16)
     cfg.fape_neighbours = getattr(cfg, "fape_neighbours", 64)
-
+    
+    cfg.num_random_neighbours = 0
     # some codes expect equivariance field
     if not hasattr(cfg, "equivariance"):
         cfg.equivariance = None
@@ -229,7 +230,7 @@ def make_full_inputs(N=64, T=3, K=16, latent_size=20):
 
 
 @pytest.mark.parametrize("N,T,K", [(64, 3, 16)])
-def test_decoder_loss_full_parity_max(monkeypatch, torch_device, jax_keys, atol, rtol, N, T, K):
+def test_decoder_loss_full_parity_max(cfg_deterministic, monkeypatch, torch_device, jax_keys, atol, rtol, N, T, K):
     cfg = make_max_cfg()
     latent_size = int(getattr(cfg, "latent_size", 20))
 
@@ -452,7 +453,7 @@ def grad_parity_one_key(
 
 
 @pytest.mark.parametrize("N,T,K", [(64, 3, 16)])
-def test_grad_parity_many_keys(monkeypatch, torch_device, jax_keys, atol, rtol, N, T, K):
+def test_grad_parity_many_keys(cfg_deterministic, monkeypatch, torch_device, jax_keys, atol, rtol, N, T, K):
     cfg = make_max_cfg()
     latent_size = int(getattr(cfg, "latent_size", 20))
 

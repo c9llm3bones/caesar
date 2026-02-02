@@ -15,7 +15,7 @@ def test_encoder_prepare_features_preparams_matches_jax(
     rtol,
     seed,
     jax_keys,
-    cfg):
+    cfg_deterministic):
     """
       - pos_input (without noise_encoder for deterministic features)
       - neighbours = extract_neighbours(5,5,0)
@@ -46,7 +46,7 @@ def test_encoder_prepare_features_preparams_matches_jax(
         position_rotation_features as torch_position_rotation_features,
         pair_vector_features as torch_pair_vector_features,
     )
-    c = cfg 
+    c = cfg_deterministic 
 
     data_np = dict(protein_data)
     data_jax = {k: to_jax(v) for k, v in data_np.items()}
