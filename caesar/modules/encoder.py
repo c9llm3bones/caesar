@@ -46,7 +46,6 @@ class EncoderBlock(nn.Module):
             activation=gelu_salad,
             final_init=init_linear()
         )
-        # no attn for now. will be added later
         self.attn = SparseStructureAttention(c)
         self.update = EncoderUpdate(c)
 
@@ -187,6 +186,8 @@ class Encoder(nn.Module):
         chain = data["chain_index"]
         batch = data["batch_index"]
         mask = data["mask"]
+        if mask.dtype != torch.bool:
+            mask = (mask != 0)
 
         pos = Vec3Array.from_array(pos)
 
@@ -237,10 +238,11 @@ class AADecoderPairFeatures(nn.Module):
     def forward(self, pos, neighbours, resi, chain, batch, mask):
         neighbours = neighbours.to(torch.long)
 
-        pair_mask = mask[:, None] * mask[neighbours]
-        pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
-        pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
-
+        mask_bool = mask
+        if mask_bool.dtype != torch.bool:
+            mask_bool = (mask_bool != 0)
+        pair_mask = (mask_bool[:, None] & mask_bool[neighbours] & (neighbours != -1)).to(torch.float32)
+        
         pair  = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
         pair += self.p_dist(distance_features(pos, neighbours, d_min=0.0, d_max=22.0))
         pair += self.p_dir(direction_features(pos, neighbours))
@@ -274,10 +276,12 @@ class InitLocalFeatures(nn.Module):
     def forward(self, pos, neighbours, resi, chain, batch, mask):
         neighbours = neighbours.to(torch.long)
 
-        pair_mask = mask[:, None] * mask[neighbours]
-        pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
-        pair_mask = pair_mask.to(torch.bool)
+        mask_bool = mask
+        if mask_bool.dtype != torch.bool:
+            mask_bool = (mask_bool != 0)
 
+        pair_mask_bool = (mask_bool[:, None] & mask_bool[neighbours] & (neighbours != -1))
+        pair_mask = pair_mask_bool.to(dtype=torch.float32)
         pair  = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
         pair += self.p_dist(distance_features(pos, neighbours, d_min=0.0, d_max=22.0))
         pair += self.p_dir(direction_features(pos, neighbours))
@@ -287,10 +291,14 @@ class InitLocalFeatures(nn.Module):
         pair = self.ln(pair)
         pair = self.mlp(pair)
 
-        pair = pair * pair_mask.unsqueeze(-1).to(pair.dtype)
+        pair = torch.where(
+            pair_mask_bool.unsqueeze(-1),
+            pair,
+            torch.zeros_like(pair),
+        )
 
-        denom = pair_mask.sum(dim=-1, keepdim=True).to(pair.dtype).clamp_min(1.0)
+
+        denom = pair_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
         local = pair.sum(dim=1) / denom
-
         local = self.to_local(local)
         return local

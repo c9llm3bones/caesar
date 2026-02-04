@@ -282,13 +282,10 @@ class SparseStructureAttention(nn.Module):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         frames, _ = extract_aa_frames(Vec3Array.from_array(pos))
-
-        if hasattr(frames, "to_tensor"):
-            frames_t = frames.to_tensor()
-        elif hasattr(frames, "to_array"):
-            frames_t = frames.to_array()
-        else:
-            frames_t = frames 
+        arr = frames.to_tensor()
+        # print("frames.to_tensor shape:", arr.shape, "dtype:", arr.dtype)
+        # print("frames.to_tensor[0]:", arr.reshape(-1, arr.shape[-1])[0])
+        frames_t = frames.to_tensor() if hasattr(frames, "to_tensor") else frames
 
         local_update = self.attn(
             local,
@@ -377,12 +374,12 @@ class SparseInvariantMultiQueryAttention(nn.Module):
         y = proj(x).view(N, H, Q, 3)                       # local
         pts = Vec3Array.from_array(y)
         pts_g = frames[:, None, None].apply_to_point(pts)  # global
-        return pts_g.to_tensor() if hasattr(pts_g, "to_tensor") else pts_g.to_array()
+        return pts_g.to_tensor()
 
     def _to_local(self, x_global: torch.Tensor, frames: Rigid3Array) -> torch.Tensor:
         pts = Vec3Array.from_array(x_global)
         pts_l = frames[:, None, None].apply_inverse_to_point(pts)
-        return pts_l.to_tensor() if hasattr(pts_l, "to_tensor") else pts_l.to_array()
+        return pts_l.to_tensor() 
 
     def forward(
         self,
@@ -392,8 +389,13 @@ class SparseInvariantMultiQueryAttention(nn.Module):
         neighbours: torch.Tensor,   # (N, K)
         mask: torch.Tensor,         # (N, K)
     ) -> torch.Tensor:
-        frames_r = Rigid3Array.from_array(frames.to(dtype=torch.float32))
-
+        if isinstance(frames, Rigid3Array):
+            frames_r = frames
+        else:
+            frames_r = Rigid3Array.from_array(frames.to(dtype=torch.float32))
+        # arr = frames_r.to_tensor()
+        # print("frames.to_tensor shape:", arr.shape, "dtype:", arr.dtype)
+        # print("frames.to_tensor[0]:", arr.reshape(-1, arr.shape[-1])[0])
         neighbours = neighbours.to(torch.long)
         mask_bool = mask.to(torch.bool)
 
@@ -789,7 +791,7 @@ class SparseSemiEquivariantPointAttention(nn.Module):
         out_point_v = out_point_v - base_v
 
         out_norm = out_point_v.norm()  
-        out_point_t = out_point_v.to_tensor() if hasattr(out_point_v, "to_tensor") else out_point_v.to_array()
+        out_point_t = out_point_v.to_tensor() 
 
         out = torch.cat(
             [
@@ -847,9 +849,12 @@ class SparseInvariantPointAttention(nn.Module):
             if self._ln_local is None:
                 self._ln_local = nn.LayerNorm(local.shape[-1], elementwise_affine=True).to(local.device)
             local = self._ln_local(local)
-
-        frames = Rigid3Array.from_array(frames.to(dtype=torch.float32))
-
+        if isinstance(frames, Rigid3Array):
+            frames = frames
+        else:
+            frames = Rigid3Array.from_array(frames.to(dtype=torch.float32))
+        # arr = frames.to_tensor()
+        
         qkv = self.qkv(local).view(*local.shape[:-1], self.heads, 3 * self.size)
         q, k, v = torch.split(qkv, self.size, dim=-1)
 
@@ -901,7 +906,7 @@ class SparseInvariantPointAttention(nn.Module):
         out_point = frames[:, None, None].apply_inverse_to_point(out_point)
 
         out_norm = out_point.norm()
-        out_point = out_point.to_tensor() if hasattr(out_point, "to_tensor") else out_point.to_array()
+        out_point = out_point.to_tensor() 
 
         concat = torch.cat(
             [

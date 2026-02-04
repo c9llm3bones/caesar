@@ -208,7 +208,10 @@ def bond_angle(x, y, z):
     """
     left = x - y
     right = z - y
-    cos_tau = (left * right).sum(dim=-1) / torch.maximum(torch.linalg.norm(left, dim=-1) * torch.linalg.norm(right, dim=-1), 1e-6)
+    den = torch.linalg.norm(left, dim=-1) * torch.linalg.norm(right, dim=-1)
+    den = den.clamp_min(1e-6)
+    cos_tau = (left * right).sum(dim=-1) / den
+
     return torch.arccos(cos_tau) / torch.pi * 180
 
 def dihedral_angle(a, b, c, d):
@@ -223,8 +226,8 @@ def dihedral_angle(a, b, c, d):
     y = c - b
     z = d - c
     y_norm = torch.linalg.norm(y, dim=-1)
-    result = torch.arctan2(y_norm * (x * torch.cross(y, z)).sum(dim=-1),
-                         (torch.cross(x, y) * torch.cross(y, z)).sum(dim=-1))
+    result = torch.arctan2(y_norm * (x * torch.cross(y, z, dim=-1)).sum(dim=-1),
+                         (torch.cross(x, y, dim=-1) * torch.cross(y, z, dim=-1)).sum(dim=-1))
     return result / torch.pi * 180
 
 def batch_pairwise_dist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -410,7 +413,7 @@ def compute_pseudo_cb(positions):
     n, ca, c = torch.moveaxis(positions[..., :3, :], -2, 0)
     b = ca - n
     c = c - ca
-    a = torch.cross(b, c)
+    a = torch.cross(b, c, dim=-1)
     const = [-0.58273431, 0.56802827, -0.54067466]
     return const[0] * a + const[1] * b + const[2] * c + ca
 
@@ -442,18 +445,16 @@ def index_sum(data: torch.Tensor,
         E.g. for values [1, 2, 3, 4, 5] and index [0, 0, 0, 1, 1]
         the result would be [6, 6, 6, 9, 9].
     """
-    N = data.shape[0]
-    index = index.to(dtype=torch.long)
-    # (c) torch.where needs boolean condition; jax allows numeric masks
-    mask_bool = mask if mask.dtype == torch.bool else (mask > 0)
-    mask_b = mask_bool.view(N, *([1] * (data.ndim - 1)))
-    data_masked = torch.where(mask_b, data, torch.zeros_like(data))
+    if index.dtype != torch.long:
+        index = index.long()
+    mask_bool = mask if mask.dtype == torch.bool else (mask != 0)
+    data_masked = torch.where(mask_bool, data, torch.zeros_like(data))
     result = torch.zeros_like(data)
     result.index_add_(0, index, data_masked)
-    gathered = result.index_select(0, index)  
+    gathered = result.index_select(0, index)
     if not apply_mask:
         return gathered
-    return torch.where(mask_b, gathered, torch.zeros_like(gathered))
+    return torch.where(mask_bool, gathered, torch.zeros_like(gathered))
 
 def index_max(data: torch.Tensor,
               index: torch.Tensor,
@@ -493,74 +494,51 @@ def index_max(data: torch.Tensor,
 
     return torch.where(mask_b, gathered, torch.full_like(gathered, dmin))
 
-# Helper functions to broadcast mask and weight to data shape
-def _broadcast_mask_to_data(mask: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
-    """
-    Make mask broadcastable to data by adding singleton dims.
-    jax allows mask (N,) or (N,1) etc; we emulate that.
-    """
-    # ensure mask starts with N dimension
-    if mask.dim() == 1 and data.dim() > 1:
-        mask = mask.view(mask.shape[0], *([1] * (data.dim() - 1)))
-    elif mask.dim() < data.dim():
-        mask = mask.view(*mask.shape, *([1] * (data.dim() - mask.dim())))
-    return mask
-
-def _broadcast_weight_to_data(weight: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
-    """
-    Broadcast weight to match data shape (same logic as mask).
-    """
-    if weight.dim() == 1 and data.dim() > 1:
-        weight = weight.view(weight.shape[0], *([1] * (data.dim() - 1)))
-    elif weight.dim() < data.dim():
-        weight = weight.view(*weight.shape, *([1] * (data.dim() - weight.dim())))
-    return weight
-
 def index_mean(data, index, mask, weight=None, apply_mask=True):
+    """Mean of array entries with the same index value.
+
+    Args:
+        data: data array of shape (N, ...).
+        index: integer index of shape (N,) with values between 0 and N-1.
+        mask: boolean entry mask of shape (N,).
+        apply_mask: restrict the output to entries where mask is True. Default: True.
+    Returns:
+        Mean of array entries with the same index value, broadcasted
+        to all entries with that index value.
+        E.g. for values [1, 2, 3, 4, 5] and index [0, 0, 0, 1, 1]
+        the result would be [2, 2, 2, 4.5, 4.5].
+    """
     if index.dtype != torch.long:
         index = index.long()
 
-    # mask -> bool
-    mask_bool = (mask != 0) if mask.dtype != torch.bool else mask
-
-    # broadcast mask для torch.where
-    mask_b = _broadcast_mask_to_data(mask_bool, data)
+    mask_bool = mask if mask.dtype == torch.bool else (mask != 0)
 
     x = data
     if weight is not None:
-        w = weight if torch.is_tensor(weight) else torch.as_tensor(weight, device=data.device)
-        w = w.to(device=data.device, dtype=data.dtype)
-        w = _broadcast_weight_to_data(w, data)              # -> (N,1) or (N,...) broadcastable
-        w = w.expand_as(data)                               
-        x = x * w
+        x = x * weight
 
-    x = torch.where(mask_b, x, torch.zeros_like(x))
+    x = torch.where(mask_bool, x, torch.zeros_like(x))
 
     result = torch.zeros_like(x)
     result.index_add_(0, index, x)
 
-    if weight is None:
-        position_weight = mask_bool.to(dtype=data.dtype, device=data.device)
-        position_weight = _broadcast_weight_to_data(position_weight, data) 
-        position_weight = position_weight.expand_as(data)                   
-    else:
-        w = weight.to(device=data.device, dtype=data.dtype) if torch.is_tensor(weight) else torch.as_tensor(weight, device=data.device, dtype=data.dtype)
-        w = _broadcast_weight_to_data(w, data)
-        w = w.expand_as(data)                                               # !!! (N,3)
-        position_weight = torch.where(mask_b, w, torch.zeros_like(w))
+    position_weight = mask_bool
+    if weight is not None:
+        position_weight = torch.where(mask_bool, weight, torch.zeros_like(weight))
 
-    denom = torch.zeros_like(result)
-    denom.index_add_(0, index, position_weight)                            
-    denom = torch.clamp(denom, min=1e-6)
+    pw = position_weight + torch.zeros_like(x)
+
+    denom = torch.zeros_like(x)
+    denom.index_add_(0, index, pw)
+    denom = denom.clamp_min(1e-6)
 
     result = result / denom
-    out = result[index]
+    out = result.index_select(0, index)
 
     if not apply_mask:
         return out
 
-    out = torch.where(mask_b, out, torch.zeros_like(out))
-    return out
+    return torch.where(mask_bool, out, torch.zeros_like(out))
 
 def index_var(data: torch.Tensor,
               index: torch.Tensor,

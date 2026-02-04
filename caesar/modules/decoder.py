@@ -1494,7 +1494,7 @@ class UpdatePositions(nn.Module):
         if symm is not None:
             pos_update = symm(pos_update)
 
-        pos_update = Vec3Array.from_array(pos_update.view(pos_update.shape[0], A, 3))
+        pos_update = Vec3Array.from_array(pos_update.reshape(pos_update.shape[0], A, 3))
         local_pos = local_pos + pos_update
 
         pos_out = frames[..., None].apply_to_point(local_pos).to_tensor()
