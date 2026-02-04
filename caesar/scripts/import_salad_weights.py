@@ -319,10 +319,9 @@ def _AAPointAttnParams(attn) -> dict:
 
 
 def _AAUpdateParams(upd) -> dict:
-    # gate_proj/update_proj have no bias; out_proj has bias; localpos_mlp has bias
     return {
-        "linear": LinearParams(upd.gate_proj.lin, has_bias=False),
-        "linear_1": LinearParams(upd.update_proj.lin, has_bias=False),
+        "linear": LinearParams(upd.update_proj.lin, has_bias=False),
+        "linear_1": LinearParams(upd.gate_proj.lin, has_bias=False),
         "linear_2": LinearParams(upd.out_proj.lin, has_bias=True),
         "mlp": {
             "linear": LinearParams(upd.localpos_mlp.layers[0].lin, has_bias=True),
@@ -408,10 +407,10 @@ def _DistogramParams(dist) -> dict:
 
 def _DecoderUpdateParams(upd) -> dict:
     return {
-        "linear": LinearParams(upd.local_gate.lin, has_bias=False),
-        "linear_1": LinearParams(upd.local_update.lin, has_bias=False),
-        "linear_2": LinearParams(upd.batch_gate.lin, has_bias=False),
-        "linear_3": LinearParams(upd.chain_gate.lin, has_bias=False),
+        "linear": LinearParams(upd.local_update.lin, has_bias=False),
+        "linear_1": LinearParams(upd.local_gate.lin, has_bias=False),
+        "linear_2": LinearParams(upd.chain_gate.lin, has_bias=False),
+        "linear_3": LinearParams(upd.batch_gate.lin, has_bias=False),
         "linear_4": LinearParams(upd.out.lin, has_bias=True),
         "mlp": {
             "linear": LinearParams(upd.pos_mlp.layers[0].lin, has_bias=True),
@@ -422,7 +421,7 @@ def _DecoderUpdateParams(upd) -> dict:
 
 def _DecoderBlockParams(block) -> dict:
     out = {
-        "layer_norm": LayerNormParams(block.pair_features_main.ln),
+        "layer_norm":   LayerNormParams(block.pair_features_main.ln),
         "layer_norm_1": LayerNormParams(block.ln_attn_main),
         "layer_norm_4": LayerNormParams(block.ln_update),
         "layer_norm_5": LayerNormParams(block.ln_pos),
@@ -433,20 +432,19 @@ def _DecoderBlockParams(block) -> dict:
         "linear_4": LinearParams(block.pair_features_main.p_rot.lin,   has_bias=False),
         "linear_5": LinearParams(block.pair_features_main.p_vec.lin,   has_bias=False),
 
+        "linear_12": LinearParams(block.pos_update.proj.lin, has_bias=False),
+
         "mlp": MLP2Params(block.pair_features_main.mlp, has_bias=True),
 
-        "sparse_structure_attn": {"ada_point_attention": _AAPointAttnParams(block.attn_main.attn)},
+        "sparse_structure_attn": {
+            "ada_point_attention": _AAPointAttnParams(block.attn_main.attn),
+        },
         "light_global_update": _DecoderUpdateParams(block.update),
     }
-    out["linear"] = LinearParams(block.pair_features_main.p_relpos.lin, has_bias=False)
-    
+
     if getattr(block.pair_features_main, "p_dmap", None) is not None:
         out["linear_1"] = LinearParams(block.pair_features_main.p_dmap.lin, has_bias=False)
 
-    out["linear_2"] = LinearParams(block.pair_features_main.p_dist.lin, has_bias=False)
-    out["linear_3"] = LinearParams(block.pair_features_main.p_dir.lin, has_bias=False)
-    out["linear_4"] = LinearParams(block.pair_features_main.p_rot.lin, has_bias=False)
-    out["linear_5"] = LinearParams(block.pair_features_main.p_vec.lin, has_bias=False)
     if getattr(block, "pair_features_dist", None) is not None:
         out.update({
             "layer_norm_2": LayerNormParams(block.pair_features_dist.ln),
@@ -461,7 +459,9 @@ def _DecoderBlockParams(block) -> dict:
 
             "mlp_1": MLP2Params(block.pair_features_dist.mlp, has_bias=True),
 
-            "sparse_structure_attn_1": {"ada_point_attention": _AAPointAttnParams(block.attn_dist.attn)},
+            "sparse_structure_attn_1": {
+                "ada_point_attention": _AAPointAttnParams(block.attn_dist.attn),
+            },
         })
 
     if getattr(block, "distogram", None) is not None:
