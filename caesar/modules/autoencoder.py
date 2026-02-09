@@ -115,7 +115,12 @@ class StructureAutoencoder(nn.Module):
             )
 
             if not running_init:
-                if getattr(c, "eval", False):
+                fixed_recycle = data.get("fixed_recycle", None)
+                if torch.is_tensor(fixed_recycle):
+                    fixed_recycle = int(fixed_recycle.item())
+                if fixed_recycle is not None:
+                    count = int(fixed_recycle)
+                elif getattr(c, "eval", False):
                     count = int(c.num_recycle)
                 else:
                     count = int(torch.randint(0, 4, (), device=latent.device, generator=generator).item())
@@ -229,6 +234,9 @@ def prepare_data(data, generator=None):
 
     device = pos.device
     dtype = pos.dtype
+    no_random = data.get("no_random", False)
+    if torch.is_tensor(no_random):
+        no_random = bool(no_random.item())
 
     # recast positions into atom14:
     # first, truncate to atom14 format
@@ -265,7 +273,8 @@ def prepare_data(data, generator=None):
     pos_ncacocb = positions_to_ncacocb(pos)  
 
     cb = Vec3Array.from_array(pos_ncacocb[:, -1, :])    
-    noise = 0.3 * torch.randn(list(cb.shape) + [3], device=pos_ncacocb.device, dtype=pos_ncacocb.dtype, generator=generator)
+    noise_scale = 0.0 if no_random else 0.3
+    noise = noise_scale * torch.randn(list(cb.shape) + [3], device=pos_ncacocb.device, dtype=pos_ncacocb.dtype, generator=generator)
     cb = cb + Vec3Array.from_array(noise)                
     dmap = (cb[:, None] - cb[None, :]).norm()            
 
@@ -279,7 +288,10 @@ def prepare_data(data, generator=None):
     dssp, _, _ = assign_dssp(atom_pos, batch.long(), mask)
 
     # set initial backbone positions (decoder init)
-    pos_init = torch.randn(pos_ncacocb.shape, device=pos_ncacocb.device, dtype=pos_ncacocb.dtype, generator=generator) 
+    if no_random:
+        pos_init = pos_ncacocb
+    else:
+        pos_init = torch.randn(pos_ncacocb.shape, device=pos_ncacocb.device, dtype=pos_ncacocb.dtype, generator=generator) 
 
     return dict(
         pos=pos_init,
@@ -560,9 +572,9 @@ class StructureDecoder(StructureAutoencoder):
                 count = int(c.num_recycle)
             else:
                 if generator is None:
-                    count = int(torch.randint(0, 4, (1,), device="cpu").item())
+                    count = int(torch.randint(0, 4, (1,), device="cuda").item())
                 else:
-                    count = int(torch.randint(0, 4, (1,), generator=generator, device="cpu").item())
+                    count = int(torch.randint(0, 4, (1,), generator=generator, device="cuda").item())
 
             for _ in range(count):
                 result_i = self.decoder(data, prev, generator=generator)
@@ -624,7 +636,7 @@ class StructureAutoencoderInference(StructureAutoencoder):
         c = self.config
 
         data = dict(data)
-        data.update(self.prepare_data(data, generator=generator))
+        data.update(prepare_data(data, generator=generator))
 
         # optionally apply noise to inputs
         if getattr(c, "input_diffusion", False):
@@ -716,11 +728,10 @@ class StructureAutoencoderInference(StructureAutoencoder):
         lddt_ca = (in_threshold.sum(dim=1).to(torch.float32) / denom).mean(dim=-1)
         lddt_ca = torch.where(mask, lddt_ca.to(mask.dtype), torch.zeros_like(lddt_ca).to(mask.dtype))
 
-        # AlphaFold violation loss
+        # AlphaFold-style violation loss (JAX-salad compatible API)
         res_mask = mask.to(torch.float32)
         pred_mask = get_atom14_mask(aatype).to(res_mask.device).to(res_mask.dtype) * res_mask[:, None]
-
-        violation, _ = violation_loss(
+        violation_error, _ = violation_loss(
             aatype,
             data["residue_index"],
             result["atom_pos"],
@@ -732,7 +743,6 @@ class StructureAutoencoderInference(StructureAutoencoder):
             batch_index=data["batch_index"],
             per_residue=False,
         )
-        violation_error = violation.mean()
 
         latent_out = data["latent"]
         if "predicted_latent" in result:
