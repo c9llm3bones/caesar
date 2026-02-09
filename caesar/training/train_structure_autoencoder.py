@@ -1,5 +1,6 @@
 import os
 import time
+import random
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
@@ -46,8 +47,9 @@ def slice_batch_first_dim(batch: Dict[str, Any], n: int) -> Dict[str, Any]:
 
 def split_generator(gen: torch.Generator) -> Tuple[torch.Generator, torch.Generator]:
     """Rough analogue of jax.random.split."""
-    seed = int(torch.randint(0, 2**31 - 1, (1,), generator=gen).item())
-    sub = torch.Generator(device="cpu").manual_seed(seed)
+    device = gen.device if hasattr(gen, "device") else torch.device("cpu")
+    seed = int(torch.randint(0, 2**31 - 1, (1,), generator=gen, device=device).item())
+    sub = torch.Generator(device=device).manual_seed(seed)
     return gen, sub
 
 
@@ -167,9 +169,13 @@ def load_loop_state(path: str, model: torch.nn.Module, optimizer: torch.optim.Op
     optimizer.load_state_dict(ckpt["optimizer"])
     model.to(device)
 
-    gen = torch.Generator(device="cpu")
+    gen = torch.Generator(device=device)
     if "rng_state" in ckpt:
-        gen.set_state(ckpt["rng_state"])
+        try:
+            gen.set_state(ckpt["rng_state"])
+        except Exception as e:
+            print(f"Warning: failed to restore RNG state ({e}); using fresh seed.")
+            gen = torch.Generator(device=device).manual_seed(42)
 
     return State(
         key=gen,
@@ -207,6 +213,102 @@ def make_smoke_batch(npz_path: str, device: torch.device, mul: int) -> Dict[str,
 def infinite_stream(batch: Dict[str, torch.Tensor]):
     while True:
         yield {k: v.clone() for k, v in batch.items()}
+
+def clone_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            out[k] = v.clone()
+        elif isinstance(v, np.ndarray):
+            out[k] = v.copy()
+        else:
+            out[k] = v
+    return out
+
+def repeat_batch(batch: Dict[str, Any]):
+    while True:
+        yield clone_batch(batch)
+
+def accumulate_stream(stream: Iterator[Dict[str, Any]], count: int):
+    count = int(count)
+    assert count >= 1
+    while True:
+        items = [next(stream) for _ in range(count)]
+        yield _merge_batches(items)
+
+def _merge_batches(items: list[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    offset = 0
+    for item in items:
+        if "batch_index" in item:
+            bi = item["batch_index"]
+            if torch.is_tensor(bi):
+                bi = bi.detach().cpu().numpy()
+            if isinstance(bi, np.ndarray) and bi.size:
+                item = dict(item)
+                item["batch_index"] = bi + offset
+                offset += int(bi.max()) + 1
+    keys = items[0].keys()
+    for k in keys:
+        vals = [it[k] for it in items]
+        v0 = vals[0]
+        if torch.is_tensor(v0):
+            out[k] = torch.cat(vals, dim=0)
+        elif isinstance(v0, np.ndarray):
+            out[k] = np.concatenate(vals, axis=0)
+        else:
+            out[k] = v0
+    return out
+
+def take_first_protein(batch: Dict[str, Any], *, target_size: Optional[int] = None) -> Dict[str, Any]:
+    if "batch_index" not in batch:
+        return batch
+    batch_index = batch["batch_index"]
+    if torch.is_tensor(batch_index):
+        batch_index = batch_index.detach().cpu().numpy()
+    size = int(target_size or batch_index.shape[0])
+    keep = batch_index == batch_index.min()
+    out: Dict[str, Any] = {}
+    for k, v in batch.items():
+        if isinstance(v, np.ndarray) and v.shape[0] == size:
+            out[k] = v[keep]
+        else:
+            out[k] = v
+    out = pad_dict(out, size)
+    out["batch_index"] = np.zeros_like(out["batch_index"])
+    out["seq_mask"] = out["mask"] * (out["aa_gt"] != 20)
+    out["residue_mask"] = out["mask"] * out["all_atom_mask"].any(axis=-1)
+    return out
+
+def _tensor_stats(t: torch.Tensor) -> str:
+    t = t.detach()
+    if t.is_floating_point():
+        return f"sum={t.sum().item():.4g} mean={t.mean().item():.4g} std={t.std().item():.4g}"
+    return f"sum={t.sum().item()} mean={t.float().mean().item():.4g}"
+
+def summarize_batch(batch: Dict[str, Any], keys: Optional[Tuple[str, ...]] = None) -> str:
+    parts = []
+    if keys is None:
+        keys = ("aa_gt", "residue_index", "chain_index", "batch_index", "mask", "seq_mask", "residue_mask", "all_atom_positions")
+    for k in keys:
+        if k not in batch:
+            continue
+        v = batch[k]
+        t = v if torch.is_tensor(v) else torch.as_tensor(v)
+        parts.append(f"{k}: shape={tuple(t.shape)} dtype={t.dtype} device={t.device} {_tensor_stats(t)}")
+    return " | ".join(parts)
+
+def dump_batch(batch: Dict[str, Any], keys: Optional[Tuple[str, ...]] = None) -> str:
+    lines = []
+    if keys is None:
+        keys = ("aa_gt", "residue_index", "chain_index", "batch_index", "mask", "seq_mask", "residue_mask")
+    for k in keys:
+        if k not in batch:
+            continue
+        v = batch[k]
+        t = v if torch.is_tensor(v) else torch.as_tensor(v)
+        lines.append(f"{k}:\n{t}")
+    return "\n".join(lines)
         
 def cosine_decay_schedule(start_lr, decay_lr, warmup_steps, decay_steps):
     start_lr = float(start_lr)
@@ -261,6 +363,8 @@ def make_training_inner(
     clip: float,
     accumulate: int = 1,
     ema_weight: float = 0.999,
+    debug_batch: bool = False,
+    debug_batch_full: bool = False,
 ):
     accumulate = int(accumulate)
     clip = float(clip)
@@ -275,6 +379,8 @@ def make_training_inner(
     ema_weight = float(ema_weight)
 
     ema = EMA(model, decay=ema_weight) if ema_weight is not None else None
+
+    first_fp = {"value": None}
 
     def training_inner(loop_state: State):
         t = time.time()
@@ -296,6 +402,14 @@ def make_training_inner(
         item_t = {k: (v if torch.is_tensor(v) else torch.as_tensor(v)) for k, v in item.items()}
         item_t = cast_float(item_t, dtype=torch.float32)
         item_t = move_to_device(item_t, device)
+        if debug_batch:
+            fp = summarize_batch(item_t)
+            same = (fp == first_fp["value"]) if first_fp["value"] is not None else True
+            if first_fp["value"] is None:
+                first_fp["value"] = fp
+            print(f"[batch] same_as_first={same} :: {fp}")
+            if debug_batch_full:
+                print("[batch-full]\n" + dump_batch(item_t))
 
         ref = None
         for v in item_t.values():
@@ -352,8 +466,10 @@ def make_training_inner(
             aux_state={"ema": ema.shadow if ema is not None else None, "ema_decay": ema.decay if ema is not None else None},
         )
 
+        current_loss = float(loggables["loss"].detach().cpu().item())
         print(
-            f"Step {loop_state.step_id}, load time {load_time:.3f} s, step time {step_time:.3f} s, total {total_time:.3f} s"
+            f"Step {loop_state.step_id}, loss: {current_loss:.6f}, "
+            f"load time {load_time:.3f}s, step time {step_time:.3f}s, total {total_time:.3f}s"
         )
         return new_state, loggables
 
@@ -392,7 +508,7 @@ def make_valid_inner(
         res = dict(logs)
         res["loss"] = loss.detach()
 
-        print(f"Computed valid batch in {time.time() - t:.3f} seconds.")
+        print(f"Computed valid batch in {time.time() - t:.3f} seconds. w// loss = {res["loss"]}")
         return res
 
     return valid_inner
@@ -427,7 +543,7 @@ def training(
     return _loop
 
 if __name__ == "__main__":
-    from caesar.data.allpdb import BatchedProteinPDBStream
+    from caesar.data.allpdb import BatchedProteinPDBStream, pad_dict
     from flexloop.data import BatchStream
     from flexloop.utils import parse_options
     from caesar.modules.config import distance_to_structure_decoder as config_choices
@@ -454,6 +570,15 @@ if __name__ == "__main__":
         jax_seed=42,   
         multigpu="True",
         suffix="1",
+        overfit_one="False",
+        no_random="False",
+        fixed_recycle=-1,
+        deterministic="False",
+        debug_batch="False",
+        debug_batch_full="False",
+        data_seed=42,
+        num_workers=1,
+        prefetch_factor=2,
         smoke="False",
         smoke_steps=5,
         smoke_valid_interval=1,
@@ -462,8 +587,20 @@ if __name__ == "__main__":
     smoke = (opt.smoke == "True")
     
     multigpu = (opt.multigpu == "True")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(int(opt.jax_seed))
+    device = torch.device("cuda:1" if torch.cuda.is_available()  else "cpu")
+    seed = int(opt.jax_seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if opt.deterministic == "True":
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
 
     NUM_DEVICES = torch.cuda.device_count() if multigpu and torch.cuda.is_available() else 1
 
@@ -483,49 +620,91 @@ if __name__ == "__main__":
         data = iter(infinite_stream(batch))
         valid_data = iter(infinite_stream(batch))
 
-        # быстро и дёшево
         total_steps = int(opt.smoke_steps)
         valid_interval = int(opt.smoke_valid_interval)
     else:
         print("Attempting to load dataset...")
+        seed_train = int(opt.data_seed)
+        seed_valid = seed_train + 1
         data = BatchedProteinPDBStream(
             f"{opt.data_path}/allpdb/",
             seqres_aa="clusterSeqresAA",
             cutoff_resolution=4.0,
             p_complex=opt.p_complex,
-            size=1024,
+            size=512,#1024,
             min_size=16,
-            max_size=1024,
+            max_size=512,#1024,
+            seed=seed_train,
         )
-        data = iter(
-            BatchStream(
-                data,
-                num_workers=0, # 32
-                accumulate=int(opt.rebatch) * int(opt.accumulate) * int(NUM_DEVICES),
-                prefetch_factor=2, # 32
+        num_workers = int(opt.num_workers)
+        prefetch = int(opt.prefetch_factor) if num_workers > 0 else None
+        accumulate = int(opt.rebatch) * int(opt.accumulate) * int(NUM_DEVICES)
+        if num_workers == 0:
+            data = iter(data)
+            if accumulate != 1:
+                data = accumulate_stream(data, accumulate)
+        else:
+            data = iter(
+                BatchStream(
+                    data,
+                    num_workers=num_workers, # 32
+                    accumulate=accumulate,
+                    prefetch_factor=prefetch, # 32
+                )
             )
-        )
 
         valid_data = BatchedProteinPDBStream(
             f"{opt.data_path}/allpdb/",
             seqres_aa="clusterSeqresAA",
             cutoff_resolution=4.0,
             p_complex=opt.p_complex,
-            size=1024,
+            size=512,#1024,
             min_size=16,
-            max_size=1024,
+            max_size=512,#1024,
             start_date="01/01/22",
             cutoff_date="12/31/23",
+            seed=seed_valid,
         )
-        valid_data = iter(
-            BatchStream(
-                valid_data,
-                num_workers=0, # 8
-                accumulate=int(opt.rebatch) * int(opt.accumulate) * int(NUM_DEVICES),
-                prefetch_factor=2, # 8
+        if num_workers == 0:
+            valid_data = iter(valid_data)
+            if accumulate != 1:
+                valid_data = accumulate_stream(valid_data, accumulate)
+        else:
+            valid_data = iter(
+                BatchStream(
+                    valid_data,
+                    num_workers=num_workers, # 8
+                    accumulate=accumulate,
+                    prefetch_factor=prefetch, # 8
+                )
             )
-        )
         print("Dataset successfully loaded.")
+
+        if opt.overfit_one == "True":
+            print("Overfitting on a single batch (reusing the first batch for train/valid).")
+            first_item = next(data)
+            first_item = take_first_protein(first_item)
+            data = repeat_batch(first_item)
+            valid_data = repeat_batch(first_item)
+            item_0 = first_item
+        else:
+            item_0 = next(data)
+
+    def flag_stream(stream, *, no_random: bool, fixed_recycle: int):
+        if (not no_random) and fixed_recycle < 0:
+            return stream
+        def _gen():
+            for item in stream:
+                item = dict(item)
+                if no_random:
+                    item["no_random"] = True
+                if fixed_recycle >= 0:
+                    item["fixed_recycle"] = fixed_recycle
+                yield item
+        return _gen()
+
+    data = flag_stream(data, no_random=(opt.no_random == "True"), fixed_recycle=int(opt.fixed_recycle))
+    valid_data = flag_stream(valid_data, no_random=(opt.no_random == "True"), fixed_recycle=int(opt.fixed_recycle))
 
     if getattr(config, "is_decoder", False):
         model = StructureDecoder(config).to(device)
@@ -534,7 +713,8 @@ if __name__ == "__main__":
 
     # (с) "init params" analogue for LazyLinear: run one small forward
     print("Initializing model parameters...")
-    item_0 = next(data)
+    if smoke:
+        item_0 = next(data)
     print("INPUT OF SHAPE:")
     for name, value in item_0.items():
         v = value if torch.is_tensor(value) else torch.as_tensor(value)
@@ -545,7 +725,7 @@ if __name__ == "__main__":
     init_batch = move_to_device(init_batch, device)
 
     # (с) one dry forward to materialize LazyLinear
-    gen0 = torch.Generator(device="cpu").manual_seed(int(opt.jax_seed))
+    gen0 = torch.Generator(device=device).manual_seed(int(opt.jax_seed))
     model.train(True)
     with torch.no_grad():
         _ = _call_model(model, init_batch, gen0)
@@ -579,7 +759,7 @@ if __name__ == "__main__":
     step_valid = model_step(model, config, rebatch=int(opt.rebatch), is_training=False, device=device)
 
     print("Constructing training loop...")
-    key = torch.Generator(device="cpu").manual_seed(int(opt.jax_seed))
+    key = torch.Generator(device=device).manual_seed(int(opt.jax_seed))
     aux_state: Dict[str, Any] = {}
     loop_state = State(key=key, step_id=0, model=model, optimizer=optimizer, aux_state=aux_state)
 
@@ -597,6 +777,8 @@ if __name__ == "__main__":
         clip=float(opt.clip),
         accumulate=int(opt.accumulate),
         ema_weight=float(opt.ema_weight),
+        debug_batch=(opt.debug_batch == "True"),
+        debug_batch_full=(opt.debug_batch_full == "True"),
     )
     valid_inner = make_valid_inner(
         model=model,
@@ -617,3 +799,9 @@ if __name__ == "__main__":
         writer=writer,
     )
     train_loop(loop_state)
+
+
+# python -m caesar.training.train_structure_autoencoder --data_path /disk/2tb/edelkin/data --overfit_one True --p_complex 0.0 --num_workers 1 --prefetch_factor 2
+
+### full train det data
+# python -m caesar.training.train_structure_autoencoder --data_path /disk/2tb/edelkin/data --data_seed 123 --num_workers 0 --prefetch_factor 2 --deterministic True
