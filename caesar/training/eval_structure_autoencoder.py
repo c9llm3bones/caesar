@@ -223,3 +223,5 @@ if __name__ == "__main__":
                     **diagnostics,
                 )
     print("All proteins decoded.")
+
+# python -m caesar.training.eval_structure_autoencoder  --params /home/kostya/Downloads/caesar/salad_weights/ae_params/small_inner-200k.jax --path /home/kostya/Downloads/caesar/caesar/data/casp14.targets.T-dom.public_11.29.2020 --out_path outputs/ --config small_inner  --num_recycle 4  --diagnostics True
