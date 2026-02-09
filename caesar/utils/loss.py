@@ -19,7 +19,7 @@ import ml_collections
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 from caesar.aflib.common import residue_constants
 from caesar.utils.rigid_utils import Rotation, Rigid
@@ -1431,12 +1431,11 @@ def compute_violation_metrics_np(
     return tree_map(to_np, out, torch.Tensor)
 
 
-def violation_loss(
+def _violation_loss_from_violations(
     violations: Dict[str, torch.Tensor],
     atom14_atom_exists: torch.Tensor,
     average_clashes: bool = False,
-    eps=1e-6,
-    **kwargs,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     num_atoms = torch.sum(atom14_atom_exists)
 
@@ -1460,6 +1459,103 @@ def violation_loss(
     mean = torch.mean(loss)
 
     return mean
+
+
+def _violation_loss_salad_style(
+    violations: Dict[str, torch.Tensor],
+    atom14_atom_exists: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """JAX-salad compatible structural violation loss."""
+    between = violations["between_residues"]
+    within = violations["within_residues"]
+    num_atoms = torch.sum(atom14_atom_exists).to(torch.float32) + eps
+    clashes_mean_loss = between.get("clashes_mean_loss", None)
+    # Salad custom_clash_loss uses sum(dists_to_low_error) / sum(clash_mask).
+    # Reconstruct this from per-atom aggregates when available.
+    if "clashes_per_atom_num_clash" in between:
+        numer = torch.sum(between["clashes_per_atom_loss_sum"])
+        denom = torch.clamp(torch.sum(between["clashes_per_atom_num_clash"]), min=eps)
+        clashes_mean_loss = numer / denom
+    if clashes_mean_loss is None:
+        clashes_mean_loss = torch.zeros((), dtype=between["bonds_c_n_loss_mean"].dtype, device=between["bonds_c_n_loss_mean"].device)
+
+    loss = (
+        between["bonds_c_n_loss_mean"]
+        + 0.3 * between["angles_ca_c_n_loss_mean"]
+        + 0.3 * between["angles_c_n_ca_loss_mean"]
+        + clashes_mean_loss
+        + torch.sum(within["per_atom_loss_sum"]) / num_atoms
+    )
+    return torch.mean(loss)
+
+
+def violation_loss(*args: Any, average_clashes: bool = False, eps=1e-6, **kwargs):
+    """
+    Two supported call modes:
+    1) OpenFold-style: violation_loss(violations, atom14_atom_exists, ...)
+       -> returns Tensor
+    2) JAX-salad style:
+       violation_loss(aatype, residue_index, pred_positions, pred_mask, seq_mask, ...)
+       -> returns (loss, violation_metrics)
+    """
+    if len(args) >= 2 and isinstance(args[0], dict):
+        violations = args[0]
+        atom14_atom_exists = args[1]
+        return _violation_loss_from_violations(
+            violations,
+            atom14_atom_exists,
+            average_clashes=average_clashes,
+            eps=eps,
+        )
+
+    if len(args) < 5:
+        raise TypeError("violation_loss expected either (violations, atom14_atom_exists) or (aatype, residue_index, pred_positions, pred_mask, seq_mask)")
+
+    aatype, residue_index, pred_positions, pred_mask, seq_mask = args[:5]
+    chain_index = kwargs.get("chain_index", None)
+    batch_index = kwargs.get("batch_index", None)
+    per_residue = kwargs.get("per_residue", False)
+    clash_overlap_tolerance = kwargs.get("clash_overlap_tolerance", 1.5)
+    violation_tolerance_factor = kwargs.get("violation_tolerance_factor", 2.0)
+
+    # Map the JAX call shape to the torch structural-violation helpers.
+    batch = {
+        "atom14_atom_exists": pred_mask,
+        "residue_index": residue_index.to(torch.long),
+        "aatype": aatype.to(torch.long),
+        "seq_mask": seq_mask.to(torch.float32),
+        "residx_atom14_to_atom37": get_rc_tensor(
+            residue_constants.RESTYPE_ATOM14_TO_ATOM37, aatype.to(torch.long)
+        ),
+    }
+    if chain_index is not None:
+        batch["asym_id"] = chain_index.to(torch.long)
+
+    violations = find_structural_violations(
+        batch,
+        pred_positions,
+        clash_overlap_tolerance=clash_overlap_tolerance,
+        violation_tolerance_factor=violation_tolerance_factor,
+    )
+    violation_metrics = compute_violation_metrics(batch, pred_positions, violations)
+
+    if per_residue:
+        between = violations["between_residues"]
+        within = violations["within_residues"]
+        within_per_res_loss = within["per_atom_loss_sum"].sum(dim=-1) / torch.clamp(
+            within["per_atom_violations"].sum(dim=-1), min=eps
+        )
+        per_residue_loss = between["connections_per_residue_loss_sum"]
+        per_residue_loss = per_residue_loss + (
+            (between["clashes_per_atom_loss_sum"] * between["clashes_per_atom_clash_mask"]).sum(dim=-1)
+            / torch.clamp(between["clashes_per_atom_clash_mask"].sum(dim=-1), min=eps)
+        )
+        per_residue_loss = per_residue_loss + within_per_res_loss
+        per_residue_loss = per_residue_loss * (pred_mask.sum(dim=-1) > 0).to(per_residue_loss.dtype)
+        return per_residue_loss, violation_metrics
+
+    return _violation_loss_salad_style(violations, pred_mask, eps=eps), violation_metrics
 
 
 def compute_renamed_ground_truth(

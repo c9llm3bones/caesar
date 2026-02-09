@@ -1,4 +1,3 @@
-### Got completely from salad
 # Copyright 2021 AlQuraishi Laboratory
 # Copyright 2021 DeepMind Technologies Limited
 #
@@ -456,8 +455,18 @@ def load_stereo_chemical_props() -> Tuple[
       residue_virtual_bonds: Dict that maps resname -> list of Bond tuples
       residue_bond_angles: Dict that maps resname -> list of BondAngle tuples
     """
-    # TODO: this file should be downloaded in a setup script
-    stereo_chemical_props = resources.read_text("openfold.resources", "stereo_chemical_props.txt")
+    # needs stereo_chemical_props.txt or openfold.resources to be available
+    local_props_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "stereo_chemical_props.txt"
+    )
+    if os.path.exists(local_props_path):
+        with open(local_props_path, "rt") as f:
+            stereo_chemical_props = f.read()
+    else:
+        # Backward-compatible fallback if local resource is not packaged.
+        stereo_chemical_props = resources.read_text(
+            "openfold.resources", "stereo_chemical_props.txt"
+        )
 
     lines_iter = iter(stereo_chemical_props.splitlines())
     # Load bond lengths.
