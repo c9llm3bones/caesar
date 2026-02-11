@@ -808,23 +808,17 @@ def unique_chain(chain, batch):
     Returns:
         [N] unique chain index
     """
-    N = chain.shape[0]
+    # Vectorized
     device = chain.device
+    chain = chain.to(device=device)
+    batch = batch.to(device=device)
+    if chain.numel() == 0:
+        return torch.zeros_like(chain)
 
-    out = torch.zeros(N, dtype=chain.dtype, device=device)
-
-    prev_chain = torch.tensor(-1, dtype=chain.dtype, device=device)
-    prev_batch = torch.tensor(-1, dtype=batch.dtype, device=device)
-    current = torch.tensor(-1, dtype=chain.dtype, device=device)
-
-    for i in range(N):
-        if (chain[i] != prev_chain) or (batch[i] != prev_batch):
-            current += 1
-        out[i] = current
-        prev_chain = chain[i]
-        prev_batch = batch[i]
-
-    return out
+    change = torch.ones_like(chain, dtype=torch.bool, device=device)
+    change[1:] = (chain[1:] != chain[:-1]) | (batch[1:] != batch[:-1])
+    out = torch.cumsum(change.to(torch.long), dim=0) - 1
+    return out.to(dtype=chain.dtype)
 
 def positions_to_ncacocb(pos: torch.ndarray):
     """Compute N, CA, C, O, CB positions for atom14 positions.
