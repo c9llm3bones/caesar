@@ -78,9 +78,11 @@ if __name__ == "__main__":
         "sample from a protein diffusion model.",
         params="checkpoint.jax",
         out_path="outputs/",
-        config="default",
+        config="small_inner",
         path="inputs/",
         diagnostics="False",
+        trace="False",
+        no_random="False",
         time=0.0,
         num_recycle=4,
         jax_seed=42
@@ -92,6 +94,9 @@ if __name__ == "__main__":
     config = getattr(config_choices, opt.config)
     config.eval = True
     config.num_recycle = opt.num_recycle
+    config.trace = (opt.trace == "True")
+    if opt.no_random == "True":
+        config.num_random_neighbours = 0
     key = jax.random.PRNGKey(opt.jax_seed)
     _, model = hk.transform(model_step(config))
     model = jax.jit(model)
@@ -109,10 +114,19 @@ if __name__ == "__main__":
         f_scores.write(f"name,num_aa,recovery,perplexity,rmsd_ca,tm,lddt\n")
         for name, data in parse_input_data(opt.path, size=1024):
             data["time"] = opt.time # FIXME: time input
+            if opt.no_random == "True":
+                data["no_random"] = True
             key, subkey = jax.random.split(key)
             mask = data["all_atom_mask"][:, 1] > 0
             out = model(params, subkey, data)
+            trace = None
+            if opt.trace == "True" and "__trace" in out:
+                trace = out["__trace"]
+                out = dict(out)
+                out.pop("__trace", None)
             out = slice_dict(out, mask)
+            if trace is not None:
+                out["__trace"] = trace
             atom37 = atom14_to_atom37(out["atom_pos"], out["aatype"])
             atom37_mask = get_atom37_mask(out["aatype"])
             protein = Protein(np.array(atom37), np.array(out["aatype"]),
@@ -137,4 +151,12 @@ if __name__ == "__main__":
                     f"{opt.out_path}/diagnostics/decoder_{'.'.join(name.split('.')[:-1])}.npz",
                     **diagnostics
                 )
+            if opt.trace == "True" and "__trace" in out:
+                trace = {k: np.array(v) for k, v in out["__trace"].items()}
+                np.savez_compressed(
+                    f"{opt.out_path}/diagnostics/trace_{'.'.join(name.split('.')[:-1])}.npz",
+                    **trace
+                )
     print("All proteins decoded.")
+
+# 

@@ -49,6 +49,7 @@ class StructureAutoencoder(hk.Module):
         atom_mask = data["all_atom_mask"]
         chain = data["chain_index"]
         batch = data["batch_index"]
+        no_random = jnp.asarray(data.get("no_random", False))
 
         # recast positions into atom14:
         # first, truncate to atom14 format
@@ -75,7 +76,8 @@ class StructureAutoencoder(hk.Module):
         # make distance map
         cb = Vec3Array.from_array(pos_ncacocb[:, -1])
         # add noise
-        cb += Vec3Array.from_array(0.3 * jax.random.normal(hk.next_rng_key(), list(cb.shape) + [3]))
+        noise_scale = jnp.where(no_random, 0.0, 0.3)
+        cb += Vec3Array.from_array(noise_scale * jax.random.normal(hk.next_rng_key(), list(cb.shape) + [3]))
         dmap = (cb[:, None] - cb[None, :]).norm()
         dmap_mask = batch[:, None] == batch[None, :]
 
@@ -88,6 +90,7 @@ class StructureAutoencoder(hk.Module):
 
         # set initial backbone positions
         pos = jax.random.normal(hk.next_rng_key(), pos_ncacocb.shape)
+        pos = jnp.where(no_random, pos_ncacocb, pos)
         return dict(pos=pos, pos_gt=pos_ncacocb, pos_input=pos_ncacocb,
                     dssp=dssp, dmap=dmap, dmap_mask=dmap_mask,
                     chain_index=chain, mask=mask,
@@ -114,12 +117,20 @@ class StructureAutoencoder(hk.Module):
 
         # convert coordinates, center & add encoded features
         data.update(self.prepare_data(data))
+        trace = {}
+        trace["prep/mask_sum"] = jnp.sum(data["mask"]).astype(jnp.float32)
+        trace["prep/pos_gt_mean"] = jnp.mean(data["pos_gt"])
+        trace["prep/pos_init_mean"] = jnp.mean(data["pos"])
+        trace["prep/dmap_mean"] = jnp.mean(data["dmap"])
         # optionally apply noise to the inputs
         if c.input_diffusion:
             clean_latent = encoder(data)
             data["clean_latent"] = clean_latent
             data.update(self.prepare_input_diffusion(data))
         latent = encoder(data)
+        trace["enc/latent_mean"] = jnp.mean(latent)
+        trace["enc/latent_std"] = jnp.std(latent)
+        trace["enc/latent_slice"] = latent[:2, :5]
         # optionally apply noise to the latents (not used in the manuscript)
         if c.latent_diffusion:
             # NOTE: constraining latents is necessary for diffusion to work
@@ -159,11 +170,17 @@ class StructureAutoencoder(hk.Module):
             local=jnp.zeros((data["pos"].shape[0], c.local_size), dtype=jnp.float32)
         )
         if not hk.running_init():
-            if c.eval:
+            fixed_recycle = data.get("fixed_recycle", None)
+            if fixed_recycle is not None:
+                count = fixed_recycle
+            elif c.eval:
                 count = c.num_recycle
             else:
                 count = jax.random.randint(hk.next_rng_key(), (), 0, 4)
             prev = jax.lax.stop_gradient(hk.fori_loop(0, count, iteration_body, prev))
+        local0, pos0, resi0, chain0, batch0, mask0 = decoder.prepare_features(data, prev)
+        trace["dec/local0_mean"] = jnp.mean(local0)
+        trace["dec/local0_std"] = jnp.std(local0)
         result = decoder(data, prev)
         if c.codebook_size:
             result["codebook_losses"] = codebook_losses
@@ -174,6 +191,7 @@ class StructureAutoencoder(hk.Module):
         )
         if c.codebook_size and c.state:
             out_dict["_state_update"] = state_update
+        
         return total, out_dict
 
     def add_noise(self, latent, batch):
@@ -264,7 +282,10 @@ class StructureDecoder(StructureAutoencoder):
             local=jnp.zeros((data["pos"].shape[0], c.local_size), dtype=jnp.float32)
         )
         if not hk.running_init():
-            if c.eval:
+            fixed_recycle = data.get("fixed_recycle", None)
+            if fixed_recycle is not None:
+                count = fixed_recycle
+            elif c.eval:
                 count = c.num_recycle
             else:
                 count = jax.random.randint(hk.next_rng_key(), (), 0, 4)
@@ -296,12 +317,27 @@ class StructureAutoencoderInference(StructureAutoencoder):
 
         # convert coordinates, center & add encoded features
         data.update(self.prepare_data(data))
+        trace = {}
+        if getattr(c, "trace", False):
+            trace["prep/pos"] = data["pos"]
+            trace["prep/pos_gt"] = data["pos_gt"]
+            trace["prep/mask"] = data["mask"]
+            trace["prep/dmap"] = data["dmap"]
+            # grab encoder-side init features
+            enc_prep = encoder.prepare_features(data)
+            if len(enc_prep) == 8:
+                enc_local0, _, _, _, _, _, enc_neigh0, enc_lfeat0 = enc_prep
+                trace["enc/local0"] = enc_local0
+                trace["enc/neighbours0"] = enc_neigh0
+                trace["enc/local_features0"] = enc_lfeat0
         # optionally apply noise to the inputs
         if c.input_diffusion:
             clean_latent = encoder(data)
             data["clean_latent"] = clean_latent
             data.update(self.prepare_input_diffusion(data))
         latent = encoder(data)
+        if getattr(c, "trace", False):
+            trace["enc/latent"] = latent
         # optionally apply noise to the latents
         if c.latent_diffusion:
             if "latent" in data:
@@ -335,6 +371,11 @@ class StructureAutoencoderInference(StructureAutoencoder):
         count = c.num_recycle
         prev = jax.lax.stop_gradient(hk.fori_loop(0, count, iteration_body, prev))
         result = decoder(data, prev)
+        if getattr(c, "trace", False):
+            trace["dec/pos"] = result["pos"]
+            trace["dec/local"] = result["local"]
+            trace["dec/atom_pos"] = result["atom_pos"]
+            trace["dec/aa"] = result["aa"]
 
         mask = data["mask"]
         # compute decoder perplexity and sequence recovery
@@ -397,6 +438,8 @@ class StructureAutoencoderInference(StructureAutoencoder):
             violation=violation_error)
         if c.codebook_size:
             out["codebook_index"] = codebook_index
+        if getattr(c, "trace", False):
+            out["__trace"] = trace
         return out
     
 class StructureDecoderInference(StructureDecoder):
@@ -558,7 +601,8 @@ class EncoderBlock(hk.Module):
                  resi, chain, batch, mask):
         c = self.config
         # embed pair features
-        neighbours = extract_neighbours(16, 16, 32)(
+        nr = int(getattr(c, "num_random_neighbours", 32))
+        neighbours = extract_neighbours(16, 16, nr)(
             Vec3Array.from_array(pos),
             resi, chain, batch, mask)
         pair, pair_mask = aa_decoder_pair_features(c)(
@@ -608,7 +652,11 @@ class Encoder(hk.Module):
 
     def __call__(self, data):
         c = self.config
-        local, pos, resi, chain, batch, mask = self.prepare_features(data)
+        prep = self.prepare_features(data)
+        if getattr(c, "trace", False):
+            local, pos, resi, chain, batch, mask, neighbours, local_features = prep
+        else:
+            local, pos, resi, chain, batch, mask = prep
         local = EncoderStack(c, depth=c.encoder_depth)(
             local, pos, resi, chain, batch, mask)
         if c.noembed:
@@ -643,6 +691,8 @@ class Encoder(hk.Module):
                 local.shape[-1], bias=False, initializer="linear")(time)
         local = hk.LayerNorm([-1], True, True)(local)
 
+        if getattr(self.config, "trace", False):
+            return local, pos.to_array(), resi, chain, batch, mask, neighbours, local_features
         return local, pos.to_array(), resi, chain, batch, mask
 
 class Decoder(hk.Module):
@@ -770,14 +820,18 @@ class Decoder(hk.Module):
         
         # AA NLL loss
         aa_predict_mask = mask * (data["aa_gt"] != 20)
+        losses["debug_mask_sum"] = mask.sum()
+        losses["debug_aa_mask_sum"] = aa_predict_mask.sum()
         aa_nll = -(result["aa"] * jax.nn.one_hot(data["aa_gt"], 20, axis=-1)).sum(axis=-1)
         aa_nll = jnp.where(aa_predict_mask, aa_nll, 0)
         aa_nll = aa_nll.sum() / jnp.maximum(aa_predict_mask.sum(), 1)
         losses["aa"] = aa_nll
-        total += c.aa_weight * aa_nll
+        losses["weighted_aa"] = c.aa_weight * aa_nll
+        total += losses["weighted_aa"]
 
         # position losses
         base_weight = mask / jnp.maximum(index_sum(mask.astype(jnp.float32), batch, mask), 1) / (batch.max() + 1)
+        losses["debug_base_weight_sum"] = base_weight.sum()
 
         # sparse neighbour FAPE ** 2
         pair_mask = batch[:, None] == batch[None, :]
@@ -791,6 +845,7 @@ class Decoder(hk.Module):
         distance = jnp.where(pair_mask, distance, jnp.inf)
         # get random neighbours to compute sparse FAPE on
         neighbours = get_random_neighbours(c.fape_neighbours)(distance, batch, mask)
+        losses["debug_neighbours_hash"] = jnp.sum(neighbours)
         mask_neighbours = (neighbours != -1) * mask[:, None] * mask[neighbours]
         pos_gt_local = frames_gt[:, None, None].apply_inverse_to_point(pos_gt[neighbours])
         traj = Vec3Array.from_array(result["trajectory"])
@@ -810,22 +865,26 @@ class Decoder(hk.Module):
         losses["fape"] = fape_traj[-1] / 3
         losses["fape_trajectory"] = fape_traj.mean() / 3
         fape_loss = (c.fape_weight * fape_traj[-1] + c.fape_trajectory_weight * fape_traj.mean()) / 3
-        total += fape_loss
+        losses["weighted_fape"] = fape_loss
+        total += losses["weighted_fape"]
 
         # sup distogram loss
         if c.distogram_block != "none":
             cb_gt = pos_gt[:, -1]
             sup_neighbours = result["sup_neighbours"]
             sup_mask = (sup_neighbours != -1) * mask[:, None] * mask[sup_neighbours]
+            losses["debug_sup_mask_sum"] = sup_mask.sum()
             dist_gt = (cb_gt[:, None] - cb_gt[sup_neighbours]).norm()
             dist_one_hot = distance_one_hot(dist_gt, 0, 22.0, 16)
             distogram_nll = -(result["sup_distogram"] * dist_one_hot[None]).sum(axis=-1)
             distogram_nll = jnp.where(sup_mask, distogram_nll, 0).sum(axis=-1)
             distogram_nll /= jnp.maximum(sup_mask.sum(axis=1), 1)
             distogram_nll = (distogram_nll * base_weight).sum(axis=1)
+            # check what is in the last index
             losses["distogram"] = distogram_nll[-1]
             losses["distogram_trajectory"] = distogram_nll.mean()
-            total += 10.0 * distogram_nll[-1] + 5.0 * distogram_nll.mean()
+            losses["weighted_distogram"] = 10.0 * distogram_nll[-1] + 5.0 * distogram_nll.mean()
+            total += losses["weighted_distogram"]
 
         # Kabsch RMSD loss
         if c.kabsch_rmsd:
@@ -842,7 +901,8 @@ class Decoder(hk.Module):
             losses["kabsch_rmsd"] = pos_loss[-1] / 3
             losses["kabsch_rmsd_trajectory"] = pos_loss.mean() / 3
             pos_loss = (c.fape_weight * pos_loss[-1] + c.fape_trajectory_weight * pos_loss.mean()) / 3
-            total += pos_loss
+            losses["weighted_kabsch_rmsd"] = pos_loss
+            total += losses["weighted_kabsch_rmsd"]
 
         # local loss
         atom_pos = Vec3Array.from_array(result["atom_pos"])
@@ -859,7 +919,8 @@ class Decoder(hk.Module):
         local_loss /= jnp.maximum(mask_gt.sum(axis=(1, 2)), 1)
         local_loss = (jnp.where(mask, local_loss, 0) * base_weight).sum() / 3
         losses["local"] = local_loss
-        total += c.local_weight * local_loss
+        losses["weighted_local"] = c.local_weight * local_loss
+        total += losses["weighted_local"]
 
         # VQ losses
         if c.codebook_size and not c.is_decoder:
@@ -879,7 +940,8 @@ class Decoder(hk.Module):
                 raw_loss = raw_loss * (1 + time ** 2) / jnp.maximum(time ** 2, 1e-6)
                 weighted_loss = (jnp.where(mask, raw_loss, 0) * base_weight).sum()
             losses["latent"] = weighted_loss
-            total += c.latent_loss_scale * weighted_loss
+            losses["weighted_latent"] = c.latent_loss_scale * weighted_loss
+            total += losses["weighted_latent"]
         # AlphaFold violation loss. (not used in manuscript)
         if c.violation_scale:
             res_mask = data["mask"]
@@ -895,8 +957,10 @@ class Decoder(hk.Module):
                                           batch_index=data["batch_index"],
                                           per_residue=False)
             losses["violation"] = violation.mean()
-            total += c.violation_scale * violation.mean()
+            losses["weighted_violation"] = c.violation_scale * violation.mean()
+            total += losses["weighted_violation"]
 
+        losses["total"] = total
         return total, losses
 
 def get_angle_positions(aa_gt, local, pos):
@@ -1557,11 +1621,11 @@ class SemiEquivariantDecoderBlock(hk.Module):
             count=32)(
                 jax.lax.stop_gradient(dmap),
                 resi, chain, batch, mask)
-
+        nr = int(getattr(c, "num_random_neighbours", 32))
         current_neighbours = extract_neighbours(
             num_index=16,
             num_spatial=16,
-            num_random=32)(
+            num_random=nr)(
                 Vec3Array.from_array(pos),
                 resi, chain, batch, mask)
 
@@ -1627,11 +1691,11 @@ class DecoderBlock(hk.Module):
             # placeholder
             distogram_logits = jnp.zeros((1,), dtype=jnp.float32)
             dmap = None
-
+        nr = int(getattr(c, "num_random_neighbours", 32))
         current_neighbours = extract_neighbours(
             num_index=16,
             num_spatial=16,
-            num_random=32)(
+            num_random=nr)(
                 Vec3Array.from_array(pos),
                 resi, chain, batch, mask)
 

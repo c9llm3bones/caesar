@@ -17,7 +17,7 @@ def cast_float(batch: Dict[str, Any], dtype: torch.dtype = torch.float32) -> Dic
     out = {}
     for k, v in batch.items():
         t = v if torch.is_tensor(v) else torch.as_tensor(v)
-        if t.is_floating_point():
+        if t.is_floating_point() and t.dtype != dtype:
             t = t.to(dtype=dtype)
         out[k] = t
     return out
@@ -27,9 +27,30 @@ def move_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any
     out = {}
     for k, v in batch.items():
         if torch.is_tensor(v):
-            out[k] = v.to(device)
+            out[k] = v if v.device == device else v.to(device=device, non_blocking=True)
         else:
-            out[k] = v
+            out[k] = torch.as_tensor(v, device=device)
+    return out
+
+
+def prepare_batch(
+    batch: Dict[str, Any],
+    *,
+    device: Optional[torch.device] = None,
+    float_dtype: torch.dtype = torch.float32,
+) -> Dict[str, Any]:
+    """
+    Convert tree leaves to tensors, cast float tensors to `float_dtype`,
+    and place tensors on `device` (if provided) in a single pass.
+    """
+    out: Dict[str, Any] = {}
+    for k, v in batch.items():
+        t = v if torch.is_tensor(v) else torch.as_tensor(v)
+        if t.is_floating_point() and t.dtype != float_dtype:
+            t = t.to(dtype=float_dtype)
+        if device is not None and t.device != device:
+            t = t.to(device=device, non_blocking=True)
+        out[k] = t
     return out
 
 
@@ -190,8 +211,7 @@ def _repeat0(t: torch.Tensor, times: int) -> torch.Tensor:
 
 def make_smoke_batch(npz_path: str, device: torch.device, mul: int) -> Dict[str, torch.Tensor]:
     d = dict(np.load(npz_path))
-    batch = {k: torch.as_tensor(v, device=device) for k, v in d.items()}
-    batch = cast_float(batch, dtype=torch.float32)
+    batch = prepare_batch(d, device=device, float_dtype=torch.float32)
 
     # infer L (residue axis length)
     L = None
@@ -335,10 +355,20 @@ def model_step(model, config, rebatch: int = 1, is_training: bool = True, device
         model.train()
 
     def core_step(data: Dict[str, Any], generator: Optional[torch.Generator] = None):
-        data = {k: (v if torch.is_tensor(v) else torch.as_tensor(v)) for k, v in data.items()}
-        data = cast_float(data, dtype=torch.float32)
-        if device is not None:
-            data = move_to_device(data, device)
+        # Hot path: only touch tensors if batch is not already prepared.
+        needs_prepare = False
+        for v in data.values():
+            if not torch.is_tensor(v):
+                needs_prepare = True
+                break
+            if v.is_floating_point() and v.dtype != torch.float32:
+                needs_prepare = True
+                break
+            if device is not None and v.device != device:
+                needs_prepare = True
+                break
+        if needs_prepare:
+            data = prepare_batch(data, device=device, float_dtype=torch.float32)
 
         loss, out = _call_model(model, data, generator)
         return loss, out
@@ -399,9 +429,7 @@ def make_training_inner(
         tr = time.time()
 
         device = next(model.parameters()).device
-        item_t = {k: (v if torch.is_tensor(v) else torch.as_tensor(v)) for k, v in item.items()}
-        item_t = cast_float(item_t, dtype=torch.float32)
-        item_t = move_to_device(item_t, device)
+        item_t = prepare_batch(item, device=device, float_dtype=torch.float32)
         if debug_batch:
             fp = summarize_batch(item_t)
             same = (fp == first_fp["value"]) if first_fp["value"] is not None else True
@@ -488,9 +516,7 @@ def make_valid_inner(
         item = next(data)
 
         device = next(model.parameters()).device
-        item_t = {k: (v if torch.is_tensor(v) else torch.as_tensor(v)) for k, v in item.items()}
-        item_t = cast_float(item_t, dtype=torch.float32)
-        item_t = move_to_device(item_t, device)
+        item_t = prepare_batch(item, device=device, float_dtype=torch.float32)
 
         backup = None
         ema_shadow = loop_state.aux_state.get("ema", None)
@@ -721,8 +747,7 @@ if __name__ == "__main__":
         print("  ", name, tuple(v.shape))
 
     init_batch = slice_batch_first_dim(item_0, int(opt.rebatch) * 100)
-    init_batch = cast_float({k: torch.as_tensor(v) for k, v in init_batch.items()}, dtype=torch.float32)
-    init_batch = move_to_device(init_batch, device)
+    init_batch = prepare_batch(init_batch, device=device, float_dtype=torch.float32)
 
     # (с) one dry forward to materialize LazyLinear
     gen0 = torch.Generator(device=device).manual_seed(int(opt.jax_seed))
@@ -755,8 +780,9 @@ if __name__ == "__main__":
     )
     print("Optimizer initialized.")
 
-    step_train = model_step(model, config, rebatch=int(opt.rebatch), is_training=True, device=device)
-    step_valid = model_step(model, config, rebatch=int(opt.rebatch), is_training=False, device=device)
+    # Batches are prepared on the target device before calling step_fn.
+    step_train = model_step(model, config, rebatch=int(opt.rebatch), is_training=True, device=None)
+    step_valid = model_step(model, config, rebatch=int(opt.rebatch), is_training=False, device=None)
 
     print("Constructing training loop...")
     key = torch.Generator(device=device).manual_seed(int(opt.jax_seed))

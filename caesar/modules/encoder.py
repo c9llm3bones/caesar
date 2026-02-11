@@ -15,7 +15,9 @@ from caesar.modules.utils import (
     distance_rbf, 
     index_mean,
     get_neighbours,
-    extract_neighbours,
+)
+from caesar.modules.utils.geometry import (
+    extract_neighbours_salad_compatible as extract_neighbours,
 )
 from caesar.modules.geometric import (
     SparseStructureAttention,
@@ -52,12 +54,13 @@ class EncoderBlock(nn.Module):
         self.ln_attn = nn.LayerNorm(c.local_size)
         self.ln_update = nn.LayerNorm(c.local_size)
 
-    def forward(self, features, pos, resi, chain, batch, mask):
+    def forward(self, features, pos, resi, chain, batch, mask, *, generator: torch.Generator | None = None):
         c = self.config
         nr = int(getattr(c, "num_random_neighbours", 32))
         neighbours = extract_neighbours(16, 16, nr)(
             Vec3Array.from_array(pos),
-            resi, chain, batch, mask
+            resi, chain, batch, mask,
+            generator=generator
         )
 
         pair, pair_mask = self.pair_features(
@@ -137,11 +140,12 @@ class EncoderStack(nn.Module):
 
         self.ln_final = nn.LayerNorm(config.local_size)
 
-    def forward(self, local, pos, resi, chain, batch, mask):
+    def forward(self, local, pos, resi, chain, batch, mask, *, generator: torch.Generator | None = None):
         for block in self.blocks:
             local = block(
                 local, pos,
-                resi, chain, batch, mask
+                resi, chain, batch, mask,
+                generator=generator
             )
 
         local = self.ln_final(local)
@@ -173,7 +177,13 @@ class Encoder(nn.Module):
             self.to_latent = Linear(c.latent_size, bias=False, initializer=init_linear()) 
 
 
-    def prepare_features(self, data):
+    def prepare_features(
+        self,
+        data,
+        *,
+        generator: torch.Generator | None = None,
+        trace: dict | None = None,
+    ):
         """Construct encoder input features from a batch of data."""
         c = self.config
 
@@ -192,7 +202,8 @@ class Encoder(nn.Module):
         pos = Vec3Array.from_array(pos)
 
         neighbours = extract_neighbours(5, 5, 0)(
-            pos, resi, chain, batch, mask
+            pos, resi, chain, batch, mask,
+            generator=generator
         )
 
         local_features = self.init_local(pos, neighbours, resi, chain, batch, mask)
@@ -205,13 +216,26 @@ class Encoder(nn.Module):
 
         local = self.local_ln(local)
 
+        if trace is not None:
+            trace["enc/neighbours0"] = neighbours.detach()
+            trace["enc/local_features0"] = local_features.detach()
+            trace["enc/local0"] = local.detach()
+
         return local, pos.to_tensor(), resi, chain, batch, mask
 
-    def forward(self, data):
+    def forward(
+        self,
+        data,
+        *,
+        generator: torch.Generator | None = None,
+        trace: dict | None = None,
+    ):
         c = self.config
 
-        local, pos, resi, chain, batch, mask = self.prepare_features(data)
-        local = self.stack(local, pos, resi, chain, batch, mask)
+        local, pos, resi, chain, batch, mask = self.prepare_features(
+            data, generator=generator, trace=trace
+        )
+        local = self.stack(local, pos, resi, chain, batch, mask, generator=generator)
         
         if c.noembed:
             return local

@@ -1,3 +1,5 @@
+### need pip install git+https://github.com/aqlaboratory/openfold.git
+
 import os
 import time
 import pickle
@@ -93,9 +95,11 @@ if __name__ == "__main__":
         "sample from a protein diffusion model.",
         params="checkpoint.jax",
         out_path="outputs/",
-        config="default",
+        config="small_inner",
         path="inputs/",
         diagnostics="False",
+        trace="False",
+        no_random="False",
         time=0.0,
         num_recycle=4,
         jax_seed=42,
@@ -109,6 +113,8 @@ if __name__ == "__main__":
     config = deepcopy(getattr(config_choices, opt.config))
     config.eval = True
     config.num_recycle = int(opt.num_recycle)
+    if opt.no_random == "True":
+        config.num_random_neighbours = 0
 
     if getattr(config, "is_decoder", False):
         model = StructureDecoderInference(
@@ -140,6 +146,8 @@ if __name__ == "__main__":
             t = t.to(torch.float32)
         warmup[k] = t
     warmup["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
+    if opt.no_random == "True":
+        warmup["no_random"] = torch.tensor(True, device=device)
     with torch.no_grad():
         _ = model(warmup, generator=torch.Generator(device=device).manual_seed(int(opt.jax_seed)))
 
@@ -176,6 +184,8 @@ if __name__ == "__main__":
                 data_t[k] = t
 
             data_t["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
+            if opt.no_random == "True":
+                data_t["no_random"] = torch.tensor(True, device=device)
 
             key, subkey = key, torch.Generator(device=device).manual_seed(
                 int(torch.randint(0, 2**31 - 1, (1,), generator=key, device=device).item())
@@ -183,7 +193,10 @@ if __name__ == "__main__":
             mask = data_t["all_atom_mask"][:, 1] > 0
 
             with torch.no_grad():
-                out = model(data_t, generator=subkey)
+                if opt.trace == "True":
+                    out, trace = model(data_t, generator=subkey, return_trace=True)
+                else:
+                    out = model(data_t, generator=subkey)
 
             out = _slice_dict(out, mask)
             atom37, atom37_mask = atom14_to_atom37(out["atom_pos"], out["aatype"])
@@ -214,13 +227,19 @@ if __name__ == "__main__":
                 diagnostics = dict(
                     latent=out["latent"].detach().cpu().numpy(),
                     local=out["local"].detach().cpu().numpy(),
-                    dssp=out["dssp"].detach().cpu().numpy(),
+#                    dssp=out["dssp"].detach().cpu().numpy(),
                 )
                 if "codebook_index" in out:
                     diagnostics["codebook_index"] = out["codebook_index"].detach().cpu().numpy()
                 np.savez_compressed(
                     f"{opt.out_path}/diagnostics/decoder_{'.'.join(name.split('.')[:-1])}.npz",
                     **diagnostics,
+                )
+            if opt.trace == "True":
+                trace_np = {k: v.detach().cpu().numpy() for k, v in trace.items()}
+                np.savez_compressed(
+                    f"{opt.out_path}/diagnostics/trace_{'.'.join(name.split('.')[:-1])}.npz",
+                    **trace_np,
                 )
     print("All proteins decoded.")
 
