@@ -25,6 +25,7 @@ dependencies = [
   "gemmi",
   "pytest>=7.0",
   "pytest-cov",
+  "flax",
 ]
 
 [project.urls]

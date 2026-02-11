@@ -37,7 +37,8 @@ default = dotdict(
     fape_trajectory_weight=0.5,
     # dataset constraints
     min_size=50,
-    max_size=None
+    max_size=None,
+    num_random_neighbours=32,
 )
 
 small = deepcopy(default)

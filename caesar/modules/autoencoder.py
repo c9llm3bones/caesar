@@ -768,7 +768,7 @@ class StructureAutoencoderInference(StructureAutoencoder):
         in_threshold = (derr[..., None] < threshold) & pair_mask[..., None]
         denom = torch.clamp(pair_mask[..., None].sum(dim=1).to(torch.float32), min=1.0)
         lddt_ca = (in_threshold.sum(dim=1).to(torch.float32) / denom).mean(dim=-1)
-        lddt_ca = torch.where(mask, lddt_ca.to(mask.dtype), torch.zeros_like(lddt_ca).to(mask.dtype))
+        lddt_ca = torch.where(mask, lddt_ca, torch.zeros_like(lddt_ca))
 
         # AlphaFold-style violation loss (JAX-salad compatible API)
         res_mask = mask.to(torch.float32)
