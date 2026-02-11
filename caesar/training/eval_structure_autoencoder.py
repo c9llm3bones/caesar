@@ -132,7 +132,23 @@ if __name__ == "__main__":
     start = time.time()
     params_path = opt.params
 
-    # warmup: materialize LazyLinear with the first input
+    try:
+        state_dict = _load_state_dict(params_path)
+        model.load_state_dict(state_dict, strict=True)
+    except Exception:
+        # fallback: import from salad .jax
+        from caesar.scripts.import_salad_weights import import_salad_weights_
+
+        if getattr(config, "is_decoder", False):
+            raise RuntimeError(
+                "Decoder inference does not support importing from .jax. "
+                "Please provide a torch checkpoint."
+            )
+        import_salad_weights_(model, params_path, verbose=False, strict_missing=True, report=True)
+
+    print(f"Model parameters loaded in {time.time() - start:.3f} seconds.")
+
+    # warmup: materialize LazyLinear with the first input (after weights load)
     first_item = next(parse_input_data(opt.path, size=1024), None)
     if first_item is None:
         raise FileNotFoundError(f"No .pdb files found in {opt.path}")
@@ -150,22 +166,6 @@ if __name__ == "__main__":
         warmup["no_random"] = torch.tensor(True, device=device)
     with torch.no_grad():
         _ = model(warmup, generator=torch.Generator(device=device).manual_seed(int(opt.jax_seed)))
-
-    try:
-        state_dict = _load_state_dict(params_path)
-        model.load_state_dict(state_dict, strict=True)
-    except Exception:
-        # fallback: import from salad .jax
-        from caesar.scripts.import_salad_weights import import_salad_weights_
-
-        if getattr(config, "is_decoder", False):
-            raise RuntimeError(
-                "Decoder inference does not support importing from .jax. "
-                "Please provide a torch checkpoint."
-            )
-        import_salad_weights_(model, params_path, verbose=False, strict_missing=True, report=True)
-
-    print(f"Model parameters loaded in {time.time() - start:.3f} seconds.")
 
     print("Start decoding...")
     os.makedirs(opt.out_path, exist_ok=True)
