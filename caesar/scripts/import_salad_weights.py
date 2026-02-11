@@ -42,11 +42,15 @@ def load_salad_flat_from_pickle(jax_path: str) -> Dict[str, np.ndarray]:
 # Pattern mirrors OpenFold: ParamType/Param/process_translation_dict/stacked/assign.
 class ParamType(Enum):
     # Dense (in,out) -> torch Linear.weight (out,in)
-    LinearWeight = partial(lambda w: w.unsqueeze(-1) if len(w.shape) == 1 else w.transpose(-1, -2))
-    Other = partial(lambda w: w)
+    LinearWeight = "linear_weight"
+    Other = "other"
 
-    def __init__(self, fn):
-        self.transformation = fn
+    @property
+    def transformation(self):
+        if self is ParamType.LinearWeight:
+            return lambda w: w.unsqueeze(-1) if len(w.shape) == 1 else w.transpose(-1, -2)
+        return lambda w: w
+
 
 
 @dataclass
