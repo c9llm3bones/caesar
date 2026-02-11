@@ -63,15 +63,15 @@ class Linear(nn.Module):
             nn.init.constant_(self.lin.bias, self.bias_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        was_uninitialized = isinstance(self.lin.weight, UninitializedParameter)
+        if self.lin.weight.device != x.device:
+            self.lin = self.lin.to(x.device)
 
-        y = self.lin(x) 
+        y = self.lin(x)
 
         if not self._inited:
-            if was_uninitialized:
-                with torch.no_grad():
-                    self._apply_init()
-                y = self.lin(x)  
+            with torch.no_grad():
+                self._apply_init()
+            y = self.lin(x)
             self._inited = True
 
         return y
