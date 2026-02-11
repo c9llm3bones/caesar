@@ -1,8 +1,5 @@
-### need pip install git+https://github.com/aqlaboratory/openfold.git
-
 import os
 import time
-import pickle
 from copy import deepcopy
 
 import numpy as np
@@ -16,21 +13,17 @@ from caesar.modules.autoencoder import (
     prepare_data,
 )
 from caesar.modules.config import distance_to_structure_decoder as config_choices
+from caesar.data.allpdb import slice_dict
+from caesar.training.train_structure_autoencoder import prepare_batch, slice_batch_first_dim
 from flexloop.utils import parse_options
 
 
-def _slice_dict(data: dict, mask: torch.Tensor) -> dict:
-    out = {}
-    for k, v in data.items():
-        if torch.is_tensor(v) and v.ndim > 0 and v.shape[0] == mask.shape[0]:
-            out[k] = v[mask]
-        else:
-            out[k] = v
-    return out
-
-
 def _load_state_dict(path: str) -> dict:
-    ckpt = torch.load(path, map_location="cpu")
+    # torch>=2.6 defaults weights_only=True; for trusted checkpoints allow full load.
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(path, map_location="cpu")
     if isinstance(ckpt, dict):
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             return ckpt["model"]
@@ -106,8 +99,6 @@ if __name__ == "__main__":
     )
 
     print(f"Running decoder with {int(opt.num_recycle) + 1} steps on files in {opt.path}")
-    start = time.time()
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     config = deepcopy(getattr(config_choices, opt.config))
@@ -115,6 +106,7 @@ if __name__ == "__main__":
     config.num_recycle = int(opt.num_recycle)
     if opt.no_random == "True":
         config.num_random_neighbours = 0
+        config.fape_neighbours = 0
 
     if getattr(config, "is_decoder", False):
         model = StructureDecoderInference(
@@ -129,38 +121,36 @@ if __name__ == "__main__":
     model.eval()
 
     print("Loading model parameters...")
-    start = time.time()
     params_path = opt.params
+    is_jax = str(params_path).endswith(".jax")
 
-    try:
+    if is_jax:
+        # Warmup to materialize LazyLinear, then import salad weights.
+        first_item = next(parse_input_data(opt.path, size=1024), None)
+        if first_item is None:
+            raise FileNotFoundError(f"No .pdb files found in {opt.path}")
+        _, warmup_data = first_item
+        warmup = prepare_batch(warmup_data, device=device, float_dtype=torch.float32)
+        warmup["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
+        if opt.no_random == "True":
+            warmup["no_random"] = torch.tensor(True, device=device)
+        with torch.no_grad():
+            _ = model(warmup, generator=torch.Generator(device=device).manual_seed(int(opt.jax_seed)))
+
+        from caesar.scripts.import_salad_weights import import_salad_weights_
+        import_salad_weights_(model, params_path, verbose=False, strict_missing=True, report=True)
+    else:
         state_dict = _load_state_dict(params_path)
         model.load_state_dict(state_dict, strict=True)
-    except Exception:
-        # fallback: import from salad .jax
-        from caesar.scripts.import_salad_weights import import_salad_weights_
 
-        if getattr(config, "is_decoder", False):
-            raise RuntimeError(
-                "Decoder inference does not support importing from .jax. "
-                "Please provide a torch checkpoint."
-            )
-        import_salad_weights_(model, params_path, verbose=False, strict_missing=True, report=True)
+    print("Model parameters loaded.")
 
-    print(f"Model parameters loaded in {time.time() - start:.3f} seconds.")
-
-    # warmup: materialize LazyLinear with the first input (after weights load)
+    # warmup (after weights load) to ensure lazy params are set on device
     first_item = next(parse_input_data(opt.path, size=1024), None)
     if first_item is None:
         raise FileNotFoundError(f"No .pdb files found in {opt.path}")
     _, warmup_data = first_item
-    warmup = {}
-    for k, v in warmup_data.items():
-        t = torch.as_tensor(v, device=device)
-        if k in ("aa_gt", "residue_index", "chain_index", "batch_index"):
-            t = t.to(torch.long)
-        elif k in ("seq_mask", "residue_mask"):
-            t = t.to(torch.float32)
-        warmup[k] = t
+    warmup = prepare_batch(warmup_data, device=device, float_dtype=torch.float32)
     warmup["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
     if opt.no_random == "True":
         warmup["no_random"] = torch.tensor(True, device=device)
@@ -174,15 +164,7 @@ if __name__ == "__main__":
         f_scores.write("name,num_aa,recovery,perplexity,rmsd_ca,tm,lddt\n")
         key = torch.Generator(device=device).manual_seed(int(opt.jax_seed))
         for name, data in parse_input_data(opt.path, size=1024):
-            data_t = {}
-            for k, v in data.items():
-                t = torch.as_tensor(v, device=device)
-                if k in ("aa_gt", "residue_index", "chain_index", "batch_index"):
-                    t = t.to(torch.long)
-                elif k in ("seq_mask", "residue_mask"):
-                    t = t.to(torch.float32)
-                data_t[k] = t
-
+            data_t = prepare_batch(data, device=device, float_dtype=torch.float32)
             data_t["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
             if opt.no_random == "True":
                 data_t["no_random"] = torch.tensor(True, device=device)
@@ -190,6 +172,7 @@ if __name__ == "__main__":
             key, subkey = key, torch.Generator(device=device).manual_seed(
                 int(torch.randint(0, 2**31 - 1, (1,), generator=key, device=device).item())
             )
+
             mask = data_t["all_atom_mask"][:, 1] > 0
 
             with torch.no_grad():
@@ -198,7 +181,7 @@ if __name__ == "__main__":
                 else:
                     out = model(data_t, generator=subkey)
 
-            out = _slice_dict(out, mask)
+            out = slice_dict(out, mask)
             atom37, atom37_mask = atom14_to_atom37(out["atom_pos"], out["aatype"])
 
             protein = Protein(
@@ -227,7 +210,6 @@ if __name__ == "__main__":
                 diagnostics = dict(
                     latent=out["latent"].detach().cpu().numpy(),
                     local=out["local"].detach().cpu().numpy(),
-#                    dssp=out["dssp"].detach().cpu().numpy(),
                 )
                 if "codebook_index" in out:
                     diagnostics["codebook_index"] = out["codebook_index"].detach().cpu().numpy()
@@ -241,6 +223,5 @@ if __name__ == "__main__":
                     f"{opt.out_path}/diagnostics/trace_{'.'.join(name.split('.')[:-1])}.npz",
                     **trace_np,
                 )
-    print("All proteins decoded.")
 
-# python -m caesar.training.eval_structure_autoencoder  --params /home/kostya/Downloads/caesar/salad_weights/ae_params/small_inner-200k.jax --path /home/kostya/Downloads/caesar/caesar/data/casp14.targets.T-dom.public_11.29.2020 --out_path outputs/ --config small_inner  --num_recycle 4  --diagnostics True
+    print("All proteins decoded.")

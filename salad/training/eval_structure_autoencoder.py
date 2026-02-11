@@ -97,6 +97,7 @@ if __name__ == "__main__":
     config.trace = (opt.trace == "True")
     if opt.no_random == "True":
         config.num_random_neighbours = 0
+        config.fape_neighbours = 0
     key = jax.random.PRNGKey(opt.jax_seed)
     _, model = hk.transform(model_step(config))
     model = jax.jit(model)
