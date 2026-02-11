@@ -5,7 +5,7 @@ All models in the manuscript were trained with the BatchedProteinPDBStream datas
 
 import os
 import datetime
-from typing import Dict
+from typing import Dict, Optional
 
 import random
 import numpy as np
@@ -54,10 +54,11 @@ class AllPDB:
     def __init__(self, path, start_date="01/01/90", cutoff_date="12/31/21",
                  cutoff_resolution=4.0, filter_residue_type=None,
                  seqres_aa="clusterSeqresAA", seqres_na="clusterSeqresNA",
-                 assembly=True, split_types=False, npz_version="") -> None:
+                 assembly=True, split_types=False, npz_version="", seed: Optional[int] = None) -> None:
         super().__init__()
         self.path = path
         self.split_types = split_types
+        self.rng = random.Random(seed)
         compute_data_index = compute_index if assembly else compute_asym_index
         self.data_index = compute_data_index(path, start_date=start_date,
                                              cutoff_date=cutoff_date,
@@ -77,9 +78,9 @@ class AllPDB:
     def __getitem__(self, kind, index) -> Dict[str, np.ndarray]:
         data_index = self.data_index[kind]
         # select a random chain at the selected index
-        chosen_chain = random.choice(data_index[index])
+        chosen_chain = self.rng.choice(data_index[index])
         # select a random biological assembly
-        assembly = random.choice(chosen_chain["assemblies"])
+        assembly = self.rng.choice(chosen_chain["assemblies"])
         # load the npz archive for that assembly
         raw_data = np.load(f"{self.path}/{assembly}")
         residue_type = raw_data["residue_type"]
@@ -111,10 +112,10 @@ class AllPDBSample(AllPDB):
     def __init__(self, path, start_date="01/01/90", cutoff_date="12/31/21",
                  cutoff_resolution=4, filter_residue_type=None,
                  seqres_aa="clusterSeqresAA", seqres_na="clusterSeqresNA",
-                 assembly=True) -> None:
+                 assembly=True, seed: Optional[int] = None) -> None:
         super().__init__(
             path, start_date, cutoff_date, cutoff_resolution,
-            filter_residue_type, seqres_aa, seqres_na, assembly)
+            filter_residue_type, seqres_aa, seqres_na, assembly, seed=seed)
         self.data_index = {
             kind: create_cluster_weights(self.data_index[kind])
             for kind in self.data_index
@@ -124,10 +125,10 @@ class AllPDBSample(AllPDB):
     def __getitem__(self, kind, index) -> Dict[str, np.ndarray]:
         data_index = self.data_index[kind]
         chosen_chain = data_index[index]
-        assembly = random.choice(chosen_chain["assemblies"])
+        assembly = self.rng.choice(chosen_chain["assemblies"])
         # randomly skip the selected chain
         weight = chosen_chain["weight"]
-        accept_item = random.random() < weight
+        accept_item = self.rng.random() < weight
         if not accept_item:
             return None
         raw_data = np.load(f"{self.path}/{assembly}")
@@ -147,13 +148,15 @@ class ProteinPDB(AllPDB):
                  cutoff_resolution=4,
                  seqres_aa="clusterSeqresAA",
                  seqres_na="clusterSeqresNA",
-                 assembly=True) -> None:
+                 assembly=True,
+                 seed: Optional[int] = None) -> None:
         super().__init__(
             path, start_date, cutoff_date,
             cutoff_resolution, ["AA"],
             seqres_aa=seqres_aa,
             seqres_na=seqres_na,
-            assembly=assembly)
+            assembly=assembly,
+            seed=seed)
         self.aa_order = np.array(
             ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN',
              'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS',
@@ -193,11 +196,11 @@ class AtomPDB(AllPDB):
     """All-atom PDB dataset in atom1 format (residue atoms not bundled)."""
     def __init__(self, path, start_date="01/01/90", cutoff_date="12/31/21",
                  cutoff_resolution=4, seqres_aa="clusterSeqresAA",
-                 seqres_na="clusterSeqresNA", assembly=True, split_types=False, npz_version=""):
+                 seqres_na="clusterSeqresNA", assembly=True, split_types=False, npz_version="", seed: Optional[int] = None):
         super().__init__(
             path, start_date, cutoff_date, cutoff_resolution,
             RESTYPES_NO_WATER, seqres_aa, seqres_na,
-            assembly, split_types, npz_version)
+            assembly, split_types, npz_version, seed=seed)
 
     def __getitem__(self, index):
         # repeat per residue features across all
@@ -820,13 +823,16 @@ class BatchedProteinPDBStream(IterableDataset):
                  min_size=32,
                  max_size=None,
                  legacy_repetitive_chains=True,
-                 base_dataset=ProteinPDB) -> None:
+                 base_dataset=ProteinPDB,
+                 seed: Optional[int] = None) -> None:
         super().__init__()
+        self.rng = random.Random(seed)
         self.protein_pdb = base_dataset(
             path, start_date, cutoff_date, cutoff_resolution,
             seqres_aa=seqres_aa,
             seqres_na=seqres_na,
-            assembly=assembly)
+            assembly=assembly,
+            seed=seed)
         self.size = size
         self.min_size = min_size
         self.max_size = max_size or size
@@ -839,7 +845,7 @@ class BatchedProteinPDBStream(IterableDataset):
         while data is None:
             if not self.current_index:
                 self.current_index = list(range(len(self.protein_pdb)))
-                random.shuffle(self.current_index)
+                self.rng.shuffle(self.current_index)
             index = self.current_index.pop()
             data = self.protein_pdb[index]
         return data, index
@@ -893,7 +899,7 @@ class BatchedProteinPDBStream(IterableDataset):
 
             # skip according to length (as done in AlphaFold)
             skip_chance = 1 - max(min(selected_chain_size, 512), 256) / 512
-            if random.random() < skip_chance:
+            if self.rng.random() < skip_chance:
                 continue
             # skip chains wrongly marked as proteins
             if selected_chain_size == 0:
@@ -910,7 +916,7 @@ class BatchedProteinPDBStream(IterableDataset):
                     break
             # with probability 1-p_complex we're in single-sequence mode:
             # add just the chosen chain to the complex
-            elif random.random() <= (1 - self.p_complex):
+            elif self.rng.random() <= (1 - self.p_complex):
                 # the selected chain fits in the batch
                 part = slice_dict(protein_data, selected_chain)
             # otherwise, we're in complex mode:
@@ -1026,14 +1032,14 @@ class CroppedPDBStream(BatchedProteinPDBStream):
         selected_chain = chain_index == np.array([chain])[0]
         selected_chain_size = selected_chain.sum()
         chains = np.unique(chain_index)
-        np.random.shuffle(chains)
+        self.rng.shuffle(chains)
         num_chains = chains.shape[0]
         # return a complex crop with probability p_complex
         p_spatial = 0.5
-        if num_chains > 1 and random.random() < self.p_complex:
+        if num_chains > 1 and self.rng.random() < self.p_complex:
             # print("complex crop...")
             # interface spatial crop
-            if random.random() < p_spatial:
+            if self.rng.random() < p_spatial:
                 # print("spatial crop...")
                 ca = data["all_atom_positions"][:, 1]
                 sel_ca = ca[selected_chain]
