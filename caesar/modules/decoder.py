@@ -16,7 +16,8 @@ from caesar.modules.encoder import (
 )
 from caesar.modules.utils.geometry import (
     distance_one_hot, get_spatial_neighbours, index_align,
-    sequence_relative_position, extract_neighbours,
+    sequence_relative_position,
+    extract_neighbours_salad_compatible as extract_neighbours,
     get_neighbours, distance_rbf, 
     index_mean, 
     get_random_neighbours, 
@@ -37,7 +38,7 @@ from caesar.modules.geometric import (
 from caesar.utils.loss import violation_loss
 from caesar.utils.all_atom_multimer import get_atom14_mask
 
-DEBUG = True
+DEBUG = False
 
 def stop_gradient(x):
     if isinstance(x, torch.Tensor):
@@ -132,7 +133,8 @@ class DecoderBlock(nn.Module):
             dmap = None
 
         current_neighbours = self.current_neigh(
-            Vec3Array.from_array(pos), resi, chain, batch, mask
+            Vec3Array.from_array(pos), resi, chain, batch, mask,
+            generator=generator
         )
 
         pair, pair_mask = self.pair_features_main(
@@ -349,10 +351,14 @@ class Decoder(nn.Module):
         aa_nll = torch.where(aa_predict_mask.to(torch.bool), aa_nll, torch.zeros_like(aa_nll))
         aa_nll = aa_nll.sum() / torch.clamp(aa_predict_mask.to(torch.float32).sum(), min=1.0)
         losses["aa"] = aa_nll
-        total = total + float(c.aa_weight) * aa_nll
+        losses["debug_mask_sum"] = mask.sum()
+        losses["debug_aa_mask_sum"] = aa_predict_mask.sum()
+        losses["weighted_aa"] = float(c.aa_weight) * aa_nll
+        total = total + losses["weighted_aa"]
 
         # position losses
         base_weight = mask / torch.clamp(index_sum(mask.to(torch.float32), batch, mask), min=1.0) / (batch.max() + 1)
+        losses["debug_base_weight_sum"] = base_weight.sum()
         
         # sparse neighbour FAPE ** 2
         pair_mask = (batch[:, None] == batch[None, :])
@@ -369,6 +375,7 @@ class Decoder(nn.Module):
         distance = torch.where(pair_mask.to(torch.bool), distance, torch.full_like(distance, float("inf")))
         # get random neighbours to compute sparse FAPE on
         neighbours = get_random_neighbours(c.fape_neighbours)(distance, batch, mask, generator=generator)
+        losses["debug_neighbours_hash"] = neighbours.to(torch.float32).sum()
         mask_neighbours = (neighbours != -1) * mask[:, None] * mask[neighbours]
         pos_gt_local = frames_gt[:, None, None].apply_inverse_to_point(pos_gt[neighbours])
         
@@ -407,7 +414,8 @@ class Decoder(nn.Module):
         losses["fape"] = fape_traj[-1] / 3.0
         losses["fape_trajectory"] = fape_traj.mean() / 3.0
         fape_loss = (float(c.fape_weight) * fape_traj[-1] + float(c.fape_trajectory_weight) * fape_traj.mean()) / 3.0
-        total = total + fape_loss
+        losses["weighted_fape"] = fape_loss
+        total = total + losses["weighted_fape"]
        
         # sup distogram loss
         if getattr(c, "distogram_block", None) not in (None, "none"):
@@ -420,9 +428,11 @@ class Decoder(nn.Module):
             distogram_nll = torch.where(sup_mask.to(torch.bool), distogram_nll, torch.zeros_like(distogram_nll)).sum(dim=-1)
             distogram_nll = distogram_nll / torch.clamp(sup_mask.sum(dim=1), min=1.0)
             distogram_nll = (distogram_nll * base_weight).sum(dim=1)
+            losses["debug_sup_mask_sum"] = sup_mask.sum()
             losses["distogram"] = distogram_nll[-1]
             losses["distogram_trajectory"] = distogram_nll.mean()
-            total = total + 10.0 * distogram_nll[-1] + 5.0 * distogram_nll.mean()
+            losses["weighted_distogram"] = 10.0 * distogram_nll[-1] + 5.0 * distogram_nll.mean()
+            total = total + losses["weighted_distogram"]
             if DEBUG:
                 print("kabsch_rmsd loss:", distogram_nll[-1].item())
  
@@ -442,7 +452,8 @@ class Decoder(nn.Module):
             losses["kabsch_rmsd"] = pos_loss[-1] / 3.0
             losses["kabsch_rmsd_trajectory"] = pos_loss.mean() / 3.0
             pos_loss = (float(c.fape_weight) * pos_loss[-1] + float(c.fape_trajectory_weight) * pos_loss.mean()) / 3.0
-            total = total + pos_loss
+            losses["weighted_kabsch_rmsd"] = pos_loss
+            total = total + losses["weighted_kabsch_rmsd"]
             if DEBUG:
                 print("kabsch_rmsd loss:", pos_loss.item())
 
@@ -473,7 +484,8 @@ class Decoder(nn.Module):
         local_loss = (torch.where(mask.to(torch.bool), local_loss, torch.zeros_like(local_loss)) * base_weight).sum() / 3.0
 
         losses["local"] = local_loss
-        total = total + float(c.local_weight) * local_loss
+        losses["weighted_local"] = float(c.local_weight) * local_loss
+        total = total + losses["weighted_local"]
 
         # VQ losses
         if getattr(c, "codebook_size", 0) and (not getattr(c, "is_decoder", False)):
@@ -497,7 +509,8 @@ class Decoder(nn.Module):
                 weighted_loss = (torch.where(mask_bool, raw_loss, torch.zeros_like(raw_loss)) * base_weight).sum()
 
             losses["latent"] = weighted_loss
-            total = total + float(c.latent_loss_scale) * weighted_loss
+            losses["weighted_latent"] = float(c.latent_loss_scale) * weighted_loss
+            total = total + losses["weighted_latent"]
             if DEBUG:
                 print("latent loss:", weighted_loss.item())
 
@@ -519,10 +532,12 @@ class Decoder(nn.Module):
                 per_residue=False,
             )
             losses["violation"] = violation.mean()
-            total = total + float(c.violation_scale) * violation.mean()
+            losses["weighted_violation"] = float(c.violation_scale) * violation.mean()
+            total = total + losses["weighted_violation"]
             if DEBUG:
                 print("violation loss:", violation.mean().item())
 
+        losses["total"] = total
         return total, losses
 
 class DecoderUpdate(nn.Module):
@@ -828,7 +843,8 @@ class SemiEquivariantDecoderBlock(nn.Module):
 
         current_neighbours = self.current_neigh(
             Vec3Array.from_array(pos),
-            resi, chain, batch, mask
+            resi, chain, batch, mask,
+            generator=generator
         )
         
         pair, pair_mask = self.pair_feat_main(
