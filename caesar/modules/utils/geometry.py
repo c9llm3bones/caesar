@@ -178,6 +178,63 @@ def extract_neighbours(num_index=16, num_spatial=16, num_random=16):
         return neighbours
     return inner
 
+
+def extract_neighbours_salad_compatible(num_index=16, num_spatial=16, num_random=16):
+    """Extract nearest neighbours of a residue based on sequence and euclidean distance."""
+    def inner(pos, resi, chain, item, mask, *, generator: Optional[torch.Generator] = None):
+        if isinstance(pos, Vec3Array):
+            ca = pos[:, 1]
+        else:
+            if pos.ndim == 3:
+                ca = Vec3Array.from_array(pos)[:, 1]
+            elif pos.ndim == 2:
+                ca = Vec3Array.from_array(pos)
+            else:
+                raise ValueError(f"Unsupported pos shape for neighbours: {tuple(pos.shape)}")
+
+        same_batch = item[:, None] == item[None, :]
+        same_chain = chain[:, None] == chain[None, :]
+        valid = same_batch * (mask[:, None] * mask[None, :])
+
+        within = (resi[:, None] - resi[None, :]).abs() < int(num_index)
+        within = within * same_batch * same_chain
+
+        distance = (ca[:, None] - ca[None, :]).norm()
+        inf = torch.full_like(distance, float("inf"))
+        distance = torch.where(within, inf, distance)
+        distance = torch.where(valid.bool(), distance, inf)
+
+        if int(num_spatial) > 0:
+            sorted_distance = torch.sort(distance, dim=-1).values
+            cutoff = sorted_distance[:, : int(num_spatial)][:, -1]
+            # NOTE: Keep JAX/SALAD broadcasting semantics from
+            # structure_autoencoder.extract_neighbours:
+            # `(distance < cutoff)` where cutoff has shape (N,).
+            within = within | (distance < cutoff)
+
+        random_distance = -3.0 * torch.log(torch.clamp(distance, min=1e-6))
+        u = torch.rand(
+            random_distance.shape,
+            device=random_distance.device,
+            dtype=random_distance.dtype,
+            generator=generator,
+        )
+        u = u * (1.0 - 2e-6) + 1e-6
+        gumbel = torch.log(-torch.log(u))
+        random_distance = -(random_distance - gumbel)
+
+        random_distance = torch.where(
+            within.bool(),
+            torch.full_like(random_distance, -10_000.0),
+            random_distance,
+        )
+        random_distance = torch.where(valid.bool(), random_distance, inf)
+
+        total = int(num_index) + int(num_spatial) + int(num_random)
+        return get_neighbours(total)(random_distance, mask)
+
+    return inner
+
 def get_index_neighbours(count: int):
     """Extracts the `count` nearest neighbours based on residue index."""
     def inner(resi, chain, item, mask, neighbours=None):
@@ -284,7 +341,16 @@ def get_neighbours(count: int):
 
             distance[idx, neighbours] = update
 
-        knn = torch.argsort(distance, dim=-1, stable=True)[..., :count]
+        # Canonical tie-break across frameworks: prefer lower column index
+        # when distances are equal.
+        col_index = torch.arange(N, device=device, dtype=distance.dtype)[None, :]
+        eps = torch.tensor(1e-6, device=device, dtype=distance.dtype)
+        distance_for_sort = torch.where(
+            torch.isfinite(distance),
+            distance + col_index * eps,
+            distance,
+        )
+        knn = torch.argsort(distance_for_sort, dim=-1, stable=True)[..., :count]
 
         knn = torch.where(
             distance[index[:, None], knn] < float("inf"),
@@ -394,7 +460,7 @@ def hl_gaussian(data, minimum=0.0, maximum=22.0, bins=64, sigma_ratio=1.0):
     lower_bound = erfinv_aux(-0.999, minimum)
     upper_bound = erfinv_aux(0.999, maximum)
     data = torch.clip(data, lower_bound, upper_bound)
-    lower = torch.arange(bins) * step
+    lower = torch.arange(bins, device=data.device, dtype=data.dtype) * step
     upper = lower + step
     value = erf_aux(upper, data[..., None]) - erf_aux(lower, data[..., None])
     value /= erf_aux(maximum, data[..., None]) - erf_aux(minimum, data[..., None])
@@ -426,7 +492,7 @@ def axis_index(data: torch.Tensor, dim=0):
     Returns:
         Index array containing values (0, ..., N-1).
     """
-    return torch.arange(data.shape[dim], dtype=torch.int32)
+    return torch.arange(data.shape[dim], dtype=torch.int32, device=data.device)
 
 def index_sum(data: torch.Tensor,
               index: torch.Tensor,
@@ -630,7 +696,7 @@ def sequence_relative_position(count: Optional[int] = 32,
         same_chain = chain[:, None] == chain[compare_index]
         same_batch = batch[:, None] == batch[compare_index]
         dist = resi[:, None] - resi[compare_index]
-        flat_resi = torch.arange(resi.shape[0], dtype=torch.int32)
+        flat_resi = torch.arange(resi.shape[0], dtype=torch.int32, device=resi.device)
         if cyclic:
             lengths = index_count(chain, torch.ones_like(chain, dtype=torch.bool))
             wrap = abs(dist) > lengths[:, None] / 2
@@ -912,7 +978,7 @@ def fast_sasa(pos, atom_mask, aatype, batch, atom_radius=ATOM14_RADIUS, n=20, ne
     neighbours = torch.where(valid[index[:, None], neighbours], neighbours, -1)
     distances = torch.linalg.norm(spheres[:, None, :, None, :, :] - pos[neighbours, None, :, None, :], axis=-1)
     drop = (distances < radius[neighbours, None, :, None])
-    index = torch.arange(atom_radius.shape[0])
+    index = torch.arange(atom_radius.shape[0], device=atom_radius.device, dtype=torch.long)
     drop = drop.at[:, 0, index, index].set(0)
     drop = drop.any(axis=(1, 3))
     count = n * atom_mask - (atom_mask[..., None] * drop).sum(axis=2)
