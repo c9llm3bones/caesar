@@ -12,7 +12,7 @@ from typing import Any, Optional, Union, Tuple, Iterable, Dict, List
 
 import torch
 import torch.nn.functional as F
-import numpy as np
+# import numpy as np
 
 import caesar.utils.geometry
 from caesar.aflib.common import residue_constants
@@ -76,6 +76,7 @@ def make_backbone_affine(
     Returns:
         Rigid3Array of residue frames.
     """
+    # print(f"make_backbone_affine position device: {positions.device}")
     if atom_order is None:
         atom_order = residue_constants.atom_order
     if atoms is None:
@@ -83,12 +84,14 @@ def make_backbone_affine(
     a, b, c = [residue_constants.atom_order[name] for name in atoms]
 
     rigid_mask = (mask[..., a] * mask[..., b] * mask[..., c]).float()
-
+    # print(f"make_backbone_affine mask device: {mask.device}")
     rigid = make_transform_from_reference(
         a_xyz=positions[..., a],
         b_xyz=positions[..., b],
         c_xyz=positions[..., c])
-
+    # print(f"make_backbone_affine rigid device: {rigid.device}")
+    # print(f"make_backbone_affine rigid_mask device: {rigid_mask.device}")
+    
     return rigid, rigid_mask
 
 def extract_aa_frames(positions: Vec3Array) -> Tuple[Rigid3Array, Vec3Array]:
@@ -100,7 +103,9 @@ def extract_aa_frames(positions: Vec3Array) -> Tuple[Rigid3Array, Vec3Array]:
         Rigid3Array of residue frames and Vec3Array of local-frame
         side chain atom positions.
     """        
-    rigids, _ = make_backbone_affine(positions, torch.ones((positions.shape[0], 14)), None)
+    #print(f"torch ones position device aa frames: {torch.ones((positions.shape[0], 14), device=positions.device).device}")
+    #print(f"positions device extract aa: {positions.device}")
+    rigids, _ = make_backbone_affine(positions, torch.ones((positions.shape[0], 14), device=positions.device), None)
     local_positions = rigids[..., None].apply_inverse_to_point(positions)
     return rigids, local_positions
 
@@ -113,6 +118,7 @@ def extract_na_frames(positions: Vec3Array):
         Rigid3Array of residue frames and Vec3Array of local-frame
         side chain atom positions.
     """
+    #print(f"positions device extract na: {positions.device}")
     rigids, _ = make_backbone_affine(positions, atoms=('O4', 'C1', 'C2'))
     local_positions = rigids[..., None].apply_inverse_to_point(positions)
     return rigids, local_positions
@@ -182,6 +188,9 @@ def extract_neighbours(num_index=16, num_spatial=16, num_random=16):
 def extract_neighbours_salad_compatible(num_index=16, num_spatial=16, num_random=16):
     """Extract nearest neighbours of a residue based on sequence and euclidean distance."""
     def inner(pos, resi, chain, item, mask, *, generator: Optional[torch.Generator] = None):
+        # print(f"generator in extract_neighbours is {generator}")
+        # if generator:
+        #     print(f"and has device={generator.device}")
         if isinstance(pos, Vec3Array):
             ca = pos[:, 1]
         else:
@@ -213,6 +222,7 @@ def extract_neighbours_salad_compatible(num_index=16, num_spatial=16, num_random
             within = within | (distance < cutoff)
 
         random_distance = -3.0 * torch.log(torch.clamp(distance, min=1e-6))
+        # print(f"generator device is {random_distance.device}")
         u = torch.rand(
             random_distance.shape,
             device=random_distance.device,
@@ -319,9 +329,9 @@ def get_neighbours(count: int):
     ):
         N = distance.shape[0]
         device = distance.device
-
+        #print(f"distance device in get_neighbours : {device}")
         index = torch.arange(N, device=device)
-
+        # print(f"mask device in get_neighbours: {mask.device}")
         distance = distance.float()
 
         distance = torch.where(
@@ -330,6 +340,7 @@ def get_neighbours(count: int):
             torch.full_like(distance, float("inf")),
         )
 
+        # print(f"distance device after wher in get_neighbours : {distance.device}")
         if neighbours is not None:
             idx = index[:, None]
 
@@ -395,6 +406,7 @@ def get_contact_neighbours(count):
         is_conditioned = pair_condition.any(dim=-1)
         # construct a distance matrix with random values for conditioned positions
         # and infinite distance everywhere else.
+        print(f"in get_contact_neig tensor is on {torch.rand(is_conditioned.shape, dtype=torch.float32).device}")
         distance = torch.where(is_conditioned,
                              torch.rand(is_conditioned.shape, dtype=torch.float32),
                               torch.full_like(is_conditioned, float('inf')))
