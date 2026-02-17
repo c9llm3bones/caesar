@@ -82,7 +82,7 @@ def make_backbone_affine(
         atoms = ('N', 'CA', 'C')
     a, b, c = [residue_constants.atom_order[name] for name in atoms]
 
-    rigid_mask = (mask[..., a] * mask[..., b] * mask[..., c]).to(dtype=torch.float32)
+    rigid_mask = (mask[..., a] * mask[..., b] * mask[..., c]).float()
 
     rigid = make_transform_from_reference(
         a_xyz=positions[..., a],
@@ -344,10 +344,9 @@ def get_neighbours(count: int):
         # Canonical tie-break across frameworks: prefer lower column index
         # when distances are equal.
         col_index = torch.arange(N, device=device, dtype=distance.dtype)[None, :]
-        eps = torch.tensor(1e-6, device=device, dtype=distance.dtype)
         distance_for_sort = torch.where(
             torch.isfinite(distance),
-            distance + col_index * eps,
+            distance + col_index * 1e-6,
             distance,
         )
         knn = torch.argsort(distance_for_sort, dim=-1, stable=True)[..., :count]
@@ -428,7 +427,7 @@ def distance_one_hot(distance, min_distance=0.0, max_distance=22.0, bins=64):
     centers = (min_distance
                + torch.arange(bins, device=distance.device, dtype=distance.dtype) * step
                + step / 2)
-    argmin = torch.argmin(torch.abs(distance[..., None] - centers), dim=-1).to(torch.long)
+    argmin = torch.argmin(torch.abs(distance[..., None] - centers), dim=-1)
     oh = F.one_hot(argmin, num_classes=bins)
     return oh.to(distance.dtype)
 
@@ -540,19 +539,22 @@ def index_max(data: torch.Tensor,
         the result would be [3, 3, 3, 5, 5].
     """
     N = data.shape[0]
-    index = index.to(dtype=torch.long)
+    index = index.long()
     mask_bool = mask if mask.dtype == torch.bool else (mask > 0)
     mask_b = mask_bool.view(N, *([1] * (data.ndim - 1)))
     dmin = data.amin()  
     data_masked = torch.where(mask_b, data, dmin)
     result = torch.full_like(data, dmin)
+    idx = index.view(N, *([1] * (data.ndim - 1))).expand_as(data_masked)
     if hasattr(result, "scatter_reduce_"):
-        idx = index.view(N, *([1] * (data.ndim - 1))).expand_as(data_masked)
         result.scatter_reduce_(0, idx, data_masked, reduce="amax", include_self=True)
+    elif hasattr(torch, "scatter_reduce"):
+        result = torch.scatter_reduce(result, 0, idx, data_masked, reduce="amax", include_self=True)
     else:
-        for i in range(N):
-            j = int(index[i].item())
-            result[j] = torch.maximum(result[j], data_masked[i])
+        raise RuntimeError(
+            "index_max requires scatter_reduce_ (PyTorch >= 1.12/2.0). "
+            "Upgrade PyTorch to avoid slow CPU fallback."
+        )
     gathered = result.index_select(0, index)  
 
     if not apply_mask:
@@ -726,7 +728,7 @@ def sequence_relative_position(count: Optional[int] = 32,
             dist = torch.where(same_chain, dist, 2 * count + 1)
             dist = torch.where(same_batch, dist, 2 * count + 1)
         if one_hot:
-            dist = F.one_hot(dist.long(), num_classes=int(count_total)).to(torch.float32)
+            dist = F.one_hot(dist.long(), num_classes=int(count_total)).float()
         return dist
     return inner
 
@@ -742,10 +744,10 @@ def index_count(index, mask, apply_mask=True):
         to all entries with that index value.
         E.g. for index [0, 0, 0, 1, 1] the result would be [3, 3, 3, 2, 2]
     """
-    index = index.to(torch.long)
-    mask = mask.to(torch.bool)
+    index = index.long()
+    mask = mask.bool()
     result = torch.zeros_like(index)
-    result.scatter_add_(0, index, mask.to(result.dtype))
+    result.scatter_add_(0, index, mask.long())
     if not apply_mask:
         return result[index]
     return torch.where(mask, result[index], torch.zeros_like(result[index]))
@@ -808,17 +810,13 @@ def unique_chain(chain, batch):
     Returns:
         [N] unique chain index
     """
-    # Vectorized
-    device = chain.device
-    chain = chain.to(device=device)
-    batch = batch.to(device=device)
-    if chain.numel() == 0:
-        return torch.zeros_like(chain)
+    N = chain.shape[0]
 
-    change = torch.ones_like(chain, dtype=torch.bool, device=device)
+    change = torch.ones(N, dtype=torch.bool, device=chain.device)
     change[1:] = (chain[1:] != chain[:-1]) | (batch[1:] != batch[:-1])
-    out = torch.cumsum(change.to(torch.long), dim=0) - 1
-    return out.to(dtype=chain.dtype)
+
+    out = torch.cumsum(change.to(dtype=chain.dtype), dim=0) - 1
+    return out
 
 def positions_to_ncacocb(pos: torch.ndarray):
     """Compute N, CA, C, O, CB positions for atom14 positions.
@@ -837,146 +835,3 @@ def replace_masked_with(pos: torch.ndarray, # (..., N, 3)
                        ) -> torch.ndarray: # (..., N, 3)
     """Replace masked atom positions with replacement positions."""
     return torch.where(atom_mask[..., None], pos, replacement)
-
-def assign_sse(pos, batch, mask):
-    """Assign secondary structure using P-SEA.
-    
-    Implements the secondary structure assignment from Labesse et al. 1997
-    (pubmed.ncbi.nlm.nih.gov/9183534/)
-
-    Args:
-        pos: atom positions in atom14 format, containing at least CA atoms.
-        batch: batch index.
-        mask: residue mask.
-    Returns:
-        3-state secondary structure assignment (0: loop, 1: helix, 2: strand);
-        secondary structure blocks; block adjacency matrix.
-    """
-    device = pos.device
-    pos = pos[:, 1]  # CA
-    N = pos.shape[0]
-
-    z1 = torch.zeros(1, device=device)
-    z2 = torch.zeros(2, device=device)
-    z3 = torch.zeros(3, device=device)
-
-    d2 = torch.cat((z1, torch.linalg.norm(pos[2:] - pos[:-2], dim=-1), z1))
-    d3 = torch.cat((z1, torch.linalg.norm(pos[3:] - pos[:-3], dim=-1), z2))
-    d4 = torch.cat((z1, torch.linalg.norm(pos[4:] - pos[:-4], dim=-1), z3))
-
-    tau = torch.cat((z1, bond_angle(pos[:-2], pos[1:-1], pos[2:]), z1))
-    alpha = torch.cat((z1, dihedral_angle(pos[:-3], pos[1:-2], pos[2:-1], pos[3:]), z2))
-
-    helix_tau = (77 <= tau) & (tau <= 101)
-    helix_alpha = (30 <= alpha) & (alpha <= 70)
-    helix_d3 = (4.8 <= d3) & (d3 <= 5.8)
-    helix_d4 = (5.8 <= d4) & (d4 <= 7.0)
-
-    sheet_tau = (110 <= tau) & (tau <= 138)
-    sheet_alpha = (-215 <= alpha) & (alpha <= -125)
-    sheet_d2 = (6.1 <= d2) & (d2 <= 7.3)
-    sheet_d3 = (9.0 <= d3) & (d3 <= 10.8)
-    sheet_d4 = (11.3 <= d4) & (d4 <= 13.5)
-
-    helix_init = (helix_tau & helix_alpha) | (helix_d3 & helix_d4)
-    helix_extend = helix_init | helix_tau | helix_d3
-
-    sheet_init = (sheet_tau & sheet_alpha) | (sheet_d2 & sheet_d3 & sheet_d4)
-    sheet_extend = sheet_init | sheet_d3
-
-    index = torch.zeros(N, dtype=torch.long, device=device)
-    carry = 0
-
-    for i in range(N):
-        if helix_init[i] or (helix_extend[i] and carry == 1):
-            index[i] = 1
-        elif sheet_init[i] or (sheet_extend[i] and carry == 2):
-            index[i] = 2
-        carry = index[i].item()
-
-    blocks = torch.zeros(N, dtype=torch.long, device=device)
-    bid = 0
-    for i in range(1, N):
-        if index[i] != index[i - 1]:
-            bid += 1
-        blocks[i] = bid
-
-    loop = index == 0
-    pair_mask = (batch[:, None] == batch[None, :]) & mask[:, None] & mask[None, :]
-
-    dist = torch.linalg.norm(pos[:, None] - pos[None, :], dim=-1)
-    block_dist = torch.full((bid + 1, bid + 1), 1e6, device=device)
-
-    for i in range(N):
-        for j in range(N):
-            bi, bj = blocks[i], blocks[j]
-            block_dist[bi, bj] = min(block_dist[bi, bj], dist[i, j])
-
-    block_adjacency = block_dist[blocks[:, None], blocks[None, :]] <= 8
-    block_adjacency &= ~(blocks[:, None] == blocks[None, :])
-    block_adjacency &= ~loop[:, None] & ~loop[None, :]
-    block_adjacency &= pair_mask
-
-    return index, blocks, block_adjacency
-
-POLAR_THRESHOLD = 3.0
-CONTACT_THRESHOLD = 6.0
-
-def unit_sphere(n):
-    """Generates n points on the surface of the unit sphere."""
-    dl = np.pi * (3 - 5 ** 0.5)
-    dz = 2.0 / n
-
-    indices = np.arange(n)
-    z = 1 - dz / 2 - indices * dz
-    longitude = indices * dl
-    r = (1 - z ** 2) ** 0.5
-    coords = np.stack((
-        np.cos(longitude) * r,
-        np.sin(longitude) * r,
-        z), axis=-1)
-    return coords
-
-# Only define ATOM14_RADIUS if residue_constants is available
-ATOM14_RADIUS=np.array([
-    [
-        residue_constants.van_der_waals_radius[c[0]] + 1.4
-        if c else 0.0
-        for c in residue_constants.restype_name_to_atom14_names[res]
-    ]
-    for res in residue_constants.restype_name_to_atom14_names
-])
-
-def fast_sasa(pos, atom_mask, aatype, batch, atom_radius=ATOM14_RADIUS, n=20, neighbours=20):
-    """Quick and dirty SASA estimate.
-    
-    Args:
-        pos: atom positions in atom14 format.
-        atom_mask: atom mask.
-        aatype: amino acid identity for each residue.
-        batch: batch_index.
-        atom_radius: dictionary of atom radii. Default: ATOM14_RADIUS.
-        n: number of points on each unit sphere.
-        neighbours: number of neighbour amino acids for SASA computation.
-    Returns:
-        Per residue SASA estimate.
-    """
-    mask = atom_mask.any(axis=1)
-    valid = (batch[:, None] == batch[None, :]) * (mask[:, None] * mask[None, :])
-    radius = atom_radius[aatype] * atom_mask
-    spheres = pos[:, :, None, :] + radius[:, :, None, None] * unit_sphere(n)[None, None, :, :]
-    aa_dist = torch.linalg.norm(pos[:, None, 1] - pos[None, :, 1], axis=-1)
-    aa_dist = torch.where(valid, aa_dist, torch.inf)
-    neighbours = torch.argsort(aa_dist, axis=1)[:, :neighbours]
-    index = axis_index(neighbours, 0)
-    neighbours = torch.where(valid[index[:, None], neighbours], neighbours, -1)
-    distances = torch.linalg.norm(spheres[:, None, :, None, :, :] - pos[neighbours, None, :, None, :], axis=-1)
-    drop = (distances < radius[neighbours, None, :, None])
-    index = torch.arange(atom_radius.shape[0], device=atom_radius.device, dtype=torch.long)
-    drop = drop.at[:, 0, index, index].set(0)
-    drop = drop.any(axis=(1, 3))
-    count = n * atom_mask - (atom_mask[..., None] * drop).sum(axis=2)
-    bare_radius = 4 * torch.pi * radius ** 2
-    surf = bare_radius * count / n
-    surf = surf.sum(axis=1) / atom_mask.sum(axis=1)
-    return surf

@@ -1,4 +1,6 @@
 import time
+import random
+import numpy as np
 
 from copy import deepcopy
 
@@ -49,7 +51,8 @@ def make_training_inner(optimizer, step, data, accumulate=1, multigpu=True,
         new_state = State(key, loop_state.step_id, params, opt_state, aux_state)
         checkpointables = dict(checkpoint=params)
         total_time = time.time() - t
-        print(f"Step {loop_state.step_id}, load time {load_time:.3f} s, step time {step_time:.3f} s, total {total_time:.3f} s")
+        print(f"Step {loop_state.step_id}, load time {load_time:.3f} s, step time {step_time:.3f} s, loss {loggables['total']}, total {total_time:.3f} s")
+        print(loggables)
         return new_state, loggables, checkpointables
     return training_inner
 
@@ -75,6 +78,63 @@ def cosine_decay_schedule(start_lr, decay_lr, warmup_steps, decay_steps):
         return result
     return schedule
 
+def take_first_protein(batch):
+    """Keep only the first protein (by batch_index) and zero-out the rest, preserving shapes."""
+    if "batch_index" not in batch:
+        return batch
+    bidx = batch["batch_index"]
+    keep = bidx == jnp.min(bidx)
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, jnp.ndarray) and v.shape[0] == bidx.shape[0]:
+            if v.dtype == jnp.bool_:
+                out[k] = v & keep
+            else:
+                out[k] = jnp.where(keep.reshape((keep.shape[0],) + (1,) * (v.ndim - 1)), v, jnp.zeros_like(v))
+        else:
+            out[k] = v
+    if "batch_index" in out:
+        out["batch_index"] = jnp.zeros_like(out["batch_index"])
+    if "mask" in out:
+        out["mask"] = out["mask"] & keep
+    if "seq_mask" in out and "mask" in out:
+        out["seq_mask"] = out["mask"] & (out.get("aa_gt", 0) != 20)
+    if "residue_mask" in out and "mask" in out and "all_atom_mask" in out:
+        out["residue_mask"] = out["mask"] & jnp.any(out["all_atom_mask"], axis=-1)
+    return out
+
+def _merge_batches(items):
+    out = {}
+    offset = 0
+    for item in items:
+        if "batch_index" in item:
+            bi = item["batch_index"]
+            if isinstance(bi, jnp.ndarray):
+                bi = np.array(bi)
+            if isinstance(bi, np.ndarray) and bi.size:
+                item = dict(item)
+                item["batch_index"] = bi + offset
+                offset += int(bi.max()) + 1
+        for k, v in item.items():
+            out.setdefault(k, []).append(v)
+    merged = {}
+    for k, vals in out.items():
+        v0 = vals[0]
+        if isinstance(v0, jnp.ndarray):
+            merged[k] = jnp.concatenate(vals, axis=0)
+        elif isinstance(v0, np.ndarray):
+            merged[k] = np.concatenate(vals, axis=0)
+        else:
+            merged[k] = v0
+    return merged
+
+def accumulate_stream(stream, count: int):
+    count = int(count)
+    assert count >= 1
+    while True:
+        items = [next(stream) for _ in range(count)]
+        yield _merge_batches(items)
+
 if __name__ == "__main__":
     from salad.data.allpdb import BatchedProteinPDBStream
     from flexloop.data import BatchStream
@@ -82,7 +142,7 @@ if __name__ == "__main__":
     opt = parse_options(
         "train a distance-to-structure decoder on PDB.",
         path="network/",
-        config="default",
+        config="small_inner",
         data_path="",
         num_aa=1024,
         p_complex=0.5,
@@ -98,8 +158,18 @@ if __name__ == "__main__":
         accumulate=1,
         jax_seed=42,
         multigpu="True",
+        overfit_one="False",
+        no_random="False",
+        fixed_recycle=-1,
+        deterministic="False",
+        data_seed=42,
+        num_workers=0,
+        prefetch_factor=2,
         suffix="1"
     )
+    seed = int(opt.jax_seed)
+    random.seed(seed)
+    np.random.seed(seed)
     multigpu = opt.multigpu == "True"
     NUM_DEVICES = jax.device_count()
     if not multigpu:
@@ -113,29 +183,77 @@ if __name__ == "__main__":
     writer = SummaryWriter(path)
 
     print("Attempting to load dataset...")
+    num_workers = int(opt.num_workers)
+    prefetch = int(opt.prefetch_factor) if num_workers > 0 else None
+    seed_train = int(opt.data_seed)
+    seed_valid = seed_train + 1
     data = BatchedProteinPDBStream(f"{opt.data_path}/allpdb/",
                                    seqres_aa="clusterSeqresAA",
                                    cutoff_resolution=4.0,
                                    p_complex=opt.p_complex,
-                                   size=1024,
+                                   size=512, #1024,
                                    min_size=16,
-                                   max_size=1024)
-    data = iter(BatchStream(data, num_workers=32,
-                            accumulate=opt.rebatch * opt.accumulate * NUM_DEVICES,
-                            prefetch_factor=32))
+                                   max_size=512, #1024,
+                                   seed=seed_train)
+    accumulate = opt.rebatch * opt.accumulate * NUM_DEVICES
+    if num_workers == 0:
+        data = iter(data)
+        if accumulate != 1:
+            data = accumulate_stream(data, accumulate)
+    else:
+        data = iter(BatchStream(data, num_workers=num_workers,
+                                accumulate=accumulate,
+                                prefetch_factor=prefetch))  
     valid_data = BatchedProteinPDBStream(f"{opt.data_path}/allpdb/",
                                          seqres_aa="clusterSeqresAA",
                                          cutoff_resolution=4.0,
                                          p_complex=opt.p_complex,
-                                         size=1024,
+                                         size=512, #1024,
                                          min_size=16,
-                                         max_size=1024,
+                                         max_size=512, #1024,
                                          start_date="01/01/22",
-                                         cutoff_date="12/31/23")
-    valid_data = iter(BatchStream(valid_data, num_workers=8,
-                                  accumulate=opt.rebatch * opt.accumulate * NUM_DEVICES,
-                                  prefetch_factor=8))
+                                         cutoff_date="12/31/23",
+                                         seed=seed_valid)
+    if num_workers == 0:
+        valid_data = iter(valid_data)
+        if accumulate != 1:
+            valid_data = accumulate_stream(valid_data, accumulate)
+    else:
+        valid_data = iter(BatchStream(valid_data, num_workers=num_workers,
+                                      accumulate=accumulate,
+                                      prefetch_factor=prefetch))
     print("Dataset successfully loaded.")
+
+    def flag_stream(stream, *, no_random: bool, fixed_recycle: int):
+        if (not no_random) and fixed_recycle < 0:
+            return stream
+        def _gen():
+            for item in stream:
+                item = dict(item)
+                if no_random:
+                    item["no_random"] = True
+                if fixed_recycle >= 0:
+                    item["fixed_recycle"] = fixed_recycle
+                yield item
+        return _gen()
+
+    # overfit on a single batch to sanity-check loss convergence.
+    if opt.overfit_one == "True":
+        print("Overfitting on a single batch (reusing the first batch for train/valid).")
+        first_item = take_first_protein(next(data))
+
+        def repeat_item(item):
+            while True:
+                yield jax.tree_util.tree_map(lambda x: x.copy(), item)
+
+        data = repeat_item(first_item)
+        valid_data = repeat_item(first_item)
+        item_0 = first_item
+    else:
+        item_0 = next(data)
+
+    data = flag_stream(data, no_random=(opt.no_random == "True"), fixed_recycle=int(opt.fixed_recycle))
+    valid_data = flag_stream(valid_data, no_random=(opt.no_random == "True"), fixed_recycle=int(opt.fixed_recycle))
 
     with_state = config.state is not None
     key = jax.random.PRNGKey(opt.jax_seed)
@@ -150,7 +268,6 @@ if __name__ == "__main__":
         model_step(config, rebatch=opt.rebatch, is_training=False))
 
     print("Initializing model parameters...")
-    item_0 = next(data)
     print("INPUT OF SHAPE:")
     for name, value in item_0.items():
         print("  ", name, value.shape)
@@ -207,3 +324,8 @@ if __name__ == "__main__":
     print("Starting training...")
     print(f"Log files and tensorboard records will be written to {path}")
     training_loop(writer, loop_state)
+
+# python -m salad.training.train_structure_autoencoder  --data_path /disk/2tb/edelkin/data --overfit_one True --p_complex 0.0
+
+### full train det data
+# python -m salad.training.train_structure_autoencoder  --data_path /disk/2tb/edelkin/data --data_seed 123 --num_workers 0 --prefetch_factor 2 --multigpu False

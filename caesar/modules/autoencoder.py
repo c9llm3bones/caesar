@@ -26,6 +26,12 @@ def _stat(t: torch.Tensor):
     t = t.detach()
     return dict(mean=float(t.mean()), std=float(t.std()), max=float(t.abs().max()))
 
+def print_desc(data):
+    for el in data:
+        print(f"{el} device is {data[el].device} & dtype is {data[el].dtype}") 
+    return
+
+# utility for fixed recycle
 def _as_int(value) -> Optional[int]:
     if value is None:
         return None
@@ -36,9 +42,16 @@ def _as_int(value) -> Optional[int]:
     return int(value)
 
 def _randint_count(generator: Optional[torch.Generator], device: torch.device) -> int:
-    if generator is None or (hasattr(generator, "device") and generator.device.type == "cpu"):
-        return int(torch.randint(0, 4, (1,), device="cpu", generator=generator).item())
-    return int(torch.randint(0, 4, (1,), device=device, generator=generator).item())
+    # Always sample on CPU to avoid GPU sync from .item() when generator is CUDA.
+    if generator is None:
+        return int(torch.randint(0, 4, (1,), device="cpu").item())
+    if hasattr(generator, "device") and generator.device.type == "cuda":
+        cpu_gen = getattr(_randint_count, "_cpu_gen", None)
+        if cpu_gen is None:
+            cpu_gen = torch.Generator(device="cpu").manual_seed(int(generator.initial_seed()))
+            _randint_count._cpu_gen = cpu_gen
+        return int(torch.randint(0, 4, (1,), device="cpu", generator=cpu_gen).item())
+    return int(torch.randint(0, 4, (1,), device="cpu", generator=generator).item())
 
 
 class StructureAutoencoder(nn.Module):
@@ -121,9 +134,11 @@ class StructureAutoencoder(nn.Module):
         prev = dict(
             pos=data["pos"],
             local=torch.zeros((data["pos"].shape[0], c.local_size), device=latent.device, dtype=torch.float32),
-        )
-
+        )   
         if not running_init:
+
+            #data["fixed_recycle"] = 0
+            #print("RUNNING RECYCLE")
             fixed_recycle = _as_int(data.get("fixed_recycle", None))
             if fixed_recycle is not None:
                 count = int(fixed_recycle)
@@ -132,6 +147,8 @@ class StructureAutoencoder(nn.Module):
             else:
                 count = _randint_count(generator, latent.device)
 
+           # print(f"WITH ({count}) iters of decoder")
+            
             for _ in range(count):
                 result_i = self.decoder(data, prev, generator=generator)
                 prev = {
@@ -142,8 +159,16 @@ class StructureAutoencoder(nn.Module):
         if DEBUG:
             local0, _, _, _, _, _ = self.decoder.prepare_features(data, prev)
             trace["dec/local0"] = _stat(local0)
-
+        if DEBUG:
+            print("DATA before decoder:")
+            print_desc(data)
         result = self.decoder(data, prev, generator=generator)
+
+        if DEBUG:
+            print("DATA after decoder:")
+            print_desc(data)
+            print('\n result after decoder:')
+            print_desc(result)
         if return_trace and DEBUG:
             trace["dec/pos"] = result["pos"].detach()
             trace["dec/local"] = result["local"].detach()
@@ -154,6 +179,7 @@ class StructureAutoencoder(nn.Module):
             result["codebook_losses"] = codebook_losses
 
         total, losses = self.decoder.loss(data, result, generator=generator)
+        
         out_dict = dict(results=result, losses=losses)
         if getattr(c, "codebook_size", 0) and getattr(c, "state", False):
             out_dict["_state_update"] = state_update
@@ -168,7 +194,8 @@ class StructureAutoencoder(nn.Module):
         
         Not used in the manuscript.
         """
-        batch = batch.to(torch.long)
+        if batch.dtype != torch.long:
+            batch = batch.long()
 
         noise_level = torch.randn(batch.shape, device=latent.device, dtype=latent.dtype, generator=generator)[batch]
         noise_level = torch.exp(noise_level)
@@ -183,14 +210,29 @@ class StructureAutoencoder(nn.Module):
         """
         c = self.config
 
-        batch = data["batch_index"].to(torch.long)
+        batch = data["batch_index"]
+        if batch.dtype != torch.long:
+            batch = batch.long()
         pos = data["pos_input"]
 
         pos = pos - index_mean(pos[:, 1], batch, data["mask"][:, None])[:, None]  # FIXME (ported as-is)
 
         time = torch.rand(batch.shape, device=pos.device, dtype=pos.dtype, generator=generator)[batch]
         if "time" in data:
-            time = data["time"].to(device=pos.device, dtype=pos.dtype) * torch.ones_like(time)
+            t = data["time"]
+            if not torch.is_tensor(t):
+                t = torch.as_tensor(t, device=pos.device, dtype=pos.dtype)
+            else:
+                needs_device = t.device != pos.device
+                needs_dtype = t.dtype != pos.dtype
+                if needs_device or needs_dtype:
+                    t = t.to(
+                        device=pos.device if needs_device else None,
+                        dtype=pos.dtype if needs_dtype else None,
+                    )
+            if t.ndim == 0:
+                t = t.expand_as(time)
+            time = t
 
         s = 0.01
         denom = math.cos(s / (1.0 + s) * math.pi / 2.0)
@@ -208,7 +250,9 @@ class StructureAutoencoder(nn.Module):
         not used in the manuscript."""
         c = self.config
 
-        batch = data["batch_index"].to(torch.long)
+        batch = data["batch_index"]
+        if batch.dtype != torch.long:
+            batch = batch.long()
         noise = torch.randn(latent.shape, device=latent.device, dtype=latent.dtype, generator=generator)
 
         if bool(c.vp_diffusion):
@@ -218,7 +262,20 @@ class StructureAutoencoder(nn.Module):
             time = torch.exp(torch.tensor(1.0, device=latent.device, dtype=latent.dtype) + 1.2 * time)
 
         if "time" in data:
-            time = data["time"].to(device=latent.device, dtype=latent.dtype) * torch.ones_like(time)
+            t = data["time"]
+            if not torch.is_tensor(t):
+                t = torch.as_tensor(t, device=latent.device, dtype=latent.dtype)
+            else:
+                needs_device = t.device != latent.device
+                needs_dtype = t.dtype != latent.dtype
+                if needs_device or needs_dtype:
+                    t = t.to(
+                        device=latent.device if needs_device else None,
+                        dtype=latent.dtype if needs_dtype else None,
+                    )
+            if t.ndim == 0:
+                t = t.expand_as(time)
+            time = t
 
         if bool(c.vp_diffusion):
             s = 0.01
@@ -240,6 +297,10 @@ def prepare_data(data, generator=None):
 
     if not torch.is_tensor(pos):
         pos = torch.as_tensor(pos)
+    if DEBUG:
+        for el in data:
+            print(f"{el} device is {data[el].device} & dtype is {data[el].dtype}") 
+        
     device = pos.device
     dtype = pos.dtype if pos.dtype.is_floating_point else torch.float32
     if pos.dtype != dtype:
@@ -248,22 +309,27 @@ def prepare_data(data, generator=None):
     if not torch.is_tensor(atom_mask):
         atom_mask = torch.as_tensor(atom_mask, device=device)
     elif atom_mask.device != device:
-        atom_mask = atom_mask.to(device=device, non_blocking=True)
+        raise ValueError(f"all_atom_mask is on {atom_mask.device}, expected {device}")
 
     if not torch.is_tensor(chain):
         chain = torch.as_tensor(chain, device=device)
     elif chain.device != device:
-        chain = chain.to(device=device, non_blocking=True)
+        raise ValueError(f"chain_index is on {chain.device}, expected {device}")
 
     if not torch.is_tensor(batch):
         batch = torch.as_tensor(batch, device=device)
     elif batch.device != device:
-        batch = batch.to(device=device, non_blocking=True)
+        raise ValueError(f"batch_index is on {batch.device}, expected {device}")
 
-    batch = batch.to(torch.long)
+    if batch.dtype != torch.long:
+        batch = batch.long()
     no_random = data.get("no_random", False)
-    if torch.is_tensor(no_random):
-        no_random = bool(no_random.detach().cpu().item())
+    # if torch.is_tensor(no_random):
+    #     if no_random.device != device:
+    #         raise ValueError(f"no_random is on {no_random.device}, expected {device}")
+    #     no_random_bool = no_random.bool()
+    # else:
+    #     no_random_bool = torch.as_tensor(bool(no_random), device=device)
 
     # recast positions into atom14:
     # first, truncate to atom14 format
@@ -271,15 +337,33 @@ def prepare_data(data, generator=None):
     atom_mask = atom_mask[:, :14]
 
     # boolean atom mask for logic
-    atom_mask_bool = atom_mask.to(torch.bool)
+    atom_mask_bool = atom_mask.bool()
 
     # uniquify chain IDs across batches:
-    chain = unique_chain(chain.to(torch.long), batch)
+    if chain.dtype != torch.long:
+        chain = chain.long()
+    chain = unique_chain(chain, batch)
 
     # mask = seq_mask * residue_mask * atom_mask[:,:3].all(axis=-1)
-    seq_mask = torch.as_tensor(data["seq_mask"], device=device, dtype=dtype)
-    residue_mask = torch.as_tensor(data["residue_mask"], device=device, dtype=dtype)
-    mask = seq_mask * residue_mask * atom_mask_bool[:, :3].all(dim=-1).to(dtype)
+    seq_mask = data["seq_mask"]
+    if not torch.is_tensor(seq_mask):
+        seq_mask = torch.as_tensor(seq_mask, device=device, dtype=dtype)
+    else:
+        if seq_mask.device != device:
+            raise ValueError(f"seq_mask is on {seq_mask.device}, expected {device}")
+        if seq_mask.dtype != dtype:
+            seq_mask = seq_mask.to(dtype=dtype)
+
+    residue_mask = data["residue_mask"]
+    if not torch.is_tensor(residue_mask):
+        residue_mask = torch.as_tensor(residue_mask, device=device, dtype=dtype)
+    else:
+        if residue_mask.device != device:
+            raise ValueError(f"residue_mask is on {residue_mask.device}, expected {device}")
+        if residue_mask.dtype != dtype:
+            residue_mask = residue_mask.to(dtype=dtype)
+    mask_bool = seq_mask.bool() & residue_mask.bool() & atom_mask_bool[:, :3].all(dim=-1)
+    mask = mask_bool.to(dtype)
 
     # subtract the center from all positions
     center = index_mean(pos[:, 1], batch, atom_mask[:, 1, None])
@@ -320,7 +404,7 @@ def prepare_data(data, generator=None):
     else:
         pos_init = torch.randn(pos_ncacocb.shape, device=pos_ncacocb.device, dtype=pos_ncacocb.dtype, generator=generator) 
 
-    return dict(
+    out_data = dict(
         pos=pos_init,
         pos_gt=pos_ncacocb,
         pos_input=pos_ncacocb,
@@ -328,12 +412,19 @@ def prepare_data(data, generator=None):
         dmap=dmap,
         dmap_mask=dmap_mask,
         chain_index=chain,
+        mask_bool=mask_bool,
         mask=mask,
         atom_pos=atom_pos,
         atom_mask=atom_mask_out,
         all_atom_positions=pos_14,
         all_atom_mask=atom_mask_out,
     )
+
+    if DEBUG:
+        for el in out_data:
+            print(f"OUT {el} device is {out_data[el].device} & dtype is {out_data[el].dtype}") 
+        
+    return out_data 
         
 class StructureDecoderInference(nn.Module):
     """Wrapper class for StructureDecoder evaluation."""
@@ -394,19 +485,24 @@ class StructureDecoderInference(nn.Module):
 
         result = self.decoder(data, prev, generator=generator)
 
-        mask = data["mask"].to(torch.bool)
-        aa_gt = data["aa_gt"].to(torch.long)
+        mask = data.get("mask_bool", data["mask"])
+        if mask.dtype != torch.bool:
+            mask = mask.bool()
+        aa_gt = data["aa_gt"]
+        if aa_gt.dtype != torch.long:
+            aa_gt = aa_gt.long()
 
         aa_pred = result["aa"]  
         aa_onehot = F.one_hot(aa_gt, 20).to(dtype=aa_pred.dtype)
 
         aa_nll = -(aa_pred * aa_onehot).sum(dim=-1)
         aa_nll = torch.where(mask, aa_nll, torch.zeros_like(aa_nll))
-        aa_nll = aa_nll.sum() / torch.clamp(mask.sum().to(aa_nll.dtype), min=1.0)
+        mask_f = mask.float()
+        aa_nll = aa_nll.sum() / torch.clamp(mask_f.sum().to(aa_nll.dtype), min=1.0)
 
         perplexity = torch.exp(aa_nll)
         aatype = torch.argmax(aa_pred, dim=-1)
-        recovery = ((aa_gt == aatype) & mask).sum().to(torch.float32) / torch.clamp(mask.sum().to(torch.float32), min=1.0)
+        recovery = ((aa_gt == aatype) & mask).float().sum() / torch.clamp(mask_f.sum(), min=1.0)
 
         pos_gt = data["pos_gt"]
         pos = result["pos"]
@@ -414,26 +510,26 @@ class StructureDecoderInference(nn.Module):
         pos_gt = index_align(pos_gt, pos, data["batch_index"], mask)
 
         di2 = ((pos[:, 1] - pos_gt[:, 1]) ** 2).sum(dim=-1)
-        rmsd_ca = torch.sqrt((di2 * mask.to(di2.dtype)).sum() / torch.clamp(mask.sum().to(di2.dtype), min=1.0))
+        rmsd_ca = torch.sqrt((di2 * mask_f.to(di2.dtype)).sum() / torch.clamp(mask_f.sum().to(di2.dtype), min=1.0))
 
-        L = torch.clamp(mask.sum().to(torch.float32), min=1.0)
+        L = torch.clamp(mask_f.sum(), min=1.0)
         d02 = (1.24 * torch.pow(torch.clamp(L - 15.0, min=0.0), 1.0 / 3.0) - 1.8) ** 2
-        inner = (1.0 / (1.0 + di2 / torch.clamp(d02, min=1e-8))) * mask.to(di2.dtype)
-        tm = inner.sum() / torch.clamp(mask.sum().to(inner.dtype), min=1.0)
+        inner = (1.0 / (1.0 + di2 / torch.clamp(d02, min=1e-8))) * mask_f.to(di2.dtype)
+        tm = inner.sum() / torch.clamp(mask_f.sum().to(inner.dtype), min=1.0)
 
         dca_gt = torch.linalg.norm(pos_gt[:, None, 1] - pos_gt[None, :, 1], dim=-1)
         dca = torch.linalg.norm(pos[:, None, 1] - pos[None, :, 1], dim=-1)
 
         pair_mask = (mask[:, None] & mask[None, :])
-        derr = (dca_gt - dca).abs() * pair_mask.to(dca.dtype)
+        derr = (dca_gt - dca).abs() * pair_mask.to(dtype=dca.dtype)
 
         threshold = torch.tensor([0.5, 1.0, 2.0, 4.0], device=derr.device, dtype=derr.dtype)
         Rinc = 15.0
         pair_mask = pair_mask & (dca_gt < Rinc)
 
         in_threshold = (derr[..., None] < threshold) & pair_mask[..., None]
-        denom = torch.clamp(pair_mask[..., None].sum(dim=1).to(torch.float32), min=1.0)
-        lddt_ca = (in_threshold.sum(dim=1).to(torch.float32) / denom).mean(dim=-1)
+        denom = torch.clamp(pair_mask[..., None].sum(dim=1).float(), min=1.0)
+        lddt_ca = (in_threshold.sum(dim=1).float() / denom).mean(dim=-1)
         lddt_ca = torch.where(mask, lddt_ca, torch.zeros_like(lddt_ca))
 
         out = dict(
@@ -484,7 +580,7 @@ class AssignState(nn.Module):
         data = dict(data)
         data.update(self.prepare_data_fn(data) if generator is None else self.prepare_data_fn(data, generator=generator))
 
-        latent = self.encoder(data, generator=generator, trace=trace if return_trace else None)
+        latent = self.encoder(data, generator=generator)
 
         if getattr(c, "codebook_size", 0):
             latent, codebook_index, _ = self.quantize(latent, data["mask"])
@@ -625,7 +721,8 @@ class StructureDecoder(StructureAutoencoder):
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """Add noise to latents."""
-        batch = batch.to(torch.long)
+        if batch.dtype != torch.long:
+            batch = batch.long()
 
         if generator is None:
             noise_level_table = torch.randn(batch.shape, device=latent.device, dtype=latent.dtype)
@@ -726,18 +823,23 @@ class StructureAutoencoderInference(StructureAutoencoder):
             trace["dec/atom_pos"] = result["atom_pos"].detach()
             trace["dec/aa"] = result["aa"].detach()
 
-        mask = data["mask"].to(torch.bool)
+        mask = data.get("mask_bool", data["mask"])
+        if mask.dtype != torch.bool:
+            mask = mask.bool()
 
         aa_logits_or_logprobs = result["aa"]
-        aa_gt = data["aa_gt"].to(torch.long)
+        aa_gt = data["aa_gt"]
+        if aa_gt.dtype != torch.long:
+            aa_gt = aa_gt.long()
         aa_onehot = F.one_hot(aa_gt, 20).to(dtype=aa_logits_or_logprobs.dtype)
         aa_nll = -(aa_logits_or_logprobs * aa_onehot).sum(dim=-1)
         aa_nll = torch.where(mask, aa_nll, torch.zeros_like(aa_nll))
-        aa_nll = aa_nll.sum() / torch.clamp(mask.sum().to(aa_nll.dtype), min=1.0)
+        mask_f = mask.float()
+        aa_nll = aa_nll.sum() / torch.clamp(mask_f.sum().to(aa_nll.dtype), min=1.0)
         perplexity = torch.exp(aa_nll)
 
         aatype = torch.argmax(aa_logits_or_logprobs, dim=-1)
-        recovery = ((aatype == aa_gt) & mask).sum().to(torch.float32) / torch.clamp(mask.sum().to(torch.float32), min=1.0)
+        recovery = ((aatype == aa_gt) & mask).float().sum() / torch.clamp(mask_f.sum(), min=1.0)
 
         # RMSD (CA)
         pos_gt = data["pos_gt"]
@@ -746,33 +848,33 @@ class StructureAutoencoderInference(StructureAutoencoder):
         pos_gt_aligned = index_align(pos_gt, pos, data["batch_index"], mask)
 
         di2 = ((pos[:, 1] - pos_gt_aligned[:, 1]) ** 2).sum(dim=-1)
-        rmsd_ca = torch.sqrt((di2 * mask.to(di2.dtype)).sum() / torch.clamp(mask.sum().to(di2.dtype), min=1.0))
+        rmsd_ca = torch.sqrt((di2 * mask_f.to(di2.dtype)).sum() / torch.clamp(mask_f.sum().to(di2.dtype), min=1.0))
 
         # TM score (CA)
-        L = torch.clamp(mask.sum().to(torch.float32), min=1.0)
+        L = torch.clamp(mask_f.sum(), min=1.0)
         d02 = (1.24 * torch.pow(torch.clamp(L - 15.0, min=0.0), 1.0 / 3.0) - 1.8) ** 2
-        inner = (1.0 / (1.0 + di2 / torch.clamp(d02, min=1e-8))) * mask.to(di2.dtype)
-        tm = inner.sum() / torch.clamp(mask.sum().to(inner.dtype), min=1.0)
+        inner = (1.0 / (1.0 + di2 / torch.clamp(d02, min=1e-8))) * mask_f.to(di2.dtype)
+        tm = inner.sum() / torch.clamp(mask_f.sum().to(inner.dtype), min=1.0)
 
         # LDDT (CA)
         dca_gt = torch.linalg.norm(pos_gt_aligned[:, None, 1] - pos_gt_aligned[None, :, 1], dim=-1)
         dca = torch.linalg.norm(pos[:, None, 1] - pos[None, :, 1], dim=-1)
         pair_mask = (mask[:, None] & mask[None, :])
 
-        derr = (dca_gt - dca).abs() * pair_mask.to(dca.dtype)
+        derr = (dca_gt - dca).abs() * pair_mask.to(dtype=dca.dtype)
 
         threshold = torch.tensor([0.5, 1.0, 2.0, 4.0], device=dca.device, dtype=dca.dtype)
         Rinc = 15.0
         pair_mask = pair_mask & (dca_gt < Rinc)
 
         in_threshold = (derr[..., None] < threshold) & pair_mask[..., None]
-        denom = torch.clamp(pair_mask[..., None].sum(dim=1).to(torch.float32), min=1.0)
-        lddt_ca = (in_threshold.sum(dim=1).to(torch.float32) / denom).mean(dim=-1)
+        denom = torch.clamp(pair_mask[..., None].sum(dim=1).float(), min=1.0)
+        lddt_ca = (in_threshold.sum(dim=1).float() / denom).mean(dim=-1)
         lddt_ca = torch.where(mask, lddt_ca, torch.zeros_like(lddt_ca))
 
         # AlphaFold-style violation loss (JAX-salad compatible API)
-        res_mask = mask.to(torch.float32)
-        pred_mask = get_atom14_mask(aatype).to(res_mask.device).to(res_mask.dtype) * res_mask[:, None]
+        res_mask = mask_f
+        pred_mask = get_atom14_mask(aatype).to(device=res_mask.device, dtype=res_mask.dtype) * res_mask[:, None]
         violation_error, _ = violation_loss(
             aatype,
             data["residue_index"],
@@ -882,8 +984,8 @@ class VQ(nn.Module):
             codebook_scale = torch.exp(self.codebook_scale)
             codebook = self.codebook_mean + codebook_scale * codebook
 
-        mask_bool = mask.to(torch.bool)
-        mask_f = mask.to(torch.float32)
+        mask_bool = mask.bool() if mask.dtype != torch.bool else mask
+        mask_f = mask.float() if mask.dtype != torch.float32 else mask
 
         distance = (features[:, None, :] - codebook[None, :, :]).pow(2).sum(dim=-1)
         distance = torch.where(mask_bool[:, None], distance, torch.full_like(distance, float("inf")))
@@ -913,14 +1015,14 @@ class VQ(nn.Module):
         assignment_mask = local_assignment_count < 1.0 
 
         unassigned_loss_per = (codebook - features_rev.detach()).pow(2).mean(dim=-1)
-        unassigned_loss_per = unassigned_loss_per * assignment_mask.to(unassigned_loss_per.dtype)
-        unassigned_loss = unassigned_loss_per.sum() / torch.clamp(assignment_mask.to(torch.float32).sum(), min=1.0)
+        unassigned_loss_per = unassigned_loss_per * assignment_mask.to(dtype=unassigned_loss_per.dtype)
+        unassigned_loss = unassigned_loss_per.sum() / torch.clamp(assignment_mask.float().sum(), min=1.0)
 
         losses = dict(
             codebook=codebook_loss,
             commitment=commitment_loss,
             unassigned=unassigned_loss,
-            unassigned_percent=(assignment_count > 0).to(torch.float32).mean(),
+            unassigned_percent=(assignment_count > 0).float().mean(),
         )
         return out_features, assign_fwd, losses
 
@@ -1041,8 +1143,8 @@ class VQState(nn.Module):
         count = self.count
         avg = self.avg
 
-        mask_bool = mask.to(torch.bool)
-        mask_f = mask.to(torch.float32)
+        mask_bool = mask.bool() if mask.dtype != torch.bool else mask
+        mask_f = mask.float() if mask.dtype != torch.float32 else mask
 
         distance = (features[:, None, :] - codebook[None, :, :]).pow(2).sum(dim=-1)
         distance = torch.where(mask_bool[:, None], distance, torch.full_like(distance, float("inf")))
@@ -1091,7 +1193,7 @@ class VQState(nn.Module):
 
         losses = dict(
             commitment=commitment_loss,
-            unassigned_percent=(assignment_count > 0).to(torch.float32).mean(),
+            unassigned_percent=(assignment_count > 0).float().mean(),
         )
         state_update = dict(
             count=count_new,

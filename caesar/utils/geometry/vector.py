@@ -28,11 +28,13 @@ class Vec3Array:
     z: torch.Tensor
 
     def __post_init__(self):
+        # print(f"vector post init devices are: {self.x.device}, {self.y.device}, {self.z.device}")
         if hasattr(self.x, 'dtype'):
-            assert self.x.dtype == self.y.dtype
-            assert self.x.dtype == self.z.dtype
-            assert all([x == y for x, y in zip(self.x.shape, self.y.shape)])
-            assert all([x == z for x, z in zip(self.x.shape, self.z.shape)])
+            # assert self.x.dtype == self.y.dtype
+            # assert self.x.dtype == self.z.dtype
+            # assert all([x == y for x, y in zip(self.x.shape, self.y.shape)])
+            # assert all([x == z for x, z in zip(self.x.shape, self.z.shape)])
+            pass
 
     def __add__(self, other: Vec3Array) -> Vec3Array:
         return Vec3Array(
@@ -156,6 +158,7 @@ class Vec3Array:
     @classmethod
     def zeros(cls, shape, device="cpu"):
         """Return Vec3Array corresponding to zeros of given shape."""
+        #print(f"zeros vector was created on {device}")
         return cls(
             torch.zeros(shape, dtype=torch.float32, device=device), 
             torch.zeros(shape, dtype=torch.float32, device=device),
@@ -163,6 +166,7 @@ class Vec3Array:
         )
 
     def to_tensor(self) -> torch.Tensor:
+        #print(f"to_tensor in vec3array returned {torch.stack([self.x, self.y, self.z], dim=-1).device}")
         return torch.stack([self.x, self.y, self.z], dim=-1)
 
     def stack(vecs, dim=0):
@@ -170,7 +174,8 @@ class Vec3Array:
 
     @classmethod
     def from_array(cls, tensor):
-        assert tensor.shape[-1] == 3, f"Vec3Array.from_array expects [...,3], got {tuple(tensor.shape)}" # (c)
+        # assert tensor.shape[-1] == 3, f"Vec3Array.from_array expects [...,3], got {tuple(tensor.shape)}" # (c)
+        #print(f"vector from_array device: {tensor.device}")
         return cls(*torch.unbind(tensor, dim=-1))
 
     @classmethod

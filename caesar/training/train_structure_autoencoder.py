@@ -9,8 +9,8 @@ import torch
 from torch.nn.parameter import UninitializedParameter
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-
-DEBUG = True
+LOG_INTERVAL = 10
+DEBUG = False
 
 def cast_float(batch: Dict[str, Any], dtype: torch.dtype = torch.float32) -> Dict[str, Any]:
     """Like flexloop.loop.cast_float: cast only floating tensors."""
@@ -45,7 +45,7 @@ def prepare_batch(
     """
     out: Dict[str, Any] = {}
     for k, v in batch.items():
-        t = v if torch.is_tensor(v) else torch.as_tensor(v)
+        t = v if torch.is_tensor(v) else torch.as_tensor(v, device=device)
         if t.is_floating_point() and t.dtype != float_dtype:
             t = t.to(dtype=float_dtype)
         if device is not None and t.device != device:
@@ -65,10 +65,8 @@ def slice_batch_first_dim(batch: Dict[str, Any], n: int) -> Dict[str, Any]:
             out[k] = t
     return out
 
-
-def split_generator(gen: torch.Generator) -> Tuple[torch.Generator, torch.Generator]:
-    """Rough analogue of jax.random.split."""
-    device = gen.device if hasattr(gen, "device") else torch.device("cpu")
+def split_generator(gen: torch.Generator, device: Optional[torch.device] = None) -> Tuple[torch.Generator, torch.Generator]:
+    device = device if device is not None else getattr(gen, "device", torch.device("cpu"))
     seed = int(torch.randint(0, 2**31 - 1, (1,), generator=gen, device=device).item())
     sub = torch.Generator(device=device).manual_seed(seed)
     return gen, sub
@@ -112,7 +110,11 @@ def rebatch_call(
         out_last: Dict[str, Any] = {}
 
         for i in range(rebatch):
-            generator, micro_gen = split_generator(generator) if generator is not None else (None, None)
+            if generator is not None:
+                gen_device = getattr(ref, "device", None)
+                generator, micro_gen = split_generator(generator, device=gen_device)
+            else:
+                micro_gen = None
             sl = slice(i * m, (i + 1) * m)
             micro = {}
             for k, v in data.items():
@@ -138,26 +140,26 @@ def rebatch_call(
 
     return _call
 
-class EMA:
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
-        self.decay = float(decay)
-        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+# class EMA:
+#     def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+#         self.decay = float(decay)
+#         self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module):
-        sd = model.state_dict()
-        for k, v in sd.items():
-            self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+#     @torch.no_grad()
+#     def update(self, model: torch.nn.Module):
+#         sd = model.state_dict()
+#         for k, v in sd.items():
+#             self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
 
-    @torch.no_grad()
-    def apply_to(self, model: torch.nn.Module) -> Dict[str, torch.Tensor]:
-        backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        model.load_state_dict(self.shadow, strict=True)
-        return backup
+#     @torch.no_grad()
+#     def apply_to(self, model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+#         backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+#         model.load_state_dict(self.shadow, strict=True)
+#         return backup
 
-    @torch.no_grad()
-    def restore(self, model: torch.nn.Module, backup: Dict[str, torch.Tensor]):
-        model.load_state_dict(backup, strict=True)
+#     @torch.no_grad()
+#     def restore(self, model: torch.nn.Module, backup: Dict[str, torch.Tensor]):
+#         model.load_state_dict(backup, strict=True)
 
 @dataclass
 class State:
@@ -248,6 +250,10 @@ def clone_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
 def repeat_batch(batch: Dict[str, Any]):
     while True:
         yield clone_batch(batch)
+
+def repeat_batch_nocopy(batch: Dict[str, Any]):
+    while True:
+        yield batch
 
 def accumulate_stream(stream: Iterator[Dict[str, Any]], count: int):
     count = int(count)
@@ -377,8 +383,8 @@ def model_step(model, config, rebatch: int = 1, is_training: bool = True, device
 
     def final_step(data: Dict[str, Any], generator: Optional[torch.Generator] = None):
         loss, out = step(data, generator)
-        res_dict = {f"{name}_loss": item for name, item in out["losses"].items()}
-        res_dict = {k: v.to(torch.float32) for k, v in res_dict.items()}
+        losses = out.get("losses", {})
+        res_dict = {f"{name}_loss": item.to(torch.float32) for name, item in losses.items()}
         return loss.to(torch.float32), res_dict
 
     return final_step
@@ -392,9 +398,11 @@ def make_training_inner(
     schedule: Callable[[int], float],
     clip: float,
     accumulate: int = 1,
-    ema_weight: float = 0.999,
+    ema_weight: None,#float = 0.999,
     debug_batch: bool = False,
     debug_batch_full: bool = False,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.float16,
 ):
     accumulate = int(accumulate)
     clip = float(clip)
@@ -406,11 +414,16 @@ def make_training_inner(
 
         print("Uninitialized params:", bad)
         assert len(bad) == 0, "Found uninitialized params; run a forward that touches them before EMA."
-    ema_weight = float(ema_weight)
-
-    ema = EMA(model, decay=ema_weight) if ema_weight is not None else None
-
+    # ema_weight = float(ema_weight)
+    # ema = EMA(model, decay=ema_weight) if ema_weight is not None else None
+    ema=None
     first_fp = {"value": None}
+
+    use_amp = bool(amp) and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and amp_dtype == torch.float16)
+    autocast = torch.autocast if hasattr(torch, "autocast") else torch.cuda.amp.autocast
+
+    cache = {"raw": None, "prepared": None, "chunks": None}
 
     def training_inner(loop_state: State):
         t = time.time()
@@ -428,55 +441,73 @@ def make_training_inner(
 
         tr = time.time()
 
-        device = next(model.parameters()).device
-        item_t = prepare_batch(item, device=device, float_dtype=torch.float32)
-        if debug_batch:
-            fp = summarize_batch(item_t)
-            same = (fp == first_fp["value"]) if first_fp["value"] is not None else True
-            if first_fp["value"] is None:
-                first_fp["value"] = fp
-            print(f"[batch] same_as_first={same} :: {fp}")
-            if debug_batch_full:
-                print("[batch-full]\n" + dump_batch(item_t))
+        if cache["raw"] is item:
+            item_t = cache["prepared"]
+            chunks = cache["chunks"]
+        else:
+            item_t = prepare_batch(item, device=device, float_dtype=torch.float32)
+            if debug_batch:
+                fp = summarize_batch(item_t)
+                same = (fp == first_fp["value"]) if first_fp["value"] is not None else True
+                if first_fp["value"] is None:
+                    first_fp["value"] = fp
+                print(f"[batch] same_as_first={same} :: {fp}")
+                if debug_batch_full:
+                    print("[batch-full]\n" + dump_batch(item_t))
 
-        ref = None
-        for v in item_t.values():
-            if torch.is_tensor(v) and v.ndim >= 1:
-                ref = v
-                break
+            ref = None
+            for v in item_t.values():
+                if torch.is_tensor(v) and v.ndim >= 1:
+                    ref = v
+                    break
 
-        chunks = [item_t]
-        if ref is not None and accumulate > 1:
-            n = int(ref.shape[0])
-            assert n % accumulate == 0, f"leading dim {n} must be divisible by accumulate={accumulate}"
-            m = n // accumulate
-            chunks = []
-            for i in range(accumulate):
-                sl = slice(i * m, (i + 1) * m)
-                ch = {}
-                for k, v in item_t.items():
-                    if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == n:
-                        ch[k] = v[sl]
-                    else:
-                        ch[k] = v
-                chunks.append(ch)
+            chunks = [item_t]
+            if ref is not None and accumulate > 1:
+                n = int(ref.shape[0])
+                assert n % accumulate == 0, f"leading dim {n} must be divisible by accumulate={accumulate}"
+                m = n // accumulate
+                chunks = []
+                for i in range(accumulate):
+                    sl = slice(i * m, (i + 1) * m)
+                    ch = {}
+                    for k, v in item_t.items():
+                        if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == n:
+                            ch[k] = v[sl]
+                        else:
+                            ch[k] = v
+                    chunks.append(ch)
+
+            cache["raw"] = item
+            cache["prepared"] = item_t
+            cache["chunks"] = chunks
 
         log_sum: Dict[str, torch.Tensor] = {}
         loss_sum = 0.0
         for ch in chunks:
             subkey, ch_key = split_generator(subkey) # (c) gen for each chunk
-            loss, logs = step_fn(ch, ch_key)
-            (loss / float(len(chunks))).backward()
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                loss, logs = step_fn(ch, ch_key)
+            scaled_loss = loss / float(len(chunks))
+            if scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
             loss_sum = loss_sum + loss.detach()
             for k, v in logs.items():
                 log_sum[k] = log_sum.get(k, 0.0) + v.detach()
 
         if clip is not None and clip > 0:
+            if scaler.is_enabled():
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip)
 
-        optimizer.step()
-        if ema is not None:
-            ema.update(model)
+        if scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        # if ema is not None:
+        #     ema.update(model)
 
         step_time = time.time() - tr
         total_time = time.time() - t
@@ -485,7 +516,6 @@ def make_training_inner(
         loggables = {k: (v / denom) for k, v in log_sum.items()}
         loggables["loss"] = (loss_sum / denom)
         loggables["lr"] = torch.tensor(lr, dtype=torch.float32)
-
         new_state = State(
             key=key,
             step_id=loop_state.step_id + 1,
@@ -510,7 +540,12 @@ def make_valid_inner(
     data: Iterator[Dict[str, Any]],
     *,
     use_ema: bool = True,
+    amp: bool = False,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ):
+    use_amp = bool(amp) and torch.cuda.is_available()
+    autocast = torch.autocast if hasattr(torch, "autocast") else torch.cuda.amp.autocast
+
     def valid_inner(loop_state: State):
         t = time.time()
         item = next(data)
@@ -519,14 +554,15 @@ def make_valid_inner(
         item_t = prepare_batch(item, device=device, float_dtype=torch.float32)
 
         backup = None
-        ema_shadow = loop_state.aux_state.get("ema", None)
-        if use_ema and (ema_shadow is not None):
-            backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            model.load_state_dict(ema_shadow, strict=True)
+        # ema_shadow = loop_state.aux_state.get("ema", None)
+        # if use_ema and (ema_shadow is not None):
+        #     backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        #     model.load_state_dict(ema_shadow, strict=True)
 
         model.eval()
         with torch.no_grad():
-            loss, logs = step_fn(item_t, loop_state.key)
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                loss, logs = step_fn(item_t, loop_state.key)
 
         if backup is not None:
             model.load_state_dict(backup, strict=True)
@@ -594,7 +630,7 @@ if __name__ == "__main__":
         rebatch=1,
         accumulate=1,
         jax_seed=42,   
-        multigpu="True",
+        multigpu="False",
         suffix="1",
         overfit_one="False",
         no_random="False",
@@ -608,12 +644,14 @@ if __name__ == "__main__":
         smoke="False",
         smoke_steps=5,
         smoke_valid_interval=1,
+        amp="True",
+        amp_dtype="fp16",
     )
     
     smoke = (opt.smoke == "True")
     
     multigpu = (opt.multigpu == "True")
-    device = torch.device("cuda:1" if torch.cuda.is_available()  else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available()  else "cpu")
     seed = int(opt.jax_seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -635,14 +673,14 @@ if __name__ == "__main__":
     path = f"{opt.path}/torch/{sae}-{opt.config}-{opt.num_aa}-{opt.suffix}"
     writer = SummaryWriter(path)
     mul = opt.rebatch * opt.accumulate * NUM_DEVICES
-    
+    print(f"mul={mul}, multigpu={multigpu}, device={device}")
     if smoke:
         print("SMOKE MODE: using tests/data/test_structure.npz instead of full dataset")
         config.is_decoder = False
         config.eval = True
 
         npz_path = "tests/data/test_structure.npz"
-        batch = make_smoke_batch(npz_path, device="cpu", mul=mul)
+        batch = make_smoke_batch(npz_path, device=device, mul=mul)
         data = iter(infinite_stream(batch))
         valid_data = iter(infinite_stream(batch))
 
@@ -710,8 +748,8 @@ if __name__ == "__main__":
             print("Overfitting on a single batch (reusing the first batch for train/valid).")
             first_item = next(data)
             first_item = take_first_protein(first_item)
-            data = repeat_batch(first_item)
-            valid_data = repeat_batch(first_item)
+            data = repeat_batch_nocopy(first_item)
+            valid_data = repeat_batch_nocopy(first_item)
             item_0 = first_item
         else:
             item_0 = next(data)
@@ -794,6 +832,9 @@ if __name__ == "__main__":
     if loaded is not None:
         loop_state = loaded
 
+    amp_enabled = (opt.amp == "True")
+    amp_dtype = torch.bfloat16 if str(opt.amp_dtype).lower() in ("bf16", "bfloat16") else torch.float16
+    print(f"amp_dtype={amp_dtype }")
     training_inner = make_training_inner(
         model=model,
         optimizer=optimizer,
@@ -805,12 +846,16 @@ if __name__ == "__main__":
         ema_weight=float(opt.ema_weight),
         debug_batch=(opt.debug_batch == "True"),
         debug_batch_full=(opt.debug_batch_full == "True"),
+        amp=amp_enabled,
+        amp_dtype=amp_dtype,
     )
     valid_inner = make_valid_inner(
         model=model,
         step_fn=step_valid,
         data=valid_data,
-        use_ema=True,
+        use_ema=False, #True,
+        amp=amp_enabled,
+        amp_dtype=amp_dtype,
     )
 
     print("Starting training...")

@@ -50,6 +50,9 @@ class Rot3Array:
             }
         )
     
+    def device(self,):
+        return self.xx.device
+    
     def __mul__(self, other: torch.Tensor):
         field_names = utils.get_field_names(Rot3Array)
         return Rot3Array(

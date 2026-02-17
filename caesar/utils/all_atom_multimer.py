@@ -229,7 +229,7 @@ def atom37_to_frames(
 RESTYPE_ATOM14_MASK = _make_restype_atom14_mask()
 
 # FIXME
-def get_atom14_mask(aatype):
+def зЗ(aatype):
     aatype = aatype.to(torch.long)
     aatype = aatype.clamp(0, RESTYPE_ATOM14_MASK.shape[0] - 1)
     table = RESTYPE_ATOM14_MASK.to(device=aatype.device)

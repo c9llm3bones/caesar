@@ -49,11 +49,14 @@ def _resolve_init(initializer: Union[str, Callable[[torch.Tensor], None]]):
 class Linear(nn.Module):
     def __init__(self, size: int = 128, bias: bool = True, bias_init: float = 0.0,
                  initializer: Union[str, Callable[[torch.Tensor], None]] = "linear",
-                 name: Optional[str] = "linear"):
+                 name: Optional[str] = "linear",
+                 device: Optional[torch.device] = None,
+                 dtype: Optional[torch.dtype] = None):
         super().__init__()
+        # print(f"LINEAR INITED ON DEVICE: {device}")
         self.bias_init = float(bias_init)
         self.init = _resolve_init(initializer)
-        self.lin = nn.LazyLinear(int(size), bias=bool(bias))
+        self.lin = nn.LazyLinear(int(size), bias=bool(bias), device=device, dtype=dtype)
         self._inited = False
 
     @torch.no_grad()
@@ -63,8 +66,12 @@ class Linear(nn.Module):
             nn.init.constant_(self.lin.bias, self.bias_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.lin.weight.device != x.device:
-            self.lin = self.lin.to(x.device)
+        # print(f"LINEAR IS FORWARDING ON DEVICE: {self.lin.weight.device}")
+        if (not isinstance(self.lin.weight, UninitializedParameter)) and self.lin.weight.device != x.device:
+            raise RuntimeError(
+                f"Linear module is on {self.lin.weight.device}, input is on {x.device}. "
+                "Move the parent model with model.to(device) before forward."
+            )
 
         y = self.lin(x)
 
@@ -124,7 +131,13 @@ class GatedMLP(nn.Module):
         gate = self.act(self.gate_lin(x))
         hidden = gate * self.hid_lin(x)
         if self.out_lin is None:
-            self.out_lin = Linear(int(x.shape[-1]), bias=False, initializer=self.final_init).to(x.device)
+            self.out_lin = Linear(
+                int(x.shape[-1]),
+                bias=False,
+                initializer=self.final_init,
+                device=x.device,
+                dtype=x.dtype,
+            )
         return self.out_lin(hidden)
 
 

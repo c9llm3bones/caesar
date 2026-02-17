@@ -1,6 +1,23 @@
 from typing import Optional
 import torch
-import numpy as np
+
+# def _is_compiling() -> bool:
+#     try:
+#         import torch.compiler as _compiler  # type: ignore
+#         return bool(_compiler.is_compiling())
+#     except Exception:
+#         return False
+
+# try:
+#     _dynamo_disable = torch.compiler.disable  # type: ignore[attr-defined]
+# except Exception:
+#     try:
+#         import torch._dynamo as _dynamo  # type: ignore
+#         _dynamo_disable = _dynamo.disable
+#     except Exception:
+#         def _dynamo_disable(fn):
+#             return fn
+# import numpy as np
 import torch.nn.functional as F
 import torch.nn as nn
 from caesar.utils.geometry import Vec3Array
@@ -36,6 +53,7 @@ def distance_features(pos, neighbours=None, d_min=0.0, d_max=22.0, num_rbf=16):
     result = distance_rbf(dist, d_min, d_max, num_rbf).reshape(*dist.shape[:-1], -1)
     return result
 
+# @_dynamo_disable
 def direction_features(pos, neighbours=None, d_min=0.0, d_max=22.0, num_rbf=16):
     """Computes residue relative direction features.
     
@@ -55,40 +73,6 @@ def direction_features(pos, neighbours=None, d_min=0.0, d_max=22.0, num_rbf=16):
         dirs = local_pos.normalized().to_tensor()
     result = dirs.reshape(*dirs.shape[:2], -1)
     return result
-
-def type_position_features(local, pos, batch, mask, size=32, scale=10.0,
-                           learned_offset=False, neighbours=None):
-    frames, _ = extract_aa_frames(pos)
-    pair_mask = (neighbours != -1) * mask[:, None]
-    def type_features(type_pos):
-        type_pos = Vec3Array.from_array(type_pos)
-        if len(type_pos.shape) == 3:
-            type_pos = frames[:, None, None].apply_inverse_to_point(type_pos)
-        else:
-            type_pos = frames[:, None].apply_inverse_to_point(type_pos)
-        type_dir = type_pos.normalized().to_tensor().reshape(local.shape[0], size * 3)
-        type_dist = distance_rbf(type_pos.norm(), 0.0, 22.0, 10).reshape(type_pos.shape[0], -1)
-        type_pos = type_pos.to_tensor().reshape(type_pos.shape[0], size * 3) / scale
-        return torch.concatenate((type_dir, type_dist, type_pos), axis=-1)
-    # compute type weight
-    base_type_weight = Linear(size, bias=False, initializer="linear")(local)
-    base_type_weight = gelu_salad(base_type_weight)
-    # local type positions
-    type_weight = base_type_weight[neighbours]
-    type_weight = torch.where((neighbours != -1)[..., None], type_weight, 0)
-    pos = pos.to_tensor()
-    entry_pos = pos[:, 1, None]
-    if learned_offset:
-        entry_pos = LinearToPoints(size, init="zeros")(local, frames)
-    local_type_pos = entry_pos[neighbours] * type_weight[..., None]
-    local_type_pos = torch.where(pair_mask[..., None, None], local_type_pos, 0)
-    local_type_pos = local_type_pos.sum(axis=1) / torch.maximum(pair_mask.sum(axis=-1)[..., None, None], 1)
-    # global type positions
-    global_type_pos = index_mean(
-        entry_pos * base_type_weight[..., None],
-        batch, mask[:, None, None])
-    return torch.concatenate((type_features(local_type_pos),
-                            type_features(global_type_pos)), axis=-1)
 
 def paired_distance_features(x, y, d_min=0.0, d_max=22.0, num_rbf=16):
     """Compute distance features for a pair of structures x and y.
@@ -218,7 +202,10 @@ class LinearToPoints(nn.Module):
         points = Vec3Array.from_array(raw)                
         points = frames[..., None].apply_to_point(points)
 
-        return points.to_tensor().to(dtype)
+        out = points.to_tensor()
+        if out.dtype != dtype:
+            out = out.to(dtype=dtype)
+        return out
 
 class SparseStructureMessage(nn.Module):
     """Message passing wrapper."""
@@ -237,7 +224,9 @@ class SparseStructureMessage(nn.Module):
     def forward(self, local, pos, pair, pair_mask, neighbours, resi, chain, batch, mask):
         c = self.config
 
-        pos = Vec3Array.from_array(pos.to(dtype=torch.float32))
+        # if pos.dtype != torch.float32:
+        #     pos = pos.to(dtype=torch.float32)
+        pos = Vec3Array.from_array(pos)
 
         pair = self.pair_mlp(pair)
 
@@ -392,12 +381,14 @@ class SparseInvariantMultiQueryAttention(nn.Module):
         if isinstance(frames, Rigid3Array):
             frames_r = frames
         else:
-            frames_r = Rigid3Array.from_array(frames.to(dtype=torch.float32))
+            # if frames.dtype != torch.float32:
+            #     frames = frames.to(dtype=torch.float32)
+            frames_r = Rigid3Array.from_array(frames)
         # arr = frames_r.to_tensor()
         # print("frames.to_tensor shape:", arr.shape, "dtype:", arr.dtype)
         # print("frames.to_tensor[0]:", arr.reshape(-1, arr.shape[-1])[0])
-        neighbours = neighbours.to(torch.long)
-        mask_bool = mask.to(torch.bool)
+        neighbours = neighbours.long()
+        mask_bool = mask.bool()
 
         N, K = neighbours.shape
         H, C, Q = self.heads, self.size, self.query_points
@@ -482,7 +473,11 @@ class SparseAttention(nn.Module):
     def forward(self, local, pair, neighbours, mask):
         if self.normalize:
             if self._ln_local is None:
-                self._ln_local = nn.LayerNorm(local.shape[-1], elementwise_affine=True).to(local.device)
+                self._ln_local = nn.LayerNorm(
+                    local.shape[-1],
+                    elementwise_affine=True,
+                    device=local.device,
+                )
             local = self._ln_local(local)
 
         qkv = self.qkv(local).view(*local.shape[:-1], self.heads, 3 * self.size)
@@ -499,7 +494,7 @@ class SparseAttention(nn.Module):
         w_L = (1.0 / 2.0) ** 0.5
 
         if neighbours is not None:
-            neighbours = neighbours.to(dtype=torch.long)
+            neighbours = neighbours.long()
 
         dot = (1.0 / self.size) ** 0.5 * (q.unsqueeze(1) * k[neighbours]).sum(dim=-1)
         attn_logits = w_L * (dot + bias)
@@ -510,13 +505,13 @@ class SparseAttention(nn.Module):
             pair_mask = mask * (neighbours != -1)
 
         attn_logits = torch.where(
-            pair_mask[..., None].to(torch.bool),
+            pair_mask[..., None].bool(),
             attn_logits,
             torch.full_like(attn_logits, -1e9),
         )
 
         attn = torch.softmax(attn_logits, dim=1)  
-        attn = torch.where(pair_mask[..., None].to(torch.bool), attn, torch.zeros_like(attn))
+        attn = torch.where(pair_mask[..., None].bool(), attn, torch.zeros_like(attn))
 
         out_pair = torch.einsum("nkh,nkc->nhc", attn, pair)
         out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v[neighbours])
@@ -530,10 +525,17 @@ class SparseAttention(nn.Module):
         )
 
         if self._project_out is None:
-            self._project_out = Linear(int(local.shape[-1]), initializer=self.final_init, name="project_out").to(local.device)
+            self._project_out = Linear(
+                int(local.shape[-1]),
+                initializer=self.final_init,
+                name="project_out",
+                device=local.device,
+            )
 
         out = self._project_out(x)
-        return out.to(dtype=local.dtype)
+        if out.dtype != local.dtype:
+            out = out.to(dtype=local.dtype)
+        return out
 
 class DenseNonEquivariantPointAttention(nn.Module):
     """EXPERIMENTAL. Non-equivariant point attention."""
@@ -592,14 +594,19 @@ class DenseNonEquivariantPointAttention(nn.Module):
     def forward(self, local, pos, resi, chain, batch, mask):
         if self.normalize:
             if self._ln_local is None:
-                self._ln_local = nn.LayerNorm(local.shape[-1], elementwise_affine=True).to(local.device)
+                self._ln_local = nn.LayerNorm(
+                    local.shape[-1],
+                    elementwise_affine=True,
+                    device=local.device,
+                )
             local = self._ln_local(local)
 
         H, C = self.heads, self.size
         Q, V = self.query_points, self.value_points
 
         same_batch = batch[:, None].eq(batch[None, :])
-        pair_mask = (mask[:, None] * mask[None, :] * same_batch.to(mask.dtype)).to(torch.bool)
+        mask_bool = mask.bool()
+        pair_mask = mask_bool[:, None] & mask_bool[None, :] & same_batch
 
         def attention_component(x, proj: Linear):
             y = proj(x)  # (N, H*C)
@@ -638,7 +645,7 @@ class DenseNonEquivariantPointAttention(nn.Module):
 
         rel = (query_points[:, None] - key_points[None, :]).reshape(dist.shape[0], dist.shape[1], -1)
 
-        rdist = (resi_dist + 32).to(torch.long)
+        rdist = (resi_dist + 32).long()
         rdist = torch.where(other_chain, torch.full_like(rdist, 65), rdist)
         rdist_emb = self.resi_embedding[rdist]  # (N, N, C + 3*V)
 
@@ -658,7 +665,12 @@ class DenseNonEquivariantPointAttention(nn.Module):
         result = torch.einsum("ijh,ijhc->ihc", attn, pair).reshape(local.shape[0], -1)
 
         if self._out is None:
-            self._out = Linear(int(local.shape[-1]), bias=False, initializer="zeros").to(local.device)
+            self._out = Linear(
+                int(local.shape[-1]),
+                bias=False,
+                initializer="zeros",
+                device=local.device,
+            )
 
         return self._out(result)
 
@@ -729,9 +741,7 @@ class SparseSemiEquivariantPointAttention(nn.Module):
         k = self.ln_k(k)
 
         qkv_g = self.qkv_g(local)  # (..., H*(2Q+V)*3)
-
-        # (c) maybe bug
-        qkv_g = qkv.view(qkv.shape[0], -1, 3) 
+        qkv_g = qkv_g.view(qkv_g.shape[0], -1, 3)
 
         base = pos[:, 1, :]  # (N, 3)
         qkv_g = qkv_g + base[:, None, :]           # (N, H*(2Q+V), 3)
@@ -756,10 +766,10 @@ class SparseSemiEquivariantPointAttention(nn.Module):
                 "(the original code has it, but downstream einsums expect neighbour dimension)."
             )
         else:
-            neighbours = neighbours.to(torch.long)
-            pair_mask = mask * (neighbours != -1).to(mask.dtype)
+            neighbours = neighbours.long()
+            pair_mask = mask * (neighbours != -1)
 
-        pair_mask_bool = pair_mask.to(torch.bool)
+        pair_mask_bool = pair_mask.bool()
 
         k_n = k[neighbours]  # (N,K,H,C)
         v_n = v[neighbours]  # (N,K,H,C)
@@ -786,8 +796,12 @@ class SparseSemiEquivariantPointAttention(nn.Module):
 
         out_point = torch.einsum("nkh,nkhvd->nhvd", attn, v_gn)  # (N,H,V,3)
 
-        out_point_v = Vec3Array.from_array(out_point.to(torch.float32))
-        base_v = Vec3Array.from_array(base.to(torch.float32))[:, None, None]
+        # if out_point.dtype != torch.float32:
+        #     out_point = out_point.to(dtype=torch.float32)
+        # if base.dtype != torch.float32:
+        #     base = base.to(dtype=torch.float32)
+        out_point_v = Vec3Array.from_array(out_point)
+        base_v = Vec3Array.from_array(base)[:, None, None]
         out_point_v = out_point_v - base_v
 
         out_norm = out_point_v.norm()  
@@ -804,7 +818,9 @@ class SparseSemiEquivariantPointAttention(nn.Module):
         )
 
         out = self.project_out(out)
-        return out.to(dtype=local.dtype)
+        if out.dtype != local.dtype:
+            out = out.to(dtype=local.dtype)
+        return out
     
 class SparseInvariantPointAttention(nn.Module):
     """Sparse IPA."""
@@ -847,12 +863,18 @@ class SparseInvariantPointAttention(nn.Module):
     def forward(self, local, pair, frames, neighbours, mask):
         if self.normalize:
             if self._ln_local is None:
-                self._ln_local = nn.LayerNorm(local.shape[-1], elementwise_affine=True).to(local.device)
+                self._ln_local = nn.LayerNorm(
+                    local.shape[-1],
+                    elementwise_affine=True,
+                    device=local.device,
+                )
             local = self._ln_local(local)
         if isinstance(frames, Rigid3Array):
             frames = frames
         else:
-            frames = Rigid3Array.from_array(frames.to(dtype=torch.float32))
+            # if frames.dtype != torch.float32:
+            #     frames = frames.to(dtype=torch.float32)
+            frames = Rigid3Array.from_array(frames)
         # arr = frames.to_tensor()
         
         qkv = self.qkv(local).view(*local.shape[:-1], self.heads, 3 * self.size)
@@ -881,7 +903,7 @@ class SparseInvariantPointAttention(nn.Module):
         dfactor = F.softplus(self.gamma.view(1, 1, self.heads)) * w_C / 2.0
 
         if neighbours is not None:
-            neighbours = neighbours.to(dtype=torch.long)
+            neighbours = neighbours.long()
 
         dist = dfactor * (q_g[:, None] - k_g[neighbours]).pow(2).sum(dim=(-1, -2))
         dot = (1.0 / self.size) ** 0.5 * (q.unsqueeze(1) * k[neighbours]).sum(dim=-1)
@@ -893,16 +915,18 @@ class SparseInvariantPointAttention(nn.Module):
         else:
             pair_mask = mask * (neighbours != -1)
 
-        attn_logits = torch.where(pair_mask[..., None].to(torch.bool), attn_logits, torch.full_like(attn_logits, -1e9))
+        attn_logits = torch.where(pair_mask[..., None].bool(), attn_logits, torch.full_like(attn_logits, -1e9))
 
         attn = torch.softmax(attn_logits, dim=1)
-        attn = torch.where(pair_mask[..., None].to(torch.bool), attn, torch.zeros_like(attn))
+        attn = torch.where(pair_mask[..., None].bool(), attn, torch.zeros_like(attn))
 
         out_pair = torch.einsum("nkh,nkc->nhc", attn, pair)
         out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v[neighbours])
         out_point = torch.einsum("nkh,nkhvd->nhvd", attn, v_g[neighbours])
 
-        out_point = Vec3Array.from_array(out_point.to(dtype=torch.float32))
+        # if out_point.dtype != torch.float32:
+        #     out_point = out_point.to(dtype=torch.float32)
+        out_point = Vec3Array.from_array(out_point)
         out_point = frames[:, None, None].apply_inverse_to_point(out_point)
 
         out_norm = out_point.norm()
@@ -919,7 +943,14 @@ class SparseInvariantPointAttention(nn.Module):
         )
 
         if self._project_out is None:
-            self._project_out = Linear(int(local.shape[-1]), initializer=self.final_init, name="project_out").to(local.device)
+            self._project_out = Linear(
+                int(local.shape[-1]),
+                initializer=self.final_init,
+                name="project_out",
+                device=local.device,
+            )
 
         out = self._project_out(concat)
-        return out.to(dtype=local.dtype)
+        if out.dtype != local.dtype:
+            out = out.to(dtype=local.dtype)
+        return out
