@@ -25,6 +25,27 @@ from caesar.utils.geometry import Rigid3Array, Vec3Array
 
 Float = Union[float, torch.Tensor]
 
+def _gather_rows(source: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Gather rows from dim 0 for arbitrary index shape.
+
+    Uses modulo indexing to preserve legacy behavior for `-1` sentinel values
+    (which previously selected the last row via advanced indexing).
+    """
+    if index.dtype != torch.long:
+        index = index.long()
+    flat = index.reshape(-1).remainder(source.shape[0])
+    gathered = torch.index_select(source, dim=0, index=flat)
+    return gathered.reshape(*index.shape, *source.shape[1:])
+
+
+def _gather_cols_per_row(source: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Row-wise gather from a matrix along dim 1 with legacy `-1` semantics."""
+    if index.dtype != torch.long:
+        index = index.long()
+    safe_index = index.remainder(source.shape[1])
+    return torch.gather(source, dim=1, index=safe_index)
+
+
 def rot_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Matrix multiply two rotation matrices [*, 3, 3]."""
     def row_mul(i):
@@ -100,7 +121,9 @@ def extract_aa_frames(positions: Vec3Array) -> Tuple[Rigid3Array, Vec3Array]:
         Rigid3Array of residue frames and Vec3Array of local-frame
         side chain atom positions.
     """        
-    rigids, _ = make_backbone_affine(positions, torch.ones((positions.shape[0], 14)), None)
+    # Keep mask on the same device/dtype and support arbitrary leading dims.
+    atom_mask = positions.x.new_ones((*positions.shape[:-1], positions.shape[-1]))
+    rigids, _ = make_backbone_affine(positions, atom_mask, None)
     local_positions = rigids[..., None].apply_inverse_to_point(positions)
     return rigids, local_positions
 
@@ -320,8 +343,6 @@ def get_neighbours(count: int):
         N = distance.shape[0]
         device = distance.device
 
-        index = torch.arange(N, device=device)
-
         distance = distance.float()
 
         distance = torch.where(
@@ -331,15 +352,15 @@ def get_neighbours(count: int):
         )
 
         if neighbours is not None:
-            idx = index[:, None]
-
+            neighbours = neighbours.long()
+            gathered = _gather_cols_per_row(distance, neighbours)
             update = torch.where(
                 neighbours != -1,
-                torch.full_like(neighbours, float("inf"), dtype=distance.dtype),
-                distance[idx, neighbours],
+                torch.full_like(gathered, float("inf"), dtype=distance.dtype),
+                gathered,
             )
 
-            distance[idx, neighbours] = update
+            distance.scatter_(dim=1, index=neighbours.remainder(N), src=update)
 
         # Canonical tie-break across frameworks: prefer lower column index
         # when distances are equal.
@@ -349,13 +370,19 @@ def get_neighbours(count: int):
             distance + col_index * 1e-6,
             distance,
         )
-        knn = torch.argsort(distance_for_sort, dim=-1, stable=True)[..., :count]
+        k = min(int(count), N)
+        if k <= 0:
+            knn = torch.empty((N, 0), device=device, dtype=torch.long)
+        else:
+            knn = torch.topk(
+                distance_for_sort,
+                k=k,
+                dim=-1,
+                largest=False,
+                sorted=True,
+            ).indices
 
-        knn = torch.where(
-            distance[index[:, None], knn] < float("inf"),
-            knn,
-            -1,
-        )
+        knn = torch.where(_gather_cols_per_row(distance, knn) < float("inf"), knn, -1)
 
         if neighbours is not None:
             knn = torch.cat((neighbours, knn), dim=-1)
@@ -692,12 +719,18 @@ def sequence_relative_position(count: Optional[int] = 32,
         be cyclised.
     """
     def inner(resi, chain, batch, neighbours=None, cyclic_mask=None):
-        compare_index = (None, slice(None))
-        if neighbours is not None:
-            compare_index = neighbours
-        same_chain = chain[:, None] == chain[compare_index]
-        same_batch = batch[:, None] == batch[compare_index]
-        dist = resi[:, None] - resi[compare_index]
+        if neighbours is None:
+            same_chain = chain[:, None] == chain[None, :]
+            same_batch = batch[:, None] == batch[None, :]
+            dist = resi[:, None] - resi[None, :]
+        else:
+            neighbours = neighbours.long()
+            chain_n = _gather_rows(chain, neighbours)
+            batch_n = _gather_rows(batch, neighbours)
+            resi_n = _gather_rows(resi, neighbours)
+            same_chain = chain[:, None] == chain_n
+            same_batch = batch[:, None] == batch_n
+            dist = resi[:, None] - resi_n
         flat_resi = torch.arange(resi.shape[0], dtype=torch.int32, device=resi.device)
         if cyclic:
             lengths = index_count(chain, torch.ones_like(chain, dtype=torch.bool))
@@ -718,7 +751,10 @@ def sequence_relative_position(count: Optional[int] = 32,
             dist = torch.where(same_chain, dist, 2 * count - 2)
             dist = torch.where(same_batch, dist, 2 * count - 2)
         elif pseudo_chains:
-            flat_dist = flat_resi[:, None] - flat_resi[compare_index]
+            if neighbours is None:
+                flat_dist = flat_resi[:, None] - flat_resi[None, :]
+            else:
+                flat_dist = flat_resi[:, None] - _gather_rows(flat_resi, neighbours)
             flat_dist = torch.where(flat_dist >= 0, 0, 2 * count - 1)
             count_total = 2 * count + 2
             dist = torch.where(same_chain, dist, flat_dist)
@@ -748,9 +784,10 @@ def index_count(index, mask, apply_mask=True):
     mask = mask.bool()
     result = torch.zeros_like(index)
     result.scatter_add_(0, index, mask.long())
+    gathered = result.index_select(0, index)
     if not apply_mask:
-        return result[index]
-    return torch.where(mask, result[index], torch.zeros_like(result[index]))
+        return gathered
+    return torch.where(mask, gathered, torch.zeros_like(gathered))
 
 def index_align(x, y, index, mask, weight=None):
     """Rigid align two structures x and y.

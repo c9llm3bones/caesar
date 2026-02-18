@@ -31,6 +31,45 @@ from caesar.utils.all_atom_multimer import make_transform_from_reference
 
 from caesar.utils.geometry import Vec3Array, Rigid3Array
 
+def _gather_rows(source: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Gather rows along dim 0 for an arbitrary index shape."""
+    if index.dtype != torch.long:
+        index = index.long()
+    flat_index = index.reshape(-1).remainder(source.shape[0])
+    gathered = torch.index_select(source, dim=0, index=flat_index)
+    return gathered.reshape(*index.shape, *source.shape[1:])
+
+
+def _gather_vec3(source: Vec3Array, index: torch.Tensor) -> Vec3Array:
+    return Vec3Array(
+        _gather_rows(source.x, index),
+        _gather_rows(source.y, index),
+        _gather_rows(source.z, index),
+    )
+
+
+def _gather_rigid(source: Rigid3Array, index: torch.Tensor) -> Rigid3Array:
+    rot = source.rotation
+    gathered_rot = type(rot)(
+        _gather_rows(rot.xx, index),
+        _gather_rows(rot.xy, index),
+        _gather_rows(rot.xz, index),
+        _gather_rows(rot.yx, index),
+        _gather_rows(rot.yy, index),
+        _gather_rows(rot.yz, index),
+        _gather_rows(rot.zx, index),
+        _gather_rows(rot.zy, index),
+        _gather_rows(rot.zz, index),
+    )
+    trans = source.translation
+    gathered_trans = Vec3Array(
+        _gather_rows(trans.x, index),
+        _gather_rows(trans.y, index),
+        _gather_rows(trans.z, index),
+    )
+    return Rigid3Array(gathered_rot, gathered_trans)
+
+
 def distance_features(pos, neighbours=None, d_min=0.0, d_max=22.0, num_rbf=16):
     """Compute residue pair distance features.
     
@@ -48,7 +87,8 @@ def distance_features(pos, neighbours=None, d_min=0.0, d_max=22.0, num_rbf=16):
     if neighbours is None:
         dist = (pos[:, None, :5, None] - pos[None, :, None, :5]).norm()
     else:
-        dist = (pos[:, None, :5, None] - pos[neighbours, None, :5]).norm()
+        pos_neighbours = _gather_vec3(pos, neighbours)
+        dist = (pos[:, None, :5, None] - pos_neighbours[:, :, None, :5]).norm()
     dist = dist.reshape(*dist.shape[:-2], -1)
     result = distance_rbf(dist, d_min, d_max, num_rbf).reshape(*dist.shape[:-1], -1)
     return result
@@ -69,7 +109,9 @@ def direction_features(pos, neighbours=None, d_min=0.0, d_max=22.0, num_rbf=16):
         local_pos = frames[:, None, None].apply_inverse_to_point(pos[None, :])
         dirs = local_pos.normalized().to_tensor()
     else:
-        local_pos = frames[:, None, None].apply_inverse_to_point(pos[neighbours])
+        local_pos = frames[:, None, None].apply_inverse_to_point(
+            _gather_vec3(pos, neighbours)
+        )
         dirs = local_pos.normalized().to_tensor()
     result = dirs.reshape(*dirs.shape[:2], -1)
     return result
@@ -102,7 +144,7 @@ def rotation_features(frames, neighbours=None):
     if neighbours is None:
         rot = frames[:, None].inverse().rotation @ frames[None, :].rotation
     else:
-        rot = frames[:, None].inverse().rotation @ frames[neighbours].rotation
+        rot = frames[:, None].inverse().rotation @ _gather_rigid(frames, neighbours).rotation
     rot = rot.to_tensor().reshape(*rot.shape, -1)
     return rot
 
@@ -120,7 +162,7 @@ def position_rotation_features(pos: Vec3Array, neighbours=None):
     if neighbours is None:
         rot = frames[:, None].inverse().rotation @ frames[None, :].rotation
     else:
-        rot = frames[:, None].inverse().rotation @ frames[neighbours].rotation
+        rot = frames[:, None].inverse().rotation @ _gather_rigid(frames, neighbours).rotation
     rot = rot.to_tensor().reshape(*rot.shape, -1)
     return rot
 
@@ -172,7 +214,7 @@ def pair_vector_features(pos, neighbours=None, scale: float = 0.1):
         frames[:, None, None].apply_inverse_to_point(pos[:, None]).to_tensor()
             .expand(neighbours.shape[0], neighbours.shape[1], A, 3),
         # frames.apply_inverse_to_point(pos[neighbours]) -> (N,K,A,3)
-        frames[:, None, None].apply_inverse_to_point(pos[neighbours]).to_tensor(),
+        frames[:, None, None].apply_inverse_to_point(_gather_vec3(pos, neighbours)).to_tensor(),
     ), dim=-2)  
 
     pair_vectors = Vec3Array.from_array(pair_vectors)  # (N,K,2A)
@@ -195,7 +237,7 @@ class LinearToPoints(nn.Module):
     def forward(self, data: torch.Tensor, frames):
         dtype = data.dtype
 
-        raw = self.proj(data).to(torch.float32)
+        raw = self.proj(data)
 
         raw = raw.reshape(*raw.shape[:-1], self.size, 3)
 
@@ -404,10 +446,10 @@ class SparseInvariantMultiQueryAttention(nn.Module):
         kp = self._points_global(local, self.kp_proj, frames_r, heads=1)   # (N,1,Q,3)
         vp = self._points_global(local, self.vp_proj, frames_r, heads=1)   # (N,1,Q,3)
 
-        k_g = k[neighbours]    # (N,K,1,C)
-        v_g = v[neighbours]    # (N,K,1,C)
-        kp_g = kp[neighbours]  # (N,K,1,Q,3)
-        vp_g = vp[neighbours]  # (N,K,1,Q,3)
+        k_g = _gather_rows(k, neighbours)    # (N,K,1,C)
+        v_g = _gather_rows(v, neighbours)    # (N,K,1,C)
+        kp_g = _gather_rows(kp, neighbours)  # (N,K,1,Q,3)
+        vp_g = _gather_rows(vp, neighbours)  # (N,K,1,Q,3)
 
         k_g = k_g.expand(-1, -1, H, -1)             # (N,K,H,C)
         v_g = v_g.expand(-1, -1, H, -1)             # (N,K,H,C)
@@ -477,6 +519,7 @@ class SparseAttention(nn.Module):
                     local.shape[-1],
                     elementwise_affine=True,
                     device=local.device,
+                    dtype=local.dtype,
                 )
             local = self._ln_local(local)
 
@@ -496,7 +539,14 @@ class SparseAttention(nn.Module):
         if neighbours is not None:
             neighbours = neighbours.long()
 
-        dot = (1.0 / self.size) ** 0.5 * (q.unsqueeze(1) * k[neighbours]).sum(dim=-1)
+        if neighbours is None:
+            k_neigh = k[None, :]
+            v_neigh = v[None, :]
+        else:
+            k_neigh = _gather_rows(k, neighbours)
+            v_neigh = _gather_rows(v, neighbours)
+
+        dot = (1.0 / self.size) ** 0.5 * (q.unsqueeze(1) * k_neigh).sum(dim=-1)
         attn_logits = w_L * (dot + bias)
 
         if neighbours is None:
@@ -514,7 +564,7 @@ class SparseAttention(nn.Module):
         attn = torch.where(pair_mask[..., None].bool(), attn, torch.zeros_like(attn))
 
         out_pair = torch.einsum("nkh,nkc->nhc", attn, pair)
-        out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v[neighbours])
+        out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v_neigh)
 
         x = torch.cat(
             [
@@ -530,6 +580,7 @@ class SparseAttention(nn.Module):
                 initializer=self.final_init,
                 name="project_out",
                 device=local.device,
+                dtype=local.dtype,
             )
 
         out = self._project_out(x)
@@ -598,6 +649,7 @@ class DenseNonEquivariantPointAttention(nn.Module):
                     local.shape[-1],
                     elementwise_affine=True,
                     device=local.device,
+                    dtype=local.dtype,
                 )
             local = self._ln_local(local)
 
@@ -670,9 +722,12 @@ class DenseNonEquivariantPointAttention(nn.Module):
                 bias=False,
                 initializer="zeros",
                 device=local.device,
+                dtype=local.dtype,
             )
-
-        return self._out(result)
+        out = self._out(result)
+        if out.dtype != local.dtype:
+            out = out.to(dtype=local.dtype)
+        return out
 
 class SparseSemiEquivariantPointAttention(nn.Module):
     """Sparse IPA with additional non-equivariant features."""
@@ -771,11 +826,11 @@ class SparseSemiEquivariantPointAttention(nn.Module):
 
         pair_mask_bool = pair_mask.bool()
 
-        k_n = k[neighbours]  # (N,K,H,C)
-        v_n = v[neighbours]  # (N,K,H,C)
+        k_n = _gather_rows(k, neighbours)  # (N,K,H,C)
+        v_n = _gather_rows(v, neighbours)  # (N,K,H,C)
 
-        k_gn = k_g[neighbours]  # (N,K,H,Q,3)
-        v_gn = v_g[neighbours]  # (N,K,H,V,3)
+        k_gn = _gather_rows(k_g, neighbours)  # (N,K,H,Q,3)
+        v_gn = _gather_rows(v_g, neighbours)  # (N,K,H,V,3)
 
         dist = dfactor * (q_g.unsqueeze(1) - k_gn).pow(2).sum(dim=(-1, -2))
 
@@ -867,6 +922,7 @@ class SparseInvariantPointAttention(nn.Module):
                     local.shape[-1],
                     elementwise_affine=True,
                     device=local.device,
+                    dtype=local.dtype,
                 )
             local = self._ln_local(local)
         if isinstance(frames, Rigid3Array):
@@ -905,8 +961,19 @@ class SparseInvariantPointAttention(nn.Module):
         if neighbours is not None:
             neighbours = neighbours.long()
 
-        dist = dfactor * (q_g[:, None] - k_g[neighbours]).pow(2).sum(dim=(-1, -2))
-        dot = (1.0 / self.size) ** 0.5 * (q.unsqueeze(1) * k[neighbours]).sum(dim=-1)
+        if neighbours is None:
+            k_neigh = k[None, :]
+            v_neigh = v[None, :]
+            k_g_neigh = k_g[None, :]
+            v_g_neigh = v_g[None, :]
+        else:
+            k_neigh = _gather_rows(k, neighbours)
+            v_neigh = _gather_rows(v, neighbours)
+            k_g_neigh = _gather_rows(k_g, neighbours)
+            v_g_neigh = _gather_rows(v_g, neighbours)
+
+        dist = dfactor * (q_g[:, None] - k_g_neigh).pow(2).sum(dim=(-1, -2))
+        dot = (1.0 / self.size) ** 0.5 * (q.unsqueeze(1) * k_neigh).sum(dim=-1)
 
         attn_logits = w_L * (dot + bias - dist)
 
@@ -921,8 +988,8 @@ class SparseInvariantPointAttention(nn.Module):
         attn = torch.where(pair_mask[..., None].bool(), attn, torch.zeros_like(attn))
 
         out_pair = torch.einsum("nkh,nkc->nhc", attn, pair)
-        out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v[neighbours])
-        out_point = torch.einsum("nkh,nkhvd->nhvd", attn, v_g[neighbours])
+        out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v_neigh)
+        out_point = torch.einsum("nkh,nkhvd->nhvd", attn, v_g_neigh)
 
         # if out_point.dtype != torch.float32:
         #     out_point = out_point.to(dtype=torch.float32)
@@ -948,6 +1015,7 @@ class SparseInvariantPointAttention(nn.Module):
                 initializer=self.final_init,
                 name="project_out",
                 device=local.device,
+                dtype=local.dtype,
             )
 
         out = self._project_out(concat)

@@ -31,6 +31,14 @@ from caesar.modules.geometric import (
 )
 from caesar.config import EncoderConfig
 
+def _gather_rows(source: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Gather along dim 0 for arbitrary index shape with legacy -1 semantics."""
+    if index.dtype != torch.long:
+        index = index.long()
+    flat = index.reshape(-1).remainder(source.shape[0])
+    gathered = torch.index_select(source, dim=0, index=flat)
+    return gathered.reshape(*index.shape, *source.shape[1:])
+
 class EncoderBlock(nn.Module):
     """Encoder block."""
 
@@ -266,7 +274,8 @@ class AADecoderPairFeatures(nn.Module):
         mask_bool = mask
         if mask_bool.dtype != torch.bool:
             mask_bool = (mask_bool != 0)
-        pair_mask = (mask_bool[:, None] & mask_bool[neighbours] & (neighbours != -1)).float()
+        neigh_mask = _gather_rows(mask_bool, neighbours)
+        pair_mask = (mask_bool[:, None] & neigh_mask & (neighbours != -1))
         
         pair  = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
         pair += self.p_dist(distance_features(pos, neighbours, d_min=0.0, d_max=22.0))
@@ -306,8 +315,8 @@ class InitLocalFeatures(nn.Module):
         if mask_bool.dtype != torch.bool:
             mask_bool = (mask_bool != 0)
 
-        pair_mask_bool = (mask_bool[:, None] & mask_bool[neighbours] & (neighbours != -1))
-        pair_mask = pair_mask_bool.float()
+        neigh_mask = _gather_rows(mask_bool, neighbours)
+        pair_mask_bool = (mask_bool[:, None] & neigh_mask & (neighbours != -1))
         pair  = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
         pair += self.p_dist(distance_features(pos, neighbours, d_min=0.0, d_max=22.0))
         pair += self.p_dir(direction_features(pos, neighbours))
@@ -324,6 +333,7 @@ class InitLocalFeatures(nn.Module):
         )
 
 
-        local = pair.sum(dim=1) / pair_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        denom = pair_mask_bool.sum(dim=-1, keepdim=True).to(dtype=pair.dtype).clamp_min(1.0)
+        local = pair.sum(dim=1) / denom
         local = self.to_local(local)
         return local

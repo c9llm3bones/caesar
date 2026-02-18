@@ -46,7 +46,37 @@ def stop_gradient(x):
     if hasattr(x, "map_tensor_fn"):
         return x.map_tensor_fn(lambda t: t.detach())
     raise TypeError(f"stop_gradient: unsupported type {type(x)}")
-    
+
+def _gather_rows(source: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Gather along dim 0 for arbitrary index shape.
+
+    Uses modulo indexing to preserve legacy `-1` behavior from advanced indexing.
+    """
+    if index.dtype != torch.long:
+        index = index.long()
+    flat = index.reshape(-1).remainder(source.shape[0])
+    gathered = torch.index_select(source, dim=0, index=flat)
+    return gathered.reshape(*index.shape, *source.shape[1:])
+
+
+def _gather_dim1(source: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """Row-wise gather along dim 1 for tensors of shape (N, M, ...)."""
+    if index.dtype != torch.long:
+        index = index.long()
+    safe = index.remainder(source.shape[1])
+    view_shape = (*safe.shape, *([1] * (source.ndim - 2)))
+    expand_shape = (*safe.shape, *source.shape[2:])
+    gather_index = safe.view(view_shape).expand(expand_shape)
+    return torch.gather(source, dim=1, index=gather_index)
+
+
+def _gather_vec3(source: Vec3Array, index: torch.Tensor) -> Vec3Array:
+    return Vec3Array(
+        _gather_rows(source.x, index),
+        _gather_rows(source.y, index),
+        _gather_rows(source.z, index),
+    )
+
 class DecoderBlock(nn.Module):
     """Standard equivariant decoder block."""
 
@@ -124,12 +154,11 @@ class DecoderBlock(nn.Module):
                     raise ValueError("distogram_block enabled but sup_neighbours is None")
 
                 sup_neighbours = sup_neighbours.long()
-                idx = torch.arange(sup_neighbours.shape[0], device=sup_neighbours.device, dtype=torch.long)[:, None]
-                distogram_logits = dist_full_logits[idx, sup_neighbours]
+                distogram_logits = _gather_dim1(dist_full_logits, sup_neighbours)
 
             dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask, generator=generator)
         else:
-            distogram_logits = torch.zeros((1,), dtype=torch.float32, device=features.device)
+            distogram_logits = torch.zeros((1,), dtype=features.dtype, device=features.device)
             dmap = None
 
         current_neighbours = self.current_neigh(
@@ -283,12 +312,13 @@ class Decoder(nn.Module):
 
     def init_prev(self, data):
         c = self.config
+        local_dtype = data["latent"].dtype if "latent" in data else data["pos"].dtype
         return {
             "pos": data["pos"],
             "local": torch.zeros(
                 (data["pos"].shape[0], c.local_size),
                 device=data["pos"].device,
-                dtype=torch.float32,
+                dtype=local_dtype,
             ),
         }
 
@@ -335,7 +365,7 @@ class Decoder(nn.Module):
         # mask_f = mask.to(dtype=torch.float32)
 
         losses = {}
-        total = torch.zeros((), device=mask.device, dtype=torch.float32)
+        total = None
 
         # AA NLL loss
         aa_gt = data["aa_gt"]
@@ -351,16 +381,17 @@ class Decoder(nn.Module):
      
         aa_nll = -(aa_logp * aa_one_hot).sum(dim=-1)
         aa_nll = torch.where(aa_predict_mask.bool(), aa_nll, torch.zeros_like(aa_nll))
-        aa_nll = aa_nll.sum() / torch.clamp(aa_predict_mask.float().sum(), min=1.0)
+        aa_mask_sum = aa_predict_mask.to(dtype=aa_nll.dtype).sum()
+        aa_nll = aa_nll.sum() / torch.clamp(aa_mask_sum, min=1.0)
         losses["aa"] = aa_nll
         losses["debug_mask_sum"] = mask.sum()
         losses["debug_aa_mask_sum"] = aa_predict_mask.sum()
         losses["weighted_aa"] = float(c.aa_weight) * aa_nll
-        total = total + losses["weighted_aa"]
+        total = losses["weighted_aa"]
 
         # position losses
-        mask_f = mask.float()
-        base_weight = mask / torch.clamp(index_sum(mask_f, batch, mask), min=1.0) / (batch.max() + 1)
+        mask_f = mask.to(dtype=aa_nll.dtype)
+        base_weight = mask_f / torch.clamp(index_sum(mask_f, batch, mask_bool), min=1.0) / (batch.max() + 1)
         losses["debug_base_weight_sum"] = base_weight.sum()
         
         # sparse neighbour FAPE ** 2
@@ -378,23 +409,21 @@ class Decoder(nn.Module):
         distance = torch.where(pair_mask.bool(), distance, torch.full_like(distance, float("inf")))
         # get random neighbours to compute sparse FAPE on
         neighbours = get_random_neighbours(c.fape_neighbours)(distance, batch, mask, generator=generator)
-        losses["debug_neighbours_hash"] = neighbours.float().sum()
-        mask_neighbours = (neighbours != -1) * mask[:, None] * mask[neighbours]
-        pos_gt_local = frames_gt[:, None, None].apply_inverse_to_point(pos_gt[neighbours])
+        losses["debug_neighbours_hash"] = neighbours.sum().to(dtype=aa_nll.dtype)
+        gathered_mask = _gather_rows(mask, neighbours)
+        mask_neighbours = (neighbours != -1) * mask[:, None] * gathered_mask
+        pos_gt_local = frames_gt[:, None, None].apply_inverse_to_point(_gather_vec3(pos_gt, neighbours))
         
         traj = result["trajectory"]  # tensor, (T, N, A, 3)
-        T = traj.shape[0]
-
-        fape_base_list = []
-        # (c) torch equivalent for jax.vmap
-        for t in range(T):
-            traj_t = Vec3Array.from_array(traj[t])      # (N, A, 3)
-            frames_t, _ = extract_aa_frames(traj_t)            # (N,) Rigid3Array
-            traj_local_t = frames_t[:, None, None].apply_inverse_to_point(traj_t[neighbours])  # (N, K, A)
-
-            fape_base_t = (traj_local_t - pos_gt_local).norm2()  # (N, K)
-            fape_base_list.append(fape_base_t)
-        fape_base = torch.stack(fape_base_list, dim=0)  # (T, N, K)
+        traj_vec = Vec3Array.from_array(traj)
+        frames, _ = extract_aa_frames(traj_vec)  # (T, N) Rigid3Array
+        safe_neighbours = neighbours.long().remainder(traj.shape[1])
+        flat_neighbours = safe_neighbours.reshape(-1)
+        traj_neighbours = torch.index_select(traj, dim=1, index=flat_neighbours).reshape(
+            traj.shape[0], neighbours.shape[0], neighbours.shape[1], traj.shape[2], traj.shape[3]
+        )
+        traj_local = frames[:, :, None, None].apply_inverse_to_point(Vec3Array.from_array(traj_neighbours))
+        fape_base = (traj_local - pos_gt_local).norm2()
 
         fape_clipped = torch.clamp(fape_base, 0.0, float(c.clip_fape))
 
@@ -424,8 +453,9 @@ class Decoder(nn.Module):
         if getattr(c, "distogram_block", None) not in (None, "none"):
             cb_gt = pos_gt[:, -1]  
             sup_neighbours = result["sup_neighbours"]
-            sup_mask = (sup_neighbours != -1) * mask[:, None] * mask[sup_neighbours]
-            dist_gt = (cb_gt[:, None] - cb_gt[sup_neighbours]).norm()
+            gathered_mask = _gather_rows(mask, sup_neighbours)
+            sup_mask = (sup_neighbours != -1) * mask[:, None] * gathered_mask
+            dist_gt = (cb_gt[:, None] - _gather_vec3(cb_gt, sup_neighbours)).norm()
             dist_one_hot = distance_one_hot(dist_gt, 0.0, 22.0, 16)
             distogram_nll = -(result["sup_distogram"] * dist_one_hot[None]).sum(dim=-1)
             distogram_nll = torch.where(sup_mask.bool(), distogram_nll, torch.zeros_like(distogram_nll)).sum(dim=-1)
@@ -468,13 +498,13 @@ class Decoder(nn.Module):
             pos_gt[:, -1], batch, mask
         )
 
-        mask_gt = data["atom_mask"][local_neighbours]
+        mask_gt = _gather_rows(data["atom_mask"], local_neighbours)
 
         frames_gt, _ = extract_aa_frames(atom_pos_gt)
-        atom_pos_gt = frames_gt[:, None, None].apply_inverse_to_point(atom_pos_gt[local_neighbours])
+        atom_pos_gt = frames_gt[:, None, None].apply_inverse_to_point(_gather_vec3(atom_pos_gt, local_neighbours))
 
         frames, _ = extract_aa_frames(atom_pos)
-        atom_pos = frames[:, None, None].apply_inverse_to_point(atom_pos[local_neighbours])
+        atom_pos = frames[:, None, None].apply_inverse_to_point(_gather_vec3(atom_pos, local_neighbours))
 
         local_loss = torch.where(
             mask_gt.bool(),
@@ -520,7 +550,9 @@ class Decoder(nn.Module):
         # AlphaFold violation loss. (not used in manuscript)
         if getattr(c, "violation_scale", 0):
             res_mask = data["mask"].bool()
-            pred_mask = get_atom14_mask(data["aa_gt"]).to(device=res_mask.device, dtype=torch.float32) * res_mask[:, None].float()
+            pred_mask_dtype = result["atom_pos"].dtype
+            pred_mask = get_atom14_mask(data["aa_gt"]).to(device=res_mask.device, dtype=pred_mask_dtype)
+            pred_mask = pred_mask * res_mask[:, None].to(dtype=pred_mask_dtype)
 
             violation, _ = violation_loss(
                 data["aa_gt"],
@@ -663,7 +695,7 @@ class AADecoderBlock(nn.Module):
 
         aa_oh = F.one_hot(aa.long(), 21).to(dtype=features.dtype)
         aa_emb = self.ln_aa(self.aa_linear(aa_oh))         
-        pair = pair + aa_emb[neighbours]                  
+        pair = pair + _gather_rows(aa_emb, neighbours)
 
         pair = self.pair_mlp(pair)
 
@@ -838,9 +870,7 @@ class SemiEquivariantDecoderBlock(nn.Module):
                 raise ValueError("SemiEquivariantDecoderBlock requires sup_neighbours when distogram is enabled.")
 
             sup_neighbours = sup_neighbours.long()
-            idx = torch.arange(N, device=sup_neighbours.device)[:, None]
-
-            distogram_logits = dist_full_logits[idx, sup_neighbours]
+            distogram_logits = _gather_dim1(dist_full_logits, sup_neighbours)
             
             dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask, generator=generator)
 
@@ -1023,13 +1053,12 @@ class HybridDecoderPairFeatures(nn.Module):
         c = self.c
         neighbours = neighbours.long()
 
-        pair_mask = mask[:, None] * mask[neighbours]
+        gathered_mask = _gather_rows(mask, neighbours)
+        pair_mask = mask[:, None] * gathered_mask
         pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
 
-        index = torch.arange(neighbours.shape[0], device=neighbours.device)
-
         if dmap is not None:
-            dmap = dmap[index[:, None], neighbours]
+            dmap = _gather_dim1(dmap, neighbours)
 
         pair = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
 
@@ -1047,7 +1076,7 @@ class HybridDecoderPairFeatures(nn.Module):
         local_neighbourhood = torch.cat(
             (
                 pos_arr[:, None].expand(-1, K, -1, -1),
-                pos_arr[neighbours],
+                _gather_rows(pos_arr, neighbours),
             ),
             dim=-2,
         ) / float(c.sigma_data)
@@ -1061,7 +1090,7 @@ class HybridDecoderPairFeatures(nn.Module):
 
         pair = pair + self.p_neigh(torch.cat((local_neighbourhood, center_neighbourhood), dim=-1))
 
-        dirs = (pos_v[:, None, :, None] - pos_v[neighbours, None, :]).to_tensor()
+        dirs = (pos_v[:, None, :, None] - _gather_vec3(pos_v, neighbours)[:, :, None, :]).to_tensor()
         dirs = dirs.reshape(*neighbours.shape, -1)
         pair = pair + self.p_dirs(dirs)
 
@@ -1100,13 +1129,12 @@ class NonequivariantDecoderPairFeatures(nn.Module):
         c = self.c
         neighbours = neighbours.long()
 
-        pair_mask = mask[:, None] * mask[neighbours]
+        gathered_mask = _gather_rows(mask, neighbours)
+        pair_mask = mask[:, None] * gathered_mask
         pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
 
-        index = torch.arange(neighbours.shape[0], device=neighbours.device)
-
         if dmap is not None:
-            dmap = dmap[index[:, None], neighbours]
+            dmap = _gather_dim1(dmap, neighbours)
 
         pair = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
 
@@ -1116,7 +1144,7 @@ class NonequivariantDecoderPairFeatures(nn.Module):
             )
 
         pair = pair + self.p_local_i(local)[:, None]
-        pair = pair + self.p_local_j(local)[neighbours]
+        pair = pair + _gather_rows(self.p_local_j(local), neighbours)
 
         pair = self.ln(pair)
         pair = self.mlp(pair)
@@ -1164,11 +1192,15 @@ def structure_augmentation(pos, batch, mask, generator=None):
 def random_rotation(batch, device=None, dtype=None, generator=None):
     """Sample a random rotation."""
     batch = batch.long()
-    N = batch.shape[0]
-    x0 = torch.randn((N, 3), device=device, dtype=dtype, generator=generator)
-    y0 = torch.randn((N, 3), device=device, dtype=dtype, generator=generator)
-    x = x0[batch]
-    y = y0[batch]
+    if batch.numel() == 0:
+        x = torch.empty((0, 3), device=device, dtype=dtype)
+        y = torch.empty((0, 3), device=device, dtype=dtype)
+    else:
+        num_items = int(batch.max().item()) + 1
+        x0 = torch.randn((num_items, 3), device=device, dtype=dtype, generator=generator)
+        y0 = torch.randn((num_items, 3), device=device, dtype=dtype, generator=generator)
+        x = torch.index_select(x0, dim=0, index=batch)
+        y = torch.index_select(y0, dim=0, index=batch)
     return Rot3Array.from_two_vectors(Vec3Array.from_array(x), Vec3Array.from_array(y))
 
 def extract_dmap_neighbours(count: int = 32):
@@ -1239,13 +1271,12 @@ class DecoderPairFeatures(nn.Module):
         c = self.c
         neighbours = neighbours.long()
         
-        pair_mask = mask[:, None] * mask[neighbours]
+        gathered_mask = _gather_rows(mask, neighbours)
+        pair_mask = mask[:, None] * gathered_mask
         pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
 
-        index = torch.arange(neighbours.shape[0], device=neighbours.device)
-
         if dmap is not None:
-            dmap = dmap[index[:, None], neighbours]
+            dmap = _gather_dim1(dmap, neighbours)
 
         pair = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
 
@@ -1285,7 +1316,7 @@ class QuickDistogram(nn.Module):
         self.head = MLP(size=64, out_size=self.bins, depth=2, activation=gelu_salad, final_init="zeros")
 
         step = (stop - start) / self.bins
-        bin_centers = torch.arange(self.bins, dtype=torch.float32) * step + step / 2.0
+        bin_centers = torch.arange(self.bins, dtype=torch.get_default_dtype()) * step + step / 2.0
         self.register_buffer("bin_centers", bin_centers, persistent=False)
 
     def forward(
@@ -1307,7 +1338,7 @@ class QuickDistogram(nn.Module):
         # neigh = neighbours.clamp_min(0)
         # dcode = dl[:, None, :] + dr[neigh]
         
-        dcode = dl[:, None, :] + dr[neighbours]
+        dcode = dl[:, None, :] + _gather_rows(dr, neighbours)
         
         pair_resi = self.relpos(resi, chain, batch, neighbours)
         dcode = dcode + self.relpos_proj(pair_resi)
@@ -1323,7 +1354,7 @@ class QuickDistogram(nn.Module):
         #   distogram_logits = distogram_logits.masked_fill(~valid[..., None], -1e9)
 
         probs = torch.softmax(distogram_logits, dim=-1)
-        bin_centers = self.bin_centers if self.bin_centers.dtype == probs.dtype else self.bin_centers.to(dtype=probs.dtype)
+        bin_centers = self.bin_centers.to(device=probs.device, dtype=probs.dtype)
         dmap = (probs * bin_centers).sum(dim=-1)
 
         return distogram_logits, dmap
@@ -1343,7 +1374,7 @@ class InnerDistogram(nn.Module):
         self.inner_weight = nn.Parameter(torch.zeros(self.heads, self.heads, self.bins))
 
         step = (stop - start) / self.bins
-        bin_centers = torch.arange(self.bins, dtype=torch.float32) * step + step / 2.0
+        bin_centers = torch.arange(self.bins, dtype=torch.get_default_dtype()) * step + step / 2.0
         self.register_buffer("bin_centers", bin_centers, persistent=False)
 
     def forward(
@@ -1367,7 +1398,7 @@ class InnerDistogram(nn.Module):
         logits = F.log_softmax(logits, dim=-1)
 
         probs = torch.softmax(logits, dim=-1)
-        bin_centers = self.bin_centers if self.bin_centers.dtype == probs.dtype else self.bin_centers.to(dtype=probs.dtype)
+        bin_centers = self.bin_centers.to(device=probs.device, dtype=probs.dtype)
         dmap = (probs * bin_centers).sum(dim=-1)
         return logits, dmap
 
@@ -1419,8 +1450,7 @@ class NonEquivariantDecoderBlock(nn.Module):
 
         dist_full_logits, dmap = self.dist(features, resi, chain, batch, None)  # (N,N,B), (N,N)
 
-        idx = torch.arange(N, device=sup_neighbours.device)[:, None]
-        distogram_logits = dist_full_logits[idx, sup_neighbours] # -1 maybe
+        distogram_logits = _gather_dim1(dist_full_logits, sup_neighbours)
 
         dmap_neighbours = self.dmap_neigh(dmap.detach(), resi, chain, batch, mask)
 

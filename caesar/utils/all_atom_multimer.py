@@ -26,13 +26,21 @@ from caesar.utils.geometry.rigid_matrix_vector import Rigid3Array
 
 import numpy as np
 
+_RC_TENSOR_CACHE: dict[tuple[int, str, int | None], torch.Tensor] = {}
 
 def squared_difference(x, y):
     return np.square(x - y)
 
 
 def get_rc_tensor(rc_np, aatype):
-    return torch.tensor(rc_np, device=aatype.device)[aatype]
+    key = (id(rc_np), aatype.device.type, aatype.device.index)
+    table = _RC_TENSOR_CACHE.get(key)
+    if table is None:
+        table = torch.as_tensor(rc_np, device=aatype.device)
+        _RC_TENSOR_CACHE[key] = table
+    flat = aatype.long().reshape(-1).remainder(table.shape[0])
+    gathered = torch.index_select(table, dim=0, index=flat)
+    return gathered.reshape(*aatype.shape, *table.shape[1:])
 
 
 def atom14_to_atom37(
@@ -192,16 +200,16 @@ def atom37_to_frames(
         restype_rigidgroup_rots[restype, chi_idx + 4, 2, 2] = -1
 
     # Gather the ambiguity information for each residue.
-    residx_rigidgroup_is_ambiguous = torch.tensor(
+    residx_rigidgroup_is_ambiguous = get_rc_tensor(
         restype_rigidgroup_is_ambiguous,
-        device=aatype.device,
-    )[aatype]
-    ambiguity_rot = torch.tensor(
-        restype_rigidgroup_rots, 
-        device=aatype.device,
-    )[aatype]
+        aatype,
+    )
+    ambiguity_rot = get_rc_tensor(
+        restype_rigidgroup_rots,
+        aatype,
+    )
     ambiguity_rot = geometry.Rot3Array.from_array(
-        torch.Tensor(ambiguity_rot, device=aatype.device)
+        torch.as_tensor(ambiguity_rot, device=aatype.device)
     )
 
     # Create the alternative ground truth frames.
@@ -229,11 +237,13 @@ def atom37_to_frames(
 RESTYPE_ATOM14_MASK = _make_restype_atom14_mask()
 
 # FIXME
-def зЗ(aatype):
+def get_atom14_mask(aatype):
     aatype = aatype.to(torch.long)
     aatype = aatype.clamp(0, RESTYPE_ATOM14_MASK.shape[0] - 1)
     table = RESTYPE_ATOM14_MASK.to(device=aatype.device)
-    return table[aatype]
+    flat = aatype.reshape(-1).remainder(table.shape[0])
+    gathered = torch.index_select(table, dim=0, index=flat)
+    return gathered.reshape(*aatype.shape, *table.shape[1:])
 
 def torsion_angles_to_frames(
     aatype: torch.Tensor,    # (N)
@@ -434,7 +444,9 @@ def compute_chi_angles(
     aatype_gapless = torch.clamp(aatype, max=20)
 
     # Select atoms to compute chis. Shape: [*, num_res, chis=4, atoms=4]. 
-    atom_indices = chi_atom_indices[aatype_gapless]
+    flat_aatype = aatype_gapless.reshape(-1).remainder(chi_atom_indices.shape[0])
+    atom_indices = torch.index_select(chi_atom_indices, dim=0, index=flat_aatype)
+    atom_indices = atom_indices.reshape(*aatype_gapless.shape, *chi_atom_indices.shape[1:])
     # Gather atom positions. Shape: [num_res, chis=4, atoms=4, xyz=3].
     chi_angle_atoms = positions.map_tensor_fn(
         partial(
@@ -454,7 +466,8 @@ def compute_chi_angles(
     chi_angles_mask.append([0.0, 0.0, 0.0, 0.0])
     chi_angles_mask = torch.tensor(chi_angles_mask, device=aatype.device)
     # Compute the chi angle mask. Shape [num_res, chis=4].
-    chi_mask = chi_angles_mask[aatype_gapless]
+    chi_mask = torch.index_select(chi_angles_mask, dim=0, index=flat_aatype)
+    chi_mask = chi_mask.reshape(*aatype_gapless.shape, *chi_angles_mask.shape[1:])
 
     # The chi_mask is set to 1 only when all necessary chi angle atoms were set.
     # Gather the chi angle atoms mask. Shape: [num_res, chis=4, atoms=4].

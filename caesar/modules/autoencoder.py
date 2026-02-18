@@ -53,6 +53,28 @@ def _randint_count(generator: Optional[torch.Generator], device: torch.device) -
         return int(torch.randint(0, 4, (1,), device="cpu", generator=cpu_gen).item())
     return int(torch.randint(0, 4, (1,), device="cpu", generator=generator).item())
 
+def _sample_by_batch(
+    batch: torch.Tensor,
+    *,
+    tail_shape: tuple[int, ...] = (),
+    uniform: bool = False,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Sample one random value per batch id and broadcast by `batch` via index_select."""
+    if batch.dtype != torch.long:
+        batch = batch.long()
+    if batch.numel() == 0:
+        return torch.empty((0, *tail_shape), device=device, dtype=dtype)
+    num_items = int(batch.max().item()) + 1
+    sample_shape = (num_items, *tail_shape)
+    if uniform:
+        table = torch.rand(sample_shape, device=device, dtype=dtype, generator=generator)
+    else:
+        table = torch.randn(sample_shape, device=device, dtype=dtype, generator=generator)
+    return torch.index_select(table, dim=0, index=batch)
+
 
 class StructureAutoencoder(nn.Module):
     """Wrapper class for protein structure autoencoder training"""
@@ -133,7 +155,7 @@ class StructureAutoencoder(nn.Module):
         # decoder recycling
         prev = dict(
             pos=data["pos"],
-            local=torch.zeros((data["pos"].shape[0], c.local_size), device=latent.device, dtype=torch.float32),
+            local=torch.zeros((data["pos"].shape[0], c.local_size), device=latent.device, dtype=latent.dtype),
         )   
         if not running_init:
 
@@ -197,7 +219,14 @@ class StructureAutoencoder(nn.Module):
         if batch.dtype != torch.long:
             batch = batch.long()
 
-        noise_level = torch.randn(batch.shape, device=latent.device, dtype=latent.dtype, generator=generator)[batch]
+        noise_level = _sample_by_batch(
+            batch,
+            tail_shape=(),
+            uniform=False,
+            device=latent.device,
+            dtype=latent.dtype,
+            generator=generator,
+        )
         noise_level = torch.exp(noise_level)
 
         noise = torch.randn(latent.shape, device=latent.device, dtype=latent.dtype, generator=generator) * noise_level
@@ -217,7 +246,14 @@ class StructureAutoencoder(nn.Module):
 
         pos = pos - index_mean(pos[:, 1], batch, data["mask"][:, None])[:, None]  # FIXME (ported as-is)
 
-        time = torch.rand(batch.shape, device=pos.device, dtype=pos.dtype, generator=generator)[batch]
+        time = _sample_by_batch(
+            batch,
+            tail_shape=(),
+            uniform=True,
+            device=pos.device,
+            dtype=pos.dtype,
+            generator=generator,
+        )
         if "time" in data:
             t = data["time"]
             if not torch.is_tensor(t):
@@ -256,9 +292,23 @@ class StructureAutoencoder(nn.Module):
         noise = torch.randn(latent.shape, device=latent.device, dtype=latent.dtype, generator=generator)
 
         if bool(c.vp_diffusion):
-            time = torch.rand(batch.shape, device=latent.device, dtype=latent.dtype, generator=generator)[batch]
+            time = _sample_by_batch(
+                batch,
+                tail_shape=(),
+                uniform=True,
+                device=latent.device,
+                dtype=latent.dtype,
+                generator=generator,
+            )
         else:
-            time = torch.randn(batch.shape, device=latent.device, dtype=latent.dtype, generator=generator)[batch]
+            time = _sample_by_batch(
+                batch,
+                tail_shape=(),
+                uniform=False,
+                device=latent.device,
+                dtype=latent.dtype,
+                generator=generator,
+            )
             time = torch.exp(torch.tensor(1.0, device=latent.device, dtype=latent.dtype) + 1.2 * time)
 
         if "time" in data:
@@ -471,7 +521,7 @@ class StructureDecoderInference(nn.Module):
             local=torch.zeros(
                 (data["pos"].shape[0], c.local_size),
                 device=data["pos"].device,
-                dtype=torch.float32,
+                dtype=latent.dtype,
             ),
         )
 
@@ -497,12 +547,12 @@ class StructureDecoderInference(nn.Module):
 
         aa_nll = -(aa_pred * aa_onehot).sum(dim=-1)
         aa_nll = torch.where(mask, aa_nll, torch.zeros_like(aa_nll))
-        mask_f = mask.float()
+        mask_f = mask.to(dtype=aa_nll.dtype)
         aa_nll = aa_nll.sum() / torch.clamp(mask_f.sum().to(aa_nll.dtype), min=1.0)
 
         perplexity = torch.exp(aa_nll)
         aatype = torch.argmax(aa_pred, dim=-1)
-        recovery = ((aa_gt == aatype) & mask).float().sum() / torch.clamp(mask_f.sum(), min=1.0)
+        recovery = ((aa_gt == aatype) & mask).to(dtype=aa_nll.dtype).sum() / torch.clamp(mask_f.sum(), min=1.0)
 
         pos_gt = data["pos_gt"]
         pos = result["pos"]
@@ -528,8 +578,8 @@ class StructureDecoderInference(nn.Module):
         pair_mask = pair_mask & (dca_gt < Rinc)
 
         in_threshold = (derr[..., None] < threshold) & pair_mask[..., None]
-        denom = torch.clamp(pair_mask[..., None].sum(dim=1).float(), min=1.0)
-        lddt_ca = (in_threshold.sum(dim=1).float() / denom).mean(dim=-1)
+        denom = torch.clamp(pair_mask[..., None].sum(dim=1).to(dtype=aa_nll.dtype), min=1.0)
+        lddt_ca = (in_threshold.sum(dim=1).to(dtype=aa_nll.dtype) / denom).mean(dim=-1)
         lddt_ca = torch.where(mask, lddt_ca, torch.zeros_like(lddt_ca))
 
         out = dict(
@@ -686,7 +736,7 @@ class StructureDecoder(StructureAutoencoder):
             local=torch.zeros(
                 (data["pos"].shape[0], c.local_size),
                 device=data["pos"].device,
-                dtype=torch.float32,
+                dtype=latent.dtype,
             ),
         )
 
@@ -725,13 +775,18 @@ class StructureDecoder(StructureAutoencoder):
             batch = batch.long()
 
         if generator is None:
-            noise_level_table = torch.randn(batch.shape, device=latent.device, dtype=latent.dtype)
             noise = torch.randn(latent.shape, device=latent.device, dtype=latent.dtype)
         else:
-            noise_level_table = torch.randn(batch.shape, generator=generator, device=latent.device, dtype=latent.dtype)
             noise = torch.randn(latent.shape, generator=generator, device=latent.device, dtype=latent.dtype)
 
-        noise_level = noise_level_table[batch]
+        noise_level = _sample_by_batch(
+            batch,
+            tail_shape=(),
+            uniform=False,
+            device=latent.device,
+            dtype=latent.dtype,
+            generator=generator,
+        )
         noise_level = torch.exp(noise_level)
 
         return latent + noise * noise_level[..., None]
@@ -805,7 +860,7 @@ class StructureAutoencoderInference(StructureAutoencoder):
 
         prev = dict(
             pos=data["pos"],
-            local=torch.zeros((data["pos"].shape[0], c.local_size), device=latent.device, dtype=torch.float32),
+            local=torch.zeros((data["pos"].shape[0], c.local_size), device=latent.device, dtype=latent.dtype),
         )
 
         count = int(c.num_recycle)
@@ -834,12 +889,12 @@ class StructureAutoencoderInference(StructureAutoencoder):
         aa_onehot = F.one_hot(aa_gt, 20).to(dtype=aa_logits_or_logprobs.dtype)
         aa_nll = -(aa_logits_or_logprobs * aa_onehot).sum(dim=-1)
         aa_nll = torch.where(mask, aa_nll, torch.zeros_like(aa_nll))
-        mask_f = mask.float()
+        mask_f = mask.to(dtype=aa_nll.dtype)
         aa_nll = aa_nll.sum() / torch.clamp(mask_f.sum().to(aa_nll.dtype), min=1.0)
         perplexity = torch.exp(aa_nll)
 
         aatype = torch.argmax(aa_logits_or_logprobs, dim=-1)
-        recovery = ((aatype == aa_gt) & mask).float().sum() / torch.clamp(mask_f.sum(), min=1.0)
+        recovery = ((aatype == aa_gt) & mask).to(dtype=aa_nll.dtype).sum() / torch.clamp(mask_f.sum(), min=1.0)
 
         # RMSD (CA)
         pos_gt = data["pos_gt"]
@@ -868,8 +923,8 @@ class StructureAutoencoderInference(StructureAutoencoder):
         pair_mask = pair_mask & (dca_gt < Rinc)
 
         in_threshold = (derr[..., None] < threshold) & pair_mask[..., None]
-        denom = torch.clamp(pair_mask[..., None].sum(dim=1).float(), min=1.0)
-        lddt_ca = (in_threshold.sum(dim=1).float() / denom).mean(dim=-1)
+        denom = torch.clamp(pair_mask[..., None].sum(dim=1).to(dtype=aa_nll.dtype), min=1.0)
+        lddt_ca = (in_threshold.sum(dim=1).to(dtype=aa_nll.dtype) / denom).mean(dim=-1)
         lddt_ca = torch.where(mask, lddt_ca, torch.zeros_like(lddt_ca))
 
         # AlphaFold-style violation loss (JAX-salad compatible API)
@@ -985,7 +1040,7 @@ class VQ(nn.Module):
             codebook = self.codebook_mean + codebook_scale * codebook
 
         mask_bool = mask.bool() if mask.dtype != torch.bool else mask
-        mask_f = mask.float() if mask.dtype != torch.float32 else mask
+        mask_loss = mask.to(dtype=features.dtype)
 
         distance = (features[:, None, :] - codebook[None, :, :]).pow(2).sum(dim=-1)
         distance = torch.where(mask_bool[:, None], distance, torch.full_like(distance, float("inf")))
@@ -998,7 +1053,7 @@ class VQ(nn.Module):
 
         out_features = self._replace_gradient(features_fwd, features)
 
-        total = torch.clamp(mask_f.sum(), min=1.0)
+        total = torch.clamp(mask_loss.sum(), min=1.0)
 
         codebook_loss_per = (features_fwd - features.detach()).pow(2).mean(dim=-1)
         codebook_loss = torch.where(mask_bool, codebook_loss_per, torch.zeros_like(codebook_loss_per)).sum() / total
@@ -1008,7 +1063,7 @@ class VQ(nn.Module):
         # if we are mapping over one or more axes
         # sum assignment_count over all of them
         local_assignment_count = torch.zeros((self.codebook_size,), device=features.device, dtype=torch.float32)
-        local_assignment_count.scatter_add_(0, assign_fwd, mask_f)
+        local_assignment_count.scatter_add_(0, assign_fwd, mask_loss.to(dtype=local_assignment_count.dtype))
 
         assignment_count = self._maybe_psum(local_assignment_count)
 
@@ -1016,13 +1071,16 @@ class VQ(nn.Module):
 
         unassigned_loss_per = (codebook - features_rev.detach()).pow(2).mean(dim=-1)
         unassigned_loss_per = unassigned_loss_per * assignment_mask.to(dtype=unassigned_loss_per.dtype)
-        unassigned_loss = unassigned_loss_per.sum() / torch.clamp(assignment_mask.float().sum(), min=1.0)
+        unassigned_loss = unassigned_loss_per.sum() / torch.clamp(
+            assignment_mask.to(dtype=unassigned_loss_per.dtype).sum(),
+            min=1.0,
+        )
 
         losses = dict(
             codebook=codebook_loss,
             commitment=commitment_loss,
             unassigned=unassigned_loss,
-            unassigned_percent=(assignment_count > 0).float().mean(),
+            unassigned_percent=(assignment_count > 0).to(dtype=assignment_count.dtype).mean(),
         )
         return out_features, assign_fwd, losses
 
@@ -1144,7 +1202,7 @@ class VQState(nn.Module):
         avg = self.avg
 
         mask_bool = mask.bool() if mask.dtype != torch.bool else mask
-        mask_f = mask.float() if mask.dtype != torch.float32 else mask
+        mask_loss = mask.to(dtype=features.dtype)
 
         distance = (features[:, None, :] - codebook[None, :, :]).pow(2).sum(dim=-1)
         distance = torch.where(mask_bool[:, None], distance, torch.full_like(distance, float("inf")))
@@ -1157,7 +1215,7 @@ class VQState(nn.Module):
 
         out_features = self._replace_gradient(features_fwd, features)
 
-        total = torch.clamp(mask_f.sum(), min=1.0)
+        total = torch.clamp(mask_loss.sum(), min=1.0)
 
         codebook_loss_per = (features_fwd - features.detach()).pow(2).mean(dim=-1)
         codebook_loss = torch.where(mask_bool, codebook_loss_per, torch.zeros_like(codebook_loss_per)).sum() / total
@@ -1166,7 +1224,7 @@ class VQState(nn.Module):
         commitment_loss = torch.where(mask_bool, commitment_loss_per, torch.zeros_like(commitment_loss_per)).sum() / total
 
         assignment_count = torch.zeros((self.codebook_size,), device=features.device, dtype=torch.float32)
-        assignment_count.scatter_add_(0, assign_fwd, mask_f)
+        assignment_count.scatter_add_(0, assign_fwd, mask_loss.to(dtype=assignment_count.dtype))
 
         assignment_count = self._maybe_psum_(assignment_count)
 
@@ -1193,7 +1251,7 @@ class VQState(nn.Module):
 
         losses = dict(
             commitment=commitment_loss,
-            unassigned_percent=(assignment_count > 0).float().mean(),
+            unassigned_percent=(assignment_count > 0).to(dtype=assignment_count.dtype).mean(),
         )
         state_update = dict(
             count=count_new,

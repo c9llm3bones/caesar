@@ -80,19 +80,36 @@ def one_hot(x, v_bins):
     return nn.functional.one_hot(am, num_classes=len(v_bins)).float()
 
 
-def batched_gather(data, inds, dim=0, no_batch_dims=0):
-    ranges = []
-    for i, s in enumerate(data.shape[:no_batch_dims]):
-        r = torch.arange(s)
-        r = r.view(*(*((1,) * i), -1, *((1,) * (len(inds.shape) - i - 1))))
-        ranges.append(r)
+def batched_gather(data, inds, dim=0, no_batch_dims=0, batch_dims=None):
+    """Batch-aware gather with support for legacy negative index semantics.
 
-    remaining_dims = [
-        slice(None) for _ in range(len(data.shape) - no_batch_dims)
-    ]
-    remaining_dims[dim - no_batch_dims if dim >= 0 else dim] = inds
-    ranges.extend(remaining_dims)
-    return data[ranges]
+    Args:
+        data: source tensor.
+        inds: indices tensor with leading `no_batch_dims` batch dimensions.
+        dim: gather dimension in `data`.
+        no_batch_dims: number of batch dimensions shared by `data` and `inds`.
+        batch_dims: alias for `no_batch_dims` (OpenFold compatibility).
+    """
+    if batch_dims is not None:
+        no_batch_dims = batch_dims
+
+    if dim < 0:
+        dim = data.ndim + dim
+    if inds.dtype != torch.long:
+        inds = inds.long()
+
+    # Move gather dimension right after batch dims: [B..., G, S...]
+    if dim != no_batch_dims:
+        data = torch.movedim(data, dim, no_batch_dims)
+
+    gather_size = data.shape[no_batch_dims]
+    safe_inds = inds.remainder(gather_size)
+
+    suffix_shape = data.shape[no_batch_dims + 1 :]
+    view_shape = (*safe_inds.shape, *([1] * len(suffix_shape)))
+    expand_shape = (*safe_inds.shape, *suffix_shape)
+    gather_index = safe_inds.view(view_shape).expand(expand_shape)
+    return torch.gather(data, dim=no_batch_dims, index=gather_index)
 
 
 # With tree_map, a poor man's JAX tree_map
