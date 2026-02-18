@@ -6,14 +6,14 @@ import time
 import argparse
 import math
 import numbers
-from copy import deepcopy
+import glob
+import random
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
 import csv
 from caesar.data.allpdb import BatchedProteinPDBStream
 from flexloop.data import BatchStream
@@ -25,12 +25,8 @@ DEBUG = True
 @dataclass
 class LoopState:
     step_id: int
-    model_state: Dict[str, Any]
-    opt_state: Dict[str, Any]
     aux_state: Dict[str, Any]
 from torch import profiler
-import os
-import torch
 
 def profile_train_inner(
     *,
@@ -66,6 +62,16 @@ def profile_train_inner(
         # RuntimeError: Trace is already saved.
         profiler.tensorboard_trace_handler(logdir)(p)
 
+    def run_train_step(state: LoopState, lr_value):
+        out = train_inner(state, lr_value)
+        if not isinstance(out, tuple):
+            raise RuntimeError("train_inner must return a tuple.")
+        if len(out) == 3:
+            return out
+        if len(out) == 2:
+            return out[0], out[1], {}
+        raise RuntimeError(f"Unexpected train_inner return arity: {len(out)}")
+
     # короткий прогрев (вне профиля)
     for _ in range(3):
         step = loop_state.step_id
@@ -73,7 +79,7 @@ def profile_train_inner(
         if lr_fn is not None and optimizer is not None:
             for g in optimizer.param_groups:
                 g["lr"] = lr
-        loop_state, _, _ = train_inner(loop_state, lr)
+        loop_state, _, _ = run_train_step(loop_state, lr)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -99,10 +105,10 @@ def profile_train_inner(
             if annotate_steps:
                 with profiler.record_function(f"TRAIN_STEP_{step:06d}"):
                     with profiler.record_function("TRAIN_INNER_FULL_PASS"):
-                        loop_state, step_stats, loss_dict = train_inner(loop_state, lr)
+                        loop_state, step_stats, loss_dict = run_train_step(loop_state, lr)
             else:
                 with profiler.record_function("TRAIN_INNER_FULL_PASS"):
-                    loop_state, step_stats, loss_dict = train_inner(loop_state, lr)
+                    loop_state, step_stats, loss_dict = run_train_step(loop_state, lr)
 
             step_wall_s = time.time() - step_wall_t0
 
@@ -131,14 +137,51 @@ def profile_train_inner(
     print("\n=== TOP CPU (self_cpu_time_total) ===")
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=30))
 
+    def _device_total_us(evt) -> float:
+        val = getattr(evt, "device_time_total", None)
+        if val is None:
+            val = getattr(evt, "cuda_time_total", 0.0)
+        return float(val)
+
     cpu_only = []
     for e in prof.key_averages():
-        if e.key.startswith("aten::") and getattr(e, "cuda_time_total", 0.0) == 0.0:
+        if e.key.startswith("aten::") and _device_total_us(e) == 0.0:
             cpu_only.append(e)
     cpu_only = sorted(cpu_only, key=lambda x: x.self_cpu_time_total, reverse=True)[:30]
-    print("\n=== Suspicious CPU-only aten:: ops (top self_cpu, cuda=0) ===")
+    print("\n=== Suspicious CPU-only aten:: ops (top self_cpu, device=0) ===")
     for e in cpu_only:
         print(f"{e.key:45s} self_cpu={e.self_cpu_time_total/1e3:.3f}ms  calls={e.count}")
+
+    print("\n=== aten::mul breakdown by device_type (raw events) ===")
+    try:
+        mul_events = [evt for evt in prof.events() if getattr(evt, "name", "") == "aten::mul"]
+        by_device: Dict[str, Dict[str, float]] = {}
+        for evt in mul_events:
+            dev = getattr(evt, "device_type", None)
+            dev_label = getattr(dev, "name", str(dev) if dev is not None else "Unknown")
+            if "." in dev_label:
+                dev_label = dev_label.split(".")[-1]
+            stat = by_device.setdefault(
+                dev_label,
+                {"count": 0.0, "self_cpu_us": 0.0, "cpu_total_us": 0.0, "device_total_us": 0.0},
+            )
+            stat["count"] += 1.0
+            stat["self_cpu_us"] += float(getattr(evt, "self_cpu_time_total", 0.0))
+            stat["cpu_total_us"] += float(getattr(evt, "cpu_time_total", 0.0))
+            stat["device_total_us"] += _device_total_us(evt)
+
+        if not by_device:
+            print("No aten::mul events were captured.")
+        else:
+            for dev_label, stat in sorted(by_device.items(), key=lambda kv: kv[1]["device_total_us"], reverse=True):
+                print(
+                    f"{dev_label:>8s}  calls={int(stat['count']):6d}  "
+                    f"self_cpu={stat['self_cpu_us']/1e3:9.3f}ms  "
+                    f"cpu_total={stat['cpu_total_us']/1e3:9.3f}ms  "
+                    f"device_total={stat['device_total_us']/1e3:9.3f}ms"
+                )
+    except Exception as exc:
+        print(f"mul device breakdown is unavailable: {exc}")
 
     if export_csv and step_rows:
         csv_file = os.path.join(logdir, csv_path)
@@ -156,10 +199,18 @@ def profile_train_inner(
             w.writerows(step_rows)
         print(f"Step breakdown CSV written to: {csv_file}")
 
-    print(f"\nTrace written to: {logdir}")
+    print(f"\nTrace directory: {logdir}")
     if export_chrome:
-        print(f"Chrome trace: {os.path.join(logdir, 'trace.json')}")
-        
+        trace_files = sorted(glob.glob(os.path.join(logdir, "**", "*.pt.trace.json*"), recursive=True))
+        if trace_files:
+            print("Found profiler traces:")
+            for trace_path in trace_files[:5]:
+                print(f"  {trace_path}")
+            if len(trace_files) > 5:
+                print(f"  ... and {len(trace_files) - 5} more")
+        else:
+            print("No profiler trace files were found in logdir.")
+
 
     return loop_state
 
@@ -300,45 +351,6 @@ def cosine_decay_schedule(start_lr, decay_lr, warmup_steps, decay_steps):
         return float(max(val, 0.0))
     return get_lr
 
-def init_ema_params(model: nn.Module):
-    return {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
-
-def update_ema(model: nn.Module, ema: Dict[str, torch.Tensor], ema_weight: float):
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        ema_p = ema[n].to(p.device)
-        ema_p.mul_(ema_weight).add_(p.detach() * (1.0 - ema_weight))
-        ema[n] = ema_p.cpu().clone()
-
-def load_ema_to_model(model: nn.Module, ema: Dict[str, torch.Tensor], device: torch.device):
-    for n, p in model.named_parameters():
-        if n in ema:
-            p.data.copy_(ema[n].to(device))
-
-def save_checkpoint(path, loop_state: LoopState):
-    os.makedirs(path, exist_ok=True)
-    fname = os.path.join(path, "checkpoint.pth")
-    payload = {
-        "step_id": loop_state.step_id,
-        "model_state": loop_state.model_state,
-        "opt_state": loop_state.opt_state,
-        "aux_state": loop_state.aux_state,
-    }
-    torch.save(payload, fname)
-
-def load_checkpoint(path) -> Optional[LoopState]:
-    fname = os.path.join(path, "checkpoint.pth")
-    if not os.path.exists(fname):
-        return None
-    payload = torch.load(fname, map_location="cpu")
-    return LoopState(
-        step_id=payload["step_id"],
-        model_state=payload["model_state"],
-        opt_state=payload["opt_state"],
-        aux_state=payload["aux_state"],
-    )
-
 def make_training_inner(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -346,9 +358,10 @@ def make_training_inner(
     device: torch.device,
     accumulate: int = 1,
     rebatch: int = 1,
-    ema_weight: float = 0.999,
-    writer: Optional[SummaryWriter] = None,
-    with_state: bool = False,
+    fixed_recycle: int = -1,
+    no_random: bool = False,
+    random_recycle_max: int = 4,
+    recycle_seed: int = 0,
     amp: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     log_interval: int = 10,
@@ -358,6 +371,7 @@ def make_training_inner(
     zero_grad_set_to_none: bool = True,
 ):
     model.train()
+    recycle_rng = random.Random(int(recycle_seed))
 
     model_params_devices = {name: param.device for name, param in model.named_parameters()}
     params_on_wrong_device = {name: dev for name, dev in model_params_devices.items() if dev != device}
@@ -399,6 +413,15 @@ def make_training_inner(
         else:
             batch = to_torch_batch(batch, device)
 
+        # Keep recycle control in training loop (Python scalar), not inside model graph.
+        batch = dict(batch)
+        if no_random:
+            batch["no_random"] = True
+        if int(fixed_recycle) >= 0:
+            batch["fixed_recycle"] = int(fixed_recycle)
+        else:
+            batch["fixed_recycle"] = int(recycle_rng.randrange(int(random_recycle_max)))
+
         
         #assert next(model.parameters()).device == device, f"Model is not on the correct device: {device}"
         #model_params_devices = {name: param.device for name, param in model.named_parameters()}
@@ -407,7 +430,8 @@ def make_training_inner(
     
         if debug_device_checks:
             for key, tensor in batch.items():
-                assert tensor.device == device, f"Batch tensor {key} is not on the correct device: {tensor.device}"
+                if torch.is_tensor(tensor):
+                    assert tensor.device == device, f"Batch tensor {key} is not on the correct device: {tensor.device}"
 
         step_t0 = time.time()
         if profile_markers:
@@ -419,7 +443,8 @@ def make_training_inner(
             if debug_device_checks:
                 assert next(model.parameters()).device == device, f"Model is not on the correct device: {device}"
                 for key, tensor in batch.items():
-                    assert tensor.device == device, f"Batch tensor {key} is not on the correct device: {tensor.device}"
+                    if torch.is_tensor(tensor):
+                        assert tensor.device == device, f"Batch tensor {key} is not on the correct device: {tensor.device}"
 
             if profile_markers:
                 with profiler.record_function("FWD"):
@@ -433,7 +458,8 @@ def make_training_inner(
             if debug_device_checks:
                 assert next(model.parameters()).device == device, f"Model is not on the correct device: {device}"
                 for key, tensor in batch.items():
-                    assert tensor.device == device, f"Batch tensor {key} is not on the correct device: {tensor.device}"
+                    if torch.is_tensor(tensor):
+                        assert tensor.device == device, f"Batch tensor {key} is not on the correct device: {tensor.device}"
 
             if scaler is not None and scaler.is_enabled():
                 if profile_markers:
@@ -468,9 +494,6 @@ def make_training_inner(
                 loss.backward()
                 optimizer.step()
 
-        # EMA disabled for now.
-        # if "ema" in loop_state.aux_state:
-        #     update_ema(model, loop_state.aux_state["ema"], ema_weight)
         step_time = time.time() - step_t0
 
         step_id = loop_state.step_id + 1
@@ -489,16 +512,8 @@ def make_training_inner(
                         _collect_logs(f"{prefix}/{sub_k}", sub_v)
             for k, v in loss_dict.items():
                 _collect_logs(k, v)
-        checkpointables = {
-            "state_getter": lambda: {
-                "model_state": model.state_dict(),
-                "opt_state": optimizer.state_dict(),
-            }
-        }
         new_loop_state = LoopState(
             step_id,
-            loop_state.model_state,
-            loop_state.opt_state,
             loop_state.aux_state,
         )
         total_time = time.time() - t0
@@ -511,98 +526,9 @@ def make_training_inner(
                 f"step {step_time:.3f}s, total {total_time:.3f}s, "
                 f"loss {loss_scalar:.6f}, interval {elapsed:.3f}s"
             )
-        return new_loop_state, loggables, checkpointables
+        return new_loop_state, loggables
     return training_inner
     
-def make_valid_inner(model: nn.Module, data_iter, device: torch.device, rebatch: int = 1,
-                     amp: bool = False, amp_dtype: torch.dtype = torch.float16):
-    model.eval()
-    @torch.no_grad()
-    def valid_inner(loop_state: LoopState):
-        t0 = time.time()
-        batch = next(data_iter)
-        batch = to_torch_batch(batch, device)
-        saved = None
-        if "ema" in loop_state.aux_state:
-            saved = deepcopy(model.state_dict())
-            load_ema_to_model(model, loop_state.aux_state["ema"], device)
-        if amp and torch.cuda.is_available():
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
-                loss, loss_dict = model(batch) if rebatch == 1 else forward_and_loss(model, batch, rebatch=rebatch)
-        else:
-            loss, loss_dict = model(batch) if rebatch == 1 else forward_and_loss(model, batch, rebatch=rebatch)
-        if saved is not None:
-            model.load_state_dict(saved)
-        
-        metrics = {"val_loss": float(loss.cpu().item())}
-        if isinstance(loss_dict, dict):
-            def _collect_metrics(prefix: str, value: Any):
-                if torch.is_tensor(value):
-                    t = value.detach()
-                    if t.numel() == 1:
-                        metrics[f"val_{prefix}"] = float(t.cpu().item())
-                    return
-                if isinstance(value, numbers.Number):
-                    metrics[f"val_{prefix}"] = float(value)
-                    return
-                if isinstance(value, dict):
-                    for sub_k, sub_v in value.items():
-                        _collect_metrics(f"{prefix}/{sub_k}", sub_v)
-
-            for k, v in loss_dict.items():
-                _collect_metrics(k, v)
-        
-        print(f"Computed valid batch in {time.time() - t0:.3f} seconds. val_loss={metrics['val_loss']:.6f}")
-        return metrics
-    return valid_inner
-
-def training_loop(
-    path: str,
-    train_inner,
-    valid_inner,
-    writer: SummaryWriter,
-    loop_state: LoopState,
-    max_steps: int,
-    valid_interval: int = 100,
-    *,
-    lr_fn=None,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-):
-    os.makedirs(path, exist_ok=True)
-    step = loop_state.step_id
-    checkpointables = {}
-    while step < max_steps:
-        lr = None
-        if lr_fn is not None:
-            lr = lr_fn(step)
-            if optimizer is not None:
-                for g in optimizer.param_groups:
-                    g["lr"] = lr
-        new_state, loggables, checkpointables = train_inner(loop_state, lr)
-        loop_state = new_state
-        step = loop_state.step_id
-
-        if step % valid_interval == 0:
-            val_res = valid_inner(loop_state)
-            if writer:
-                writer.add_scalar("valid/loss", val_res.get("val_loss", 0.0), step)
-                for k, v in val_res.items():
-                    if k != "val_loss":
-                        writer.add_scalar(f"valid/{k}", v, step)
-            state_getter = checkpointables.get("state_getter")
-            if state_getter is not None:
-                state = state_getter()
-                loop_state.model_state = state["model_state"]
-                loop_state.opt_state = state["opt_state"]
-            save_checkpoint(path, loop_state)
-    state_getter = checkpointables.get("state_getter")
-    if state_getter is not None:
-        state = state_getter()
-        loop_state.model_state = state["model_state"]
-        loop_state.opt_state = state["opt_state"]
-    save_checkpoint(path, loop_state)
-    print("Training finished.")
-
 def check_all_params(model_params_devices, params_on_wrong_device, device):
 
     if params_on_wrong_device:
@@ -632,9 +558,10 @@ def parse_args():
     parser.add_argument("--clip", type=float, default=0.1)
     parser.add_argument("--b1", type=float, default=0.9)
     parser.add_argument("--b2", type=float, default=0.99)
-    parser.add_argument("--ema_weight", type=float, default=0.999)
     parser.add_argument("--rebatch", type=int, default=1)
     parser.add_argument("--accumulate", type=int, default=1)
+    parser.add_argument("--fixed_recycle", type=int, default=-1)
+    parser.add_argument("--no_random", default="False")
     parser.add_argument("--jax_seed", type=int, default=42)
     parser.add_argument("--multigpu", default="False")
     parser.add_argument("--suffix", default="1")
@@ -643,6 +570,11 @@ def parse_args():
     parser.add_argument("--matmul_precision", default="high", choices=["highest", "high", "medium"])
     parser.add_argument("--allow_tf32", default="False")
     parser.add_argument("--cudnn_benchmark", default="True")
+    parser.add_argument("--compile", default="False")
+    parser.add_argument("--compile_backend", default="inductor")
+    parser.add_argument("--compile_mode", default="reduce-overhead")
+    parser.add_argument("--compile_dynamic", default="True")
+    parser.add_argument("--compile_fullgraph", default="False")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
@@ -670,6 +602,8 @@ def main():
     is_decoder = getattr(config, "is_decoder", False)
     ModelClass = StructureDecoder if is_decoder else StructureAutoencoder
     model = ModelClass(config).to(device)
+
+    compile_enabled = (opt.compile == "True")
 
     # data
     num_devices_for_batch = 1
@@ -729,6 +663,33 @@ def main():
         else:
             _ = model(sample)
 
+    if compile_enabled:
+        if hasattr(torch, "compile"):
+            compile_mode = None if str(opt.compile_mode).lower() == "none" else opt.compile_mode
+            try:
+                model = torch.compile(
+                    model,
+                    backend=opt.compile_backend,
+                    mode=compile_mode,
+                    dynamic=(opt.compile_dynamic == "True"),
+                    fullgraph=(opt.compile_fullgraph == "True"),
+                )
+                print(
+                    "torch.compile enabled: "
+                    f"backend={opt.compile_backend}, mode={compile_mode}, "
+                    f"dynamic={opt.compile_dynamic}, fullgraph={opt.compile_fullgraph}"
+                )
+                with torch.no_grad():
+                    if amp_enabled and torch.cuda.is_available():
+                        with torch.amp.autocast("cuda", dtype=amp_dtype):
+                            _ = model(sample)
+                    else:
+                        _ = model(sample)
+            except Exception as exc:
+                print(f"torch.compile failed, continue without compile: {exc}")
+        else:
+            print("torch.compile is not available in this PyTorch build; continue without compile.")
+
     # optimizer + lr schedule
     optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2), eps=1e-9)
     lr_fn = cosine_decay_schedule(opt.lr, opt.decay_lr, opt.warmup_steps, opt.decay_steps)
@@ -736,8 +697,6 @@ def main():
     # loop_state
     loop_state = LoopState(
         step_id=0,
-        model_state=model.state_dict(),
-        opt_state=optimizer.state_dict(),
         aux_state={},
     )
 
@@ -749,9 +708,10 @@ def main():
         device=device,
         accumulate=opt.accumulate,
         rebatch=opt.rebatch,
-        ema_weight=opt.ema_weight,
-        writer=None,
-        with_state=False,
+        fixed_recycle=int(opt.fixed_recycle),
+        no_random=(opt.no_random == "True"),
+        random_recycle_max=4,
+        recycle_seed=int(opt.jax_seed),
         amp=amp_enabled,
         amp_dtype=amp_dtype,
         log_interval=10**9,
@@ -765,11 +725,11 @@ def main():
         loop_state=loop_state,
         optimizer=optimizer,
         lr_fn=lr_fn,
-        steps=60,
+        steps=10,
         logdir=os.path.join(outdir, "tb_prof_train_inner"),
         wait=2,
         warmup=2,
-        active=20,
+        active=5,
         export_chrome=True,
         with_stack=True,
         sync_each_step=False,
