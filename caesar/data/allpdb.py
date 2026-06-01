@@ -34,6 +34,52 @@ AA_ORDER = ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN',
 AA_BACKBONE_ATOMS = ["N", "CA", "C", "O"]
 # list of nucleic acid backbone atom names
 NA_BACKBONE_ATOMS = ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C1'", "C2'", "O2'", "C3'", "O3'"]
+ATOM37_POSITION_FIELD = "position_atom37"
+ATOM37_MASK_FIELD = "atom_mask_atom37"
+ATOM37_ORDER = np.array(
+    ['N', 'CA', 'C', 'CB', 'O', 'CG', 'CG1', 'CG2', 'OG', 'OG1', 'SG', 'CD',
+     'CD1', 'CD2', 'ND1', 'ND2', 'OD1', 'OD2', 'SD', 'CE', 'CE1', 'CE2', 'CE3',
+     'NE', 'NE1', 'NE2', 'OE1', 'OE2', 'CH2', 'NH1', 'NH2', 'OH', 'CZ', 'CZ2',
+     'CZ3', 'NZ', 'OXT'])
+
+
+def _select_npz_fields(raw_data, fields, accept):
+    result = {
+        name: raw_data[name][accept]
+        for name in fields
+    }
+    for name in (ATOM37_POSITION_FIELD, ATOM37_MASK_FIELD):
+        if name in raw_data:
+            result[name] = raw_data[name][accept]
+    return result
+
+
+def _fallback_atom24_to_atom37(raw_data):
+    """Build atom37 from legacy atom24 fields, keeping absent atoms masked."""
+    atom_name = raw_data["atom_name"]
+    atom_pos = raw_data["position"]
+    atom_mask = raw_data["atom_mask"]
+    positions = np.zeros((atom_name.shape[0], 37, 3), dtype=atom_pos.dtype)
+    mask = np.zeros((atom_name.shape[0], 37), dtype=atom_mask.dtype)
+    for atom37_idx, name in enumerate(ATOM37_ORDER):
+        present = atom_name == name
+        has_name = present.any(axis=-1)
+        src_idx = np.argmax(present, axis=-1)
+        row = np.arange(atom_name.shape[0], dtype=np.int32)
+        positions[has_name, atom37_idx] = atom_pos[row[has_name], src_idx[has_name]]
+        mask[has_name, atom37_idx] = atom_mask[row[has_name], src_idx[has_name]]
+    return positions, mask
+
+
+def get_protein_atom_coords(raw_data: Dict[str, np.ndarray],
+                            format: str) -> tuple[np.ndarray, np.ndarray]:
+    if format == "atom24":
+        return raw_data["position"], raw_data["atom_mask"]
+    if format != "atom37":
+        raise ValueError(f"Unsupported protein atom format: {format}")
+    if ATOM37_POSITION_FIELD in raw_data and ATOM37_MASK_FIELD in raw_data:
+        return raw_data[ATOM37_POSITION_FIELD], raw_data[ATOM37_MASK_FIELD]
+    return _fallback_atom24_to_atom37(raw_data)
 
 class AllPDB:
     """Implements data loading for structures in the PDB.
@@ -95,20 +141,14 @@ class AllPDB:
             split_data = dict()
             for res_type in self.filter_residue_type:
                 accept = residue_type == res_type
-                raw_data_part = {
-                    name: raw_data[name][accept]
-                    for name in self.fields
-                }
+                raw_data_part = _select_npz_fields(raw_data, self.fields, accept)
                 split_data[res_type] = raw_data_part
             raw_data = split_data
         # by default, return one dictionary
         # for all residue types
         else:
             accept = (residue_type[:, None] == self.filter_residue_type[None, :]).any(axis=-1)
-            raw_data = {
-                name: raw_data[name][accept]
-                for name in self.fields
-            }
+            raw_data = _select_npz_fields(raw_data, self.fields, accept)
         return raw_data, chosen_chain["chain"]
 
 class AllPDBSample(AllPDB):
@@ -141,21 +181,18 @@ class AllPDBSample(AllPDB):
             return None
         residue_type = raw_data["residue_type"]
         accept = (residue_type[:, None] == self.filter_residue_type[None, :]).any(axis=-1)
-        raw_data = {
-            name: raw_data[name][accept]
-            for name in self.fields
-        }
+        raw_data = _select_npz_fields(raw_data, self.fields, accept)
         return raw_data, chosen_chain["chain"]
 
 class ProteinPDB(AllPDB):
-    """Protein-specific PDB dataset in atom24 format
-    (amino acid and nucleic acid atoms)."""
+    """Protein-specific PDB dataset in atom24 or atom37 format."""
     def __init__(self, path, start_date="01/01/90",
                  cutoff_date="12/31/21",
                  cutoff_resolution=4,
                  seqres_aa="clusterSeqresAA",
                  seqres_na="clusterSeqresNA",
                  assembly=True,
+                 format: str = "atom24",
                  seed: Optional[int] = None) -> None:
         super().__init__(
             path, start_date, cutoff_date,
@@ -164,6 +201,9 @@ class ProteinPDB(AllPDB):
             seqres_na=seqres_na,
             assembly=assembly,
             seed=seed)
+        if format not in ("atom24", "atom37"):
+            raise ValueError(f"Unsupported ProteinPDB format: {format}")
+        self.format = format
         self.aa_order = np.array(
             ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN',
              'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS',
@@ -188,8 +228,8 @@ class ProteinPDB(AllPDB):
         residue_index = raw_data["residue_index"]
         chain_index = raw_data["chain_index"]
         entity_index = raw_data["entity_index"]
-        all_atom_positions = raw_data["position"]
-        all_atom_mask = raw_data["atom_mask"]
+        all_atom_positions, all_atom_mask = get_protein_atom_coords(
+            raw_data, self.format)
         return dict(
             aa_gt=aa_gt,
             residue_index=residue_index,
@@ -631,6 +671,7 @@ class ProteinPDBSample(AllPDBSample):
                  seqres_aa="clusterSeqresAA",
                  seqres_na="clusterSeqresNA",
                  assembly=True,
+                 format: str = "atom24",
                  seed=None) -> None:
         super().__init__(
             path, start_date, cutoff_date,
@@ -639,17 +680,14 @@ class ProteinPDBSample(AllPDBSample):
             seqres_na=seqres_na,
             assembly=assembly,
             seed=seed)
-        self.format = "atom24"
+        if format not in ("atom24", "atom37"):
+            raise ValueError(f"Unsupported ProteinPDB format: {format}")
+        self.format = format
         self.aa_order = np.array(
             ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN',
              'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS',
              'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP',
              'TYR', 'VAL', 'UNK'])
-        self.atom_order_37 = np.array(
-            ['N', 'CA', 'C', 'CB', 'O', 'CG', 'CG1', 'CG2', 'OG', 'OG1', 'SG', 'CD',
-             'CD1', 'CD2', 'ND1', 'ND2', 'OD1', 'OD2', 'SD', 'CE', 'CE1', 'CE2', 'CE3',
-             'NE', 'NE1', 'NE2', 'OE1', 'OE2', 'CH2', 'NH1', 'NH2', 'OH', 'CZ', 'CZ2',
-             'CZ3', 'NZ', 'OXT', ''])
 
     def __getitem__(self, index) -> Dict[str, np.ndarray]:
         data = super().__getitem__("AA", index)
@@ -666,16 +704,8 @@ class ProteinPDBSample(AllPDBSample):
         residue_index = raw_data["residue_index"]
         chain_index = raw_data["chain_index"]
         entity_index = raw_data["entity_index"]
-        all_atom_positions = raw_data["position"]
-        all_atom_mask = raw_data["atom_mask"]
-        
-        if self.format == "atom37":
-            atom_name = raw_data["atom_name"]
-            atom37_assignment = np.argmax(
-                atom_name[:, :, None] == self.atom_order_37[None, None, :], axis=-2)
-            idb = np.arange(atom_name.shape[0], dtype=np.int32)
-            all_atom_positions = all_atom_positions[idb[:, None], atom37_assignment[:, :37]]
-            all_atom_mask = all_atom_mask[idb[:, None], atom37_assignment[:, :37]]
+        all_atom_positions, all_atom_mask = get_protein_atom_coords(
+            raw_data, self.format)
         return dict(
             aa_gt=aa_gt,
             residue_index=residue_index,
