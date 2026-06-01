@@ -35,19 +35,50 @@ def _load_state_dict(path: str) -> dict:
 
 
 def parse_input_data(path: str, size: int = 1024):
-    file_names = os.listdir(path)
+    file_names = sorted(os.listdir(path))
     for name in file_names:
         if not name.endswith(".pdb"):
             continue
         with open(f"{path}/{name}", "rt") as f:
             protein = from_pdb_string(f.read())
 
-        atom_pos_37 = protein.atom_positions
-        atom_mask_37 = protein.atom_mask
-        aatype = protein.aatype
-        resi = protein.residue_index
-        chain = protein.chain_index
-        batch = np.zeros_like(protein.residue_index)
+        atom_pos_37 = np.asarray(protein.atom_positions, dtype=np.float32)
+        atom_mask_37 = np.asarray(protein.atom_mask, dtype=np.float32)
+        aatype = np.asarray(protein.aatype)
+        resi = np.asarray(protein.residue_index)
+        chain = np.asarray(protein.chain_index)
+
+        unique_chains = np.unique(chain)
+        if unique_chains.size > 1:
+            ca_present = atom_mask_37[:, 1] > 0.5
+            best_chain = None
+            best_count = -1
+            for chain_id in unique_chains:
+                count = int(np.sum((chain == chain_id) & ca_present))
+                if count > best_count:
+                    best_count = count
+                    best_chain = chain_id
+            if best_chain is None or best_count <= 0:
+                chain_lengths = [int(np.sum(chain == chain_id)) for chain_id in unique_chains]
+                best_chain = unique_chains[int(np.argmax(chain_lengths))]
+            chain_mask = chain == best_chain
+            kept = int(np.sum(chain_mask))
+            print(
+                f"  [mono] {name}: {unique_chains.size} chains -> "
+                f"keep chain {best_chain!r} ({kept} residues)",
+                flush=True,
+            )
+            atom_pos_37 = atom_pos_37[chain_mask]
+            atom_mask_37 = atom_mask_37[chain_mask]
+            aatype = aatype[chain_mask]
+            resi = resi[chain_mask]
+            chain = chain[chain_mask]
+
+        if aatype.shape[0] == 0:
+            print(f"  [skip] {name}: empty chain after monomer filtering", flush=True)
+            continue
+
+        batch = np.zeros(resi.shape[0], dtype=np.int32)
 
         data = dict(
             aa_gt=aatype,
