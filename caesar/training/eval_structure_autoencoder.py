@@ -92,6 +92,7 @@ if __name__ == "__main__":
         time=0.0,
         num_recycle=4,
         jax_seed=42,
+        save_imported_path="",
     )
 
     print(f"Running decoder with {int(opt.num_recycle) + 1} steps on files in {opt.path}")
@@ -135,7 +136,14 @@ if __name__ == "__main__":
 
     if is_jax:
         from caesar.scripts.import_salad_weights import import_salad_weights_
-        import_salad_weights_(model, params_path, verbose=False, strict_missing=True, report=True)
+        import_salad_weights_(
+            model,
+            params_path,
+            verbose=False,
+            strict_missing=True,
+            report=True,
+            save_path=str(opt.save_imported_path or ""),
+        )
     else:
         state_dict = _load_state_dict(params_path)
         model.load_state_dict(state_dict, strict=True)

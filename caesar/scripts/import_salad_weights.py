@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import partial
 from typing import Dict, List, Union, Optional, Tuple
+import os
 
 from torch.nn.parameter import UninitializedParameter
 import numpy as np
@@ -831,6 +832,7 @@ def import_salad_weights_(
     verbose: bool = False,
     strict_missing: bool = True,
     report: bool = True,
+    save_path: str = "",
 ) -> Tuple[List[str], List[str]]:
     """
     Loads salad weights into torch model in-place.
@@ -869,5 +871,23 @@ def import_salad_weights_(
         raise KeyError(f"Missing {len(missing_in_ckpt)} salad keys (see first ones above)")
 
     assign(flat_map, orig, verbose=verbose)
+
+    if save_path:
+        parent = os.path.dirname(os.path.abspath(save_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "meta": {
+                    "source_salad_jax_path": salad_jax_path,
+                    "used_salad_keys": sorted(list(used)),
+                    "unused_salad_keys": unused_in_ckpt,
+                },
+            },
+            save_path,
+        )
+        if report:
+            print(f"Saved imported torch checkpoint: {save_path}")
 
     return unused_in_ckpt, sorted(list(used))
