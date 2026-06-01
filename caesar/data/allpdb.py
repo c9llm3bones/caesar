@@ -11,6 +11,7 @@ import random
 import numpy as np
 from numpy import ndarray
 
+import torch
 from torch.utils.data import Dataset, IterableDataset
 from caesar.data.periodic_table import periodic_table, pt_at, ATOM_TYPE_ORDER, index_atoms, apply_pt
 
@@ -1231,12 +1232,24 @@ def numerical_chain_index(chain):
     return np.argmax(chain[:, None] == indices[None, :], axis=-1)
 
 def slice_dict(data, indices):
-    """Slice all entries in a data dictionary by a set of indices."""
-    return {
-        name: item[indices] if item.ndim > 0 else item
-        for name, item in data.items()
-        if name not in ["has_structure"]
-    }
+    """Slice entries whose leading dimension matches a 1D boolean mask."""
+    idx_len = None
+    if hasattr(indices, "shape") and getattr(indices, "ndim", 0) == 1:
+        dtype = getattr(indices, "dtype", None)
+        if dtype == torch.bool or getattr(dtype, "kind", None) == "b":
+            idx_len = int(indices.shape[0])
+
+    out = {}
+    for name, item in data.items():
+        if name in ["has_structure"]:
+            continue
+        if not hasattr(item, "ndim") or item.ndim == 0:
+            out[name] = item
+        elif idx_len is not None and item.shape[0] != idx_len:
+            out[name] = item
+        else:
+            out[name] = item[indices]
+    return out
 
 def pad_item(data, target_size):
   r"""Pad a data tensor to the desired crop size, if
