@@ -83,7 +83,10 @@ class AllPDB:
         # select a random biological assembly
         assembly = self.rng.choice(chosen_chain["assemblies"])
         # load the npz archive for that assembly
-        raw_data = np.load(f"{self.path}/{assembly}")
+        try:
+            raw_data = np.load(f"{self.path}/{assembly}")
+        except FileNotFoundError:
+            return None
         residue_type = raw_data["residue_type"]
         # filter for selected residue types
         # optionally return separate dictionaries
@@ -132,7 +135,10 @@ class AllPDBSample(AllPDB):
         accept_item = self.rng.random() < weight
         if not accept_item:
             return None
-        raw_data = np.load(f"{self.path}/{assembly}")
+        try:
+            raw_data = np.load(f"{self.path}/{assembly}")
+        except FileNotFoundError:
+            return None
         residue_type = raw_data["residue_type"]
         accept = (residue_type[:, None] == self.filter_residue_type[None, :]).any(axis=-1)
         raw_data = {
@@ -166,7 +172,10 @@ class ProteinPDB(AllPDB):
 
     def __getitem__(self, index) -> Dict[str, np.ndarray]:
         # get raw PDB data
-        raw_data, chain = super().__getitem__("AA", index)
+        data = super().__getitem__("AA", index)
+        if data is None:
+            return None
+        raw_data, chain = data
         # encode the amino acid sequence
         # using the provided amino acid order (alphabetic, 3-letter).
         aa_gt = np.argmax(
@@ -209,7 +218,10 @@ class AtomPDB(AllPDB):
         def _irepeat(x):
             return np.repeat(x[:, None], 24, axis=1)
         # get an allpdb-npz assembly
-        raw_data, chain = super().__getitem__("AA", index)
+        data = super().__getitem__("AA", index)
+        if data is None:
+            return None
+        raw_data, chain = data
         mask = raw_data["atom_mask"]
         position = raw_data["position"][mask]
         atom_type = raw_data["atom_type"][mask]
@@ -418,7 +430,10 @@ class ProteinSMOLNeighboursPDB(AllPDB):
         self.atom_type_order = np.array(['C', 'N', 'O', 'S', 'P'])
 
     def __getitem__(self, index) -> Dict[str, np.ndarray]:
-        raw_data, chain = super().__getitem__("AA", index)
+        data = super().__getitem__("AA", index)
+        if data is None:
+            return None
+        raw_data, chain = data
         # get amino acid residues
         aa_data = raw_data["AA"]
         # split a random subset of these into atoms
@@ -499,7 +514,10 @@ class ProteinBinderPDB(ProteinPDB):
         self.num_aa = num_aa
 
     def __getitem__(self, index) -> Dict[str, ndarray]:
-        data, chain_id = super().__getitem__(index)
+        item = super().__getitem__(index)
+        if item is None:
+            return None
+        data, chain_id = item
         chain = np.array([chain_id])[0]
         chain_index = data["chain_index"]
         chain_indices = np.unique(chain_index)
@@ -584,7 +602,10 @@ class ProteinCropPDB(ProteinPDB):
         self.size = size
 
     def __getitem__(self, index) -> Dict[str, ndarray]:
-        raw_protein, chain = super().__getitem__(index)
+        item = super().__getitem__(index)
+        if item is None:
+            return None
+        raw_protein, chain = item
         relevant_chain = raw_protein["chain_index"] == chain
         relevant_chain *= raw_protein["all_atom_mask"][:, 1]
         protein = slice_dict(raw_protein, relevant_chain)
