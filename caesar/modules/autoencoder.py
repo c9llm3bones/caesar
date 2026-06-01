@@ -15,6 +15,7 @@ from caesar.modules.utils.geometry import (
     unique_chain, compute_pseudo_cb, positions_to_ncacocb,
     index_mean, index_align)
 from caesar.utils.all_atom_multimer import atom37_to_atom14
+from caesar.modules.decoder import _masked_rmsd_no_align
 from caesar.modules.encoder import Encoder
 from caesar.modules.decoder import Decoder
 from caesar.modules.utils.dssp import assign_dssp
@@ -1014,6 +1015,37 @@ class StructureAutoencoderInference(StructureAutoencoder):
         lddt_ca = (in_threshold.sum(dim=1).to(dtype=aa_nll.dtype) / denom).mean(dim=-1)
         lddt_ca = torch.where(mask, lddt_ca, torch.zeros_like(lddt_ca))
 
+        atom_pos_gt = data["atom_pos"]
+        atom_pos_pred = result["atom_pos"]
+        if getattr(c, "is_rmsd_alinged", True):
+            atom_pos_gt_eval = index_align(atom_pos_gt, atom_pos_pred, data["batch_index"], mask)
+        else:
+            atom_pos_gt_eval = atom_pos_gt
+        rmsd_full_atom = _masked_rmsd_no_align(
+            atom_pos_pred, atom_pos_gt_eval, data["atom_mask"], residue_mask=mask)
+
+        rmsd_full_atom37 = rmsd_full_atom
+        rmsd_valid_atom37 = rmsd_full_atom
+        rmsd_nonvalid_atom37 = torch.zeros((), device=mask_f.device, dtype=mask_f.dtype)
+        if "pos37" in result and "pos37_gt" in data:
+            pos37_gt = data["pos37_gt"]
+            pos37_pred = result["pos37"]
+            if getattr(c, "is_rmsd_alinged", True):
+                pos37_gt_eval = index_align(pos37_gt, pos37_pred, data["batch_index"], mask)
+            else:
+                pos37_gt_eval = pos37_gt
+            physical_atom37_m = data.get("physical_all_atom_mask_37", data["all_atom_mask_37"])
+            metric_atom37_m = data.get("metric_all_atom_mask_37", physical_atom37_m)
+            rmsd_full_atom37 = _masked_rmsd_no_align(
+                pos37_pred, pos37_gt_eval, metric_atom37_m, residue_mask=mask)
+            rmsd_valid_atom37 = _masked_rmsd_no_align(
+                pos37_pred, pos37_gt_eval, physical_atom37_m, residue_mask=mask)
+            nonvalid_atom37_m = (
+                1.0 - physical_atom37_m.to(dtype=pos37_pred.dtype)
+            ) * mask[:, None].to(dtype=pos37_pred.dtype)
+            rmsd_nonvalid_atom37 = _masked_rmsd_no_align(
+                pos37_pred, pos37_gt_eval, nonvalid_atom37_m, residue_mask=mask)
+
         if getattr(c, "compute_violation", True):
             # AlphaFold-style violation loss (JAX-salad compatible API)
             res_mask = mask_f
@@ -1045,6 +1077,10 @@ class StructureAutoencoderInference(StructureAutoencoder):
             perplexity=perplexity,
             recovery=recovery,
             rmsd_ca=rmsd_ca,
+            rmsd_full_atom=rmsd_full_atom,
+            rmsd_full_atom37=rmsd_full_atom37,
+            rmsd_valid_atom37=rmsd_valid_atom37,
+            rmsd_nonvalid_atom37=rmsd_nonvalid_atom37,
             tm=tm,
             lddt=lddt_ca,
             time=data["time"],

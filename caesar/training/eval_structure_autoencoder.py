@@ -195,7 +195,9 @@ if __name__ == "__main__":
     os.makedirs(opt.out_path, exist_ok=True)
     os.makedirs(f"{opt.out_path}/diagnostics/", exist_ok=True)
     with open(f"{opt.out_path}/diagnostics/scores.csv", "wt") as f_scores:
-        f_scores.write("name,num_aa,recovery,perplexity,rmsd_ca,tm,lddt\n")
+        f_scores.write(
+            "name,num_aa,recovery,perplexity,rmsd_ca,rmsd_full_atom,"
+            "rmsd_full_atom37,rmsd_valid_atom37,rmsd_nonvalid_atom37,tm,lddt\n")
         key = torch.Generator(device=device).manual_seed(int(opt.jax_seed))
         for name, data in parse_input_data(opt.path, size=1024):
             data_t = prepare_eval_batch(data, device=device)
@@ -234,7 +236,10 @@ if __name__ == "__main__":
             f_scores.write(
                 f"{name},{int(mask.to(torch.int32).sum())},"
                 f"{float(out['recovery'])},{float(out['perplexity'])},"
-                f"{float(out['rmsd_ca'])},{float(out['tm'])},{float(mean_lddt)}\n"
+                f"{float(out['rmsd_ca'])},{float(out['rmsd_full_atom'])},"
+                f"{float(out['rmsd_full_atom37'])},{float(out['rmsd_valid_atom37'])},"
+                f"{float(out['rmsd_nonvalid_atom37'])},"
+                f"{float(out['tm'])},{float(mean_lddt)}\n"
             )
             f_scores.flush()
             with open(f"{opt.out_path}/decoder_{name}", "wt") as f:
