@@ -199,7 +199,9 @@ if __name__ == "__main__":
     with open(f"{opt.out_path}/diagnostics/scores.csv", "wt") as f_scores:
         f_scores.write(
             "name,num_aa,recovery,perplexity,rmsd_ca,rmsd_full_atom,"
-            "rmsd_full_atom37,rmsd_valid_atom37,rmsd_nonvalid_atom37,tm,lddt\n")
+            "rmsd_full_atom37,rmsd_valid_atom37,rmsd_nonvalid_atom37,"
+            "rmsd_backbone_atom14,rmsd_sidechain_atom14,"
+            "rmsd_backbone_atom37,rmsd_sidechain_atom37,tm,lddt\n")
         key = torch.Generator(device=device).manual_seed(int(opt.jax_seed))
         for name, data in parse_input_data(opt.path, size=1024):
             data_t = prepare_eval_batch(data, device=device)
@@ -246,6 +248,8 @@ if __name__ == "__main__":
                 f"{float(out['rmsd_ca'])},{float(out['rmsd_full_atom'])},"
                 f"{float(out['rmsd_full_atom37'])},{float(out['rmsd_valid_atom37'])},"
                 f"{float(out['rmsd_nonvalid_atom37'])},"
+                f"{float(out['rmsd_backbone_atom14'])},{float(out['rmsd_sidechain_atom14'])},"
+                f"{float(out['rmsd_backbone_atom37'])},{float(out['rmsd_sidechain_atom37'])},"
                 f"{float(out['tm'])},{float(mean_lddt)}\n"
             )
             f_scores.flush()
@@ -257,6 +261,10 @@ if __name__ == "__main__":
                     latent=out["latent"].detach().cpu().numpy(),
                     local=out["local"].detach().cpu().numpy(),
                 )
+                if "pos37" in out:
+                    diagnostics["pos37"] = out["pos37"].detach().cpu().numpy()
+                    diagnostics["pos37_gt"] = data_t["all_atom_positions"][mask].detach().cpu().numpy()
+                    diagnostics["atom37_mask"] = data_t["all_atom_mask"][mask].detach().cpu().numpy()
                 if "codebook_index" in out:
                     diagnostics["codebook_index"] = out["codebook_index"].detach().cpu().numpy()
                 np.savez_compressed(

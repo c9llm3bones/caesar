@@ -1027,10 +1027,22 @@ class StructureAutoencoderInference(StructureAutoencoder):
             atom_pos_gt_eval = atom_pos_gt
         rmsd_full_atom = _masked_rmsd_no_align(
             atom_pos_pred, atom_pos_gt_eval, data["atom_mask"], residue_mask=mask)
+        atom14_bb_mask = data["atom_mask"] * (
+            torch.arange(data["atom_mask"].shape[-1], device=mask.device)[None, :] < 4
+        ).to(dtype=data["atom_mask"].dtype)
+        atom14_sc_mask = data["atom_mask"] * (
+            torch.arange(data["atom_mask"].shape[-1], device=mask.device)[None, :] >= 4
+        ).to(dtype=data["atom_mask"].dtype)
+        rmsd_backbone_atom14 = _masked_rmsd_no_align(
+            atom_pos_pred, atom_pos_gt_eval, atom14_bb_mask, residue_mask=mask)
+        rmsd_sidechain_atom14 = _masked_rmsd_no_align(
+            atom_pos_pred, atom_pos_gt_eval, atom14_sc_mask, residue_mask=mask)
 
         rmsd_full_atom37 = rmsd_full_atom
         rmsd_valid_atom37 = rmsd_full_atom
         rmsd_nonvalid_atom37 = torch.zeros((), device=mask_f.device, dtype=mask_f.dtype)
+        rmsd_backbone_atom37 = rmsd_backbone_atom14
+        rmsd_sidechain_atom37 = rmsd_sidechain_atom14
         if "pos37" in result and "pos37_gt" in data:
             pos37_gt = data["pos37_gt"]
             pos37_pred = result["pos37"]
@@ -1044,6 +1056,18 @@ class StructureAutoencoderInference(StructureAutoencoder):
                 pos37_pred, pos37_gt_eval, metric_atom37_m, residue_mask=mask)
             rmsd_valid_atom37 = _masked_rmsd_no_align(
                 pos37_pred, pos37_gt_eval, physical_atom37_m, residue_mask=mask)
+            bb37_slot_mask = torch.zeros(
+                (physical_atom37_m.shape[-1],),
+                device=physical_atom37_m.device,
+                dtype=physical_atom37_m.dtype,
+            )
+            bb37_slot_mask[torch.tensor([0, 1, 2, 4], device=physical_atom37_m.device)] = 1.0
+            backbone_atom37_m = physical_atom37_m * bb37_slot_mask[None, :]
+            sidechain_atom37_m = physical_atom37_m * (1.0 - bb37_slot_mask[None, :])
+            rmsd_backbone_atom37 = _masked_rmsd_no_align(
+                pos37_pred, pos37_gt_eval, backbone_atom37_m, residue_mask=mask)
+            rmsd_sidechain_atom37 = _masked_rmsd_no_align(
+                pos37_pred, pos37_gt_eval, sidechain_atom37_m, residue_mask=mask)
             nonvalid_atom37_m = (
                 1.0 - physical_atom37_m.to(dtype=pos37_pred.dtype)
             ) * mask[:, None].to(dtype=pos37_pred.dtype)
@@ -1085,6 +1109,10 @@ class StructureAutoencoderInference(StructureAutoencoder):
             rmsd_full_atom37=rmsd_full_atom37,
             rmsd_valid_atom37=rmsd_valid_atom37,
             rmsd_nonvalid_atom37=rmsd_nonvalid_atom37,
+            rmsd_backbone_atom14=rmsd_backbone_atom14,
+            rmsd_sidechain_atom14=rmsd_sidechain_atom14,
+            rmsd_backbone_atom37=rmsd_backbone_atom37,
+            rmsd_sidechain_atom37=rmsd_sidechain_atom37,
             tm=tm,
             lddt=lddt_ca,
             time=data["time"],
