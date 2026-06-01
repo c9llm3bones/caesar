@@ -512,7 +512,7 @@ class AADecoderPairFeaturesAtom37(nn.Module):
         super().__init__()
         self.c = c
 
-        self.relpos = sequence_relative_position(8, one_hot=True, pseudo_chains=True)
+        self.relpos = sequence_relative_position(32, one_hot=True, pseudo_chains=True)
         self.p_relpos = Linear(c.pair_size, bias=False, initializer="linear")
         self.p_dist   = Linear(c.pair_size, bias=False, initializer="linear")
         self.p_dir    = Linear(c.pair_size, bias=False, initializer="linear")

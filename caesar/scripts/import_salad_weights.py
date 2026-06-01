@@ -611,6 +611,31 @@ def _EncoderInitLocalParams(enc) -> dict:
     }
 
 
+def _EncoderInitLocalAtom37Params(enc) -> dict:
+    # salad atom37-main:
+    #   structure_autoencoder/encoder/~prepare_features/{linear..linear_8,mlp,layer_norm,
+    #                                                     atom37_encoder_input,
+    #                                                     atom37_encoder_input_norm}
+    return {
+        "layer_norm": LayerNormParams(enc.init_local_atom37.ln),
+        "linear": LinearParams(enc.init_local_atom37.p_relpos.lin, has_bias=False),
+        "linear_1": LinearParams(enc.init_local_atom37.p_dist.lin, has_bias=False),
+        "linear_2": LinearParams(enc.init_local_atom37.p_dir.lin, has_bias=False),
+        "linear_3": LinearParams(enc.init_local_atom37.p_rot.lin, has_bias=False),
+        "linear_4": LinearParams(enc.init_local_atom37.p_vec.lin, has_bias=False),
+        "linear_5": LinearParams(enc.init_local_atom37.p_local_self.lin, has_bias=False),
+        "linear_6": LinearParams(enc.init_local_atom37.p_local_self_j.lin, has_bias=False),
+        "linear_7": LinearParams(enc.init_local_atom37.p_local_neigh.lin, has_bias=False),
+        "linear_8": LinearParams(enc.init_local_atom37.to_local.lin, has_bias=False),
+        "mlp": MLP2Params(enc.init_local_atom37.mlp, has_bias=True),
+        "atom37_encoder_input": {
+            "linear": LinearParams(enc.local_mlp_atom37.layers[0].lin, has_bias=False),
+            "linear_1": LinearParams(enc.local_mlp_atom37.layers[1].lin, has_bias=False),
+        },
+        "atom37_encoder_input_norm": LayerNormParams(enc.local_ln_atom37),
+    }
+
+
 def _EncoderLocalMixParams(enc) -> dict:
     # salad: structure_autoencoder/encoder/~prepare_features/layer_norm_1 + mlp_1/*
     # torch: encoder.local_ln + encoder.local_mlp (biasless)
@@ -646,19 +671,67 @@ def _EncoderBlockParams(block) -> dict:
     }
 
 
+def _EncoderBlockAtom37Params(block) -> dict:
+    # salad: structure_autoencoder/encoder/encoder_stack_atom37/
+    #        __layer_stack_no_state/encoder_block_atom37/*
+    return {
+        "layer_norm": LayerNormParams(block.pair_features.ln),
+        "layer_norm_1": LayerNormParams(block.ln_attn),
+        "layer_norm_2": LayerNormParams(block.ln_update),
+
+        "linear": LinearParams(block.pair_features.p_relpos.lin, has_bias=False),
+        "linear_1": LinearParams(block.pair_features.p_dist.lin, has_bias=False),
+        "linear_2": LinearParams(block.pair_features.p_dir.lin, has_bias=False),
+        "linear_3": LinearParams(block.pair_features.p_rot.lin, has_bias=False),
+        "linear_4": LinearParams(block.pair_features.p_vec.lin, has_bias=False),
+        "linear_5": LinearParams(block.pair_features.p_local_self.lin, has_bias=False),
+        "linear_6": LinearParams(block.pair_features.p_local_self_j.lin, has_bias=False),
+        "linear_7": LinearParams(block.pair_features.p_local_neigh.lin, has_bias=False),
+
+        "mlp": MLP2Params(block.pair_mlp, has_bias=True),
+
+        "sparse_structure_attn": {
+            "ada_point_attention": _AAPointAttnParams(block.attn.attn),
+        },
+
+        "light_global_update_atom37": _AAUpdateParams(block.update),
+    }
+
+
 def _EncoderParams(ae) -> dict:
     enc = ae.encoder
+    atom37_main = (
+        getattr(ae.config, "atom37_parallel_mode", "none") == "parallel"
+        and getattr(ae.config, "atom37_main_branch", False)
+    )
+    if atom37_main:
+        blocks37 = list(enc.stack_atom37.blocks)
+        enc_stack37 = stacked([_EncoderBlockAtom37Params(b) for b in blocks37])
+        result = {
+            "~prepare_features": _EncoderInitLocalAtom37Params(enc),
+            "encoder_stack_atom37": {
+                "layer_norm": LayerNormParams(enc.stack_atom37.ln_final),
+                "__layer_stack_no_state": {
+                    "encoder_block_atom37": enc_stack37,
+                },
+            },
+        }
+        if not getattr(ae.config, "noembed", False):
+            result.update({
+                "layer_norm": LayerNormParams(enc.ln_final_atom37),
+                "linear": LinearParams(enc.to_latent_atom37.lin, has_bias=False),
+            })
+        return result
+
     blocks = list(enc.stack.blocks)
     enc_stack = stacked([_EncoderBlockParams(b) for b in blocks])  # len==1 works because assign() keeps stack dim
 
     # encoder/linear has b in salad but it is zero; torch has no bias
-    return {
+    result = {
         "~prepare_features": {
             **_EncoderInitLocalParams(enc),
             **_EncoderLocalMixParams(enc),
         },
-        "layer_norm": LayerNormParams(enc.ln_final),
-        "linear": LinearParams(enc.to_latent.lin, has_bias=False),
         "encoder_stack": {
             "layer_norm": LayerNormParams(enc.stack.ln_final),
             "__layer_stack_no_state": {
@@ -666,6 +739,12 @@ def _EncoderParams(ae) -> dict:
             },
         },
     }
+    if not getattr(ae.config, "noembed", False):
+        result.update({
+            "layer_norm": LayerNormParams(enc.ln_final),
+            "linear": LinearParams(enc.to_latent.lin, has_bias=False),
+        })
+    return result
 
 
 # Top-level translation dict
@@ -716,6 +795,35 @@ def generate_translation_dict_salad_structure_autoencoder(model) -> dict:
     }
     return translations
 
+def _materialize_model(model) -> None:
+    """Run a tiny forward to initialize all lazy (None) submodules."""
+    device = next((p.device for p in model.parameters() if not isinstance(p, UninitializedParameter)), torch.device("cpu"))
+    dtype  = next((p.dtype  for p in model.parameters() if not isinstance(p, UninitializedParameter) and p.is_floating_point()), torch.float32)
+    N = 32
+    x = torch.arange(N, dtype=dtype, device=device).unsqueeze(-1) * 3.8
+    pos = torch.zeros(N, 37, 3, dtype=dtype, device=device)
+    pos[:, 1, 0] = x[:, 0]                         # CA
+    pos[:, 0, 0] = x[:, 0] - 1.45; pos[:, 0, 1] = 0.60
+    pos[:, 2, 0] = x[:, 0] + 1.52; pos[:, 2, 1] = -0.50
+    pos[:, 4, 0] = x[:, 0] + 2.10; pos[:, 4, 1] = 0.35
+    pos[:, 3, 0] = x[:, 0] + 2.20; pos[:, 3, 1] = -1.30
+    batch = {
+        "aa_gt":              torch.zeros(N, dtype=torch.long, device=device),
+        "residue_index":      torch.arange(N, dtype=torch.long, device=device),
+        "chain_index":        torch.zeros(N, dtype=torch.long, device=device),
+        "batch_index":        torch.zeros(N, dtype=torch.long, device=device),
+        "all_atom_positions": pos,
+        "all_atom_mask":      torch.ones(N, 37, dtype=dtype, device=device),
+        "seq_mask":           torch.ones(N, dtype=dtype, device=device),
+        "residue_mask":       torch.ones(N, dtype=dtype, device=device),
+    }
+    prev_training = model.training
+    model.eval()
+    with torch.no_grad():
+        model(batch, generator=torch.Generator(device=device).manual_seed(0))
+    model.train(prev_training)
+
+
 def import_salad_weights_(
     model,
     salad_jax_path: str,
@@ -730,6 +838,7 @@ def import_salad_weights_(
     Returns:
       (unused_salad_keys, used_salad_keys)
     """
+    _materialize_model(model)
     orig = load_salad_flat_from_pickle(salad_jax_path)
     translations = generate_translation_dict_salad_structure_autoencoder(model)
     flat_map = process_translation_dict(translations)
