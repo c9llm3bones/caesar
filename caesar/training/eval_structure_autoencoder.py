@@ -201,7 +201,8 @@ if __name__ == "__main__":
             "name,num_aa,recovery,perplexity,rmsd_ca,rmsd_full_atom,"
             "rmsd_full_atom37,rmsd_valid_atom37,rmsd_nonvalid_atom37,"
             "rmsd_backbone_atom14,rmsd_sidechain_atom14,"
-            "rmsd_backbone_atom37,rmsd_sidechain_atom37,tm,lddt\n")
+            "rmsd_backbone_atom37,rmsd_sidechain_atom37,"
+            "rmsd_atom37_n,rmsd_atom37_ca,rmsd_atom37_c,rmsd_atom37_o,tm,lddt\n")
         key = torch.Generator(device=device).manual_seed(int(opt.jax_seed))
         for name, data in parse_input_data(opt.path, size=1024):
             data_t = prepare_eval_batch(data, device=device)
@@ -250,6 +251,8 @@ if __name__ == "__main__":
                 f"{float(out['rmsd_nonvalid_atom37'])},"
                 f"{float(out['rmsd_backbone_atom14'])},{float(out['rmsd_sidechain_atom14'])},"
                 f"{float(out['rmsd_backbone_atom37'])},{float(out['rmsd_sidechain_atom37'])},"
+                f"{float(out['rmsd_atom37_n'])},{float(out['rmsd_atom37_ca'])},"
+                f"{float(out['rmsd_atom37_c'])},{float(out['rmsd_atom37_o'])},"
                 f"{float(out['tm'])},{float(mean_lddt)}\n"
             )
             f_scores.flush()
