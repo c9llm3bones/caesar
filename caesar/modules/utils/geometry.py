@@ -882,3 +882,38 @@ def replace_masked_with(pos: torch.ndarray, # (..., N, 3)
                        ) -> torch.ndarray: # (..., N, 3)
     """Replace masked atom positions with replacement positions."""
     return torch.where(atom_mask[..., None], pos, replacement)
+
+
+def atom37_to_ncacocb(pos37: torch.Tensor) -> torch.Tensor:
+    """N, CA, C, O, pseudo-CB view from atom37 coords (atom37 order: N=0, CA=1, C=2, O=4)."""
+    pseudo_cb = compute_pseudo_cb(pos37)
+    return torch.cat(
+        (pos37[:, :3], pos37[:, 4:5], pseudo_cb[:, None, :]),
+        dim=-2)
+
+
+def atom37_local_feature_channels(
+    local_pos37: torch.Tensor,   # (..., 37, 3)
+    atom_mask37: torch.Tensor,   # (..., 37)
+    rbf_bins: int = 8,
+) -> torch.Tensor:
+    """Mask-aware local atom37 features from local coordinates."""
+    mask = atom_mask37.to(dtype=local_pos37.dtype)
+    local_pos37 = torch.where(mask[..., None] > 0, local_pos37, torch.zeros_like(local_pos37))
+    local_dist37 = torch.sqrt(torch.clamp((local_pos37 ** 2).sum(dim=-1), min=1e-6))
+    local_rbf37 = distance_rbf(local_dist37, 0.0, 22.0, rbf_bins)
+    return torch.cat([
+        local_pos37.reshape(*local_pos37.shape[:-2], -1),
+        local_dist37.reshape(*local_dist37.shape[:-1], -1),
+        local_rbf37.reshape(*local_rbf37.shape[:-2], -1),
+        mask.reshape(*mask.shape[:-1], -1),
+    ], dim=-1)
+
+
+def mask_atom37_local_positions(
+    local_pos37: torch.Tensor,  # (..., 37, 3)
+    atom_mask37: torch.Tensor,  # (..., 37)
+) -> torch.Tensor:
+    """Zero-out missing atom37 slots."""
+    mask = atom_mask37.to(dtype=local_pos37.dtype)
+    return torch.where(mask[..., None] > 0, local_pos37, torch.zeros_like(local_pos37))

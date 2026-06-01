@@ -32,9 +32,17 @@ default = dotdict(
     fape_neighbours=64,
     # loss weights
     local_weight=1.0,
+    full_atom_weight=0.0,
     aa_weight=10.0,
     fape_weight=1,
     fape_trajectory_weight=0.5,
+    sidechain_decoder="angles",
+    atom14_masked_input="local",
+    atom14_masked_backbone_source="predicted",
+    full_atom_loss_mode="local",
+    atom37_parallel_mode="none",
+    pos37_local_weight=0.0,
+    atom37_encoder_mode="none",
     # dataset constraints
     min_size=50,
     max_size=None,
@@ -48,6 +56,30 @@ small.distogram_block = "mlp"
 
 small_inner = deepcopy(small)
 small_inner.distogram_block = "inner"
+
+small_inner_atom14_masked_1b = deepcopy(small_inner)
+small_inner_atom14_masked_1b.sidechain_decoder = "atom14_masked"
+small_inner_atom14_masked_1b.atom14_masked_input = "concat"
+small_inner_atom14_masked_1b.full_atom_weight = 1.0
+
+small_inner_atom14_masked_1c = deepcopy(small_inner)
+small_inner_atom14_masked_1c.sidechain_decoder = "atom14_masked"
+small_inner_atom14_masked_1c.atom14_masked_input = "fusion"
+small_inner_atom14_masked_1c.full_atom_weight = 1.0
+
+small_inner_atom14_masked_gt_backbone_global = deepcopy(small_inner)
+small_inner_atom14_masked_gt_backbone_global.sidechain_decoder = "atom14_masked"
+small_inner_atom14_masked_gt_backbone_global.atom14_masked_input = "concat"
+small_inner_atom14_masked_gt_backbone_global.atom14_masked_backbone_source = "gt"
+small_inner_atom14_masked_gt_backbone_global.full_atom_loss_mode = "global"
+small_inner_atom14_masked_gt_backbone_global.full_atom_weight = 1.0
+
+small_inner_atom37_abs_concat = deepcopy(small_inner)
+small_inner_atom37_abs_concat.atom37_encoder_mode = "abs_concat"
+
+small_inner_atom37_parallel = deepcopy(small_inner)
+small_inner_atom37_parallel.atom37_parallel_mode = "parallel"
+small_inner_atom37_parallel.pos37_local_weight = 0.1
 
 small_inner_noise = deepcopy(small_inner)
 small_inner_noise.noise_encoder = 0.3

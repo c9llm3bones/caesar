@@ -12,24 +12,46 @@ from caesar.utils.geometry import Vec3Array
 
 from caesar.modules.basic import Linear
 from caesar.modules.utils.geometry import (
-    unique_chain, compute_pseudo_cb, positions_to_ncacocb, 
+    unique_chain, compute_pseudo_cb, positions_to_ncacocb,
     index_mean, index_align)
+from caesar.utils.all_atom_multimer import atom37_to_atom14
 from caesar.modules.encoder import Encoder
 from caesar.modules.decoder import Decoder
 from caesar.modules.utils.dssp import assign_dssp
 from caesar.utils.all_atom_multimer import get_atom14_mask
 from caesar.utils.loss import violation_loss
 
-DEBUG = False
-
 def _stat(t: torch.Tensor):
     t = t.detach()
     return dict(mean=float(t.mean()), std=float(t.std()), max=float(t.abs().max()))
 
-def print_desc(data):
-    for el in data:
-        print(f"{el} device is {data[el].device} & dtype is {data[el].dtype}") 
-    return
+
+def _as_bool(value: Any) -> bool:
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return False
+        return bool(value.detach().bool().any().item())
+    return bool(value)
+
+
+def _assert_finite(name: str, tensor: torch.Tensor):
+    if not torch.is_tensor(tensor):
+        return
+    finite = torch.isfinite(tensor)
+    if bool(finite.all().item()):
+        return
+    bad_count = int((~finite).sum().item())
+    finite_vals = tensor[finite]
+    if finite_vals.numel() > 0:
+        min_val = float(finite_vals.min().item())
+        max_val = float(finite_vals.max().item())
+    else:
+        min_val = float("nan")
+        max_val = float("nan")
+    raise RuntimeError(
+        f"Non-finite tensor detected in {name}: bad_count={bad_count}, "
+        f"finite_min={min_val}, finite_max={max_val}"
+    )
 
 # utility for fixed recycle
 def _as_int(value) -> Optional[int]:
@@ -106,32 +128,32 @@ class StructureAutoencoder(nn.Module):
         c = self.config
 
         data = dict(data)
+        detect_nonfinite = _as_bool(data.get("detect_nonfinite", False))
+        trace: Dict[str, torch.Tensor] = {} if return_trace else {}
 
         # convert coordinates, center & add encoded features
-        data.update(prepare_data(data, generator=generator))
-        if DEBUG:
-            trace = {}
-            trace["prep/mask_sum"] = float(data["mask"].detach().sum())
-            trace["prep/pos_gt"] = _stat(data["pos_gt"])
-            trace["prep/pos_init"] = _stat(data["pos"])
-            trace["prep/dmap"] = _stat(data["dmap"])
+        data.update(prepare_data(data, generator=generator, detect_nonfinite=detect_nonfinite))
+        if return_trace:
+            trace["prep/pos"] = data["pos"].detach()
+            trace["prep/pos_gt"] = data["pos_gt"].detach()
+            trace["prep/mask"] = data["mask"].detach()
+            trace["prep/dmap"] = data["dmap"].detach()
 
         # optionally apply noise to the inputs
         if getattr(c, "input_diffusion", False):
             clean_latent = self.encoder(data, generator=generator)
             data["clean_latent"] = clean_latent
-            data.update(self.prepare_input_diffusion(data))
+            data.update(self.prepare_input_diffusion(data, generator=generator))
 
         latent = self.encoder(data, generator=generator, trace=trace if return_trace else None)
-        if DEBUG:
-            trace["enc/latent"] = _stat(latent)
-            trace["enc/latent_slice"] = latent[:2, :5].detach().cpu()
+        if return_trace:
+            trace["enc/latent"] = latent.detach()
 
         # optionally apply noise to the latents (not used in the manuscript)
         if getattr(c, "latent_diffusion", False):
             latent = F.layer_norm(latent, (latent.shape[-1],), weight=None, bias=None)
             data["clean_latent"] = latent
-            latent, time = self.prepare_latent_diffusion(latent, data)
+            latent, time = self.prepare_latent_diffusion(latent, data, generator=generator)
             if not getattr(c, "vp_diffusion", False):
                 denom = torch.clamp(1.0 + time[:, None] ** 2, min=1e-3)
                 data["skip_latent"] = latent / denom
@@ -153,14 +175,24 @@ class StructureAutoencoder(nn.Module):
         data["latent"] = latent
 
         # decoder recycling
-        prev = dict(
-            pos=data["pos"],
-            local=torch.zeros((data["pos"].shape[0], c.local_size), device=latent.device, dtype=latent.dtype),
-        )   
-        if not running_init:
+        atom37_main = (
+            getattr(c, 'atom37_parallel_mode', 'none') == 'parallel'
+            and getattr(c, 'atom37_main_branch', False)
+        )
+        if atom37_main:
+            prev = dict(
+                pos37=data["pos37"],
+                local=torch.zeros((data["pos37"].shape[0], c.local_size),
+                                   device=latent.device, dtype=latent.dtype),
+            )
+        else:
+            prev = dict(
+                pos=data["pos"],
+                local=torch.zeros((data["pos"].shape[0], c.local_size),
+                                   device=latent.device, dtype=latent.dtype),
+            )
 
-            #data["fixed_recycle"] = 0
-            #print("RUNNING RECYCLE")
+        if not running_init:
             fixed_recycle = _as_int(data.get("fixed_recycle", None))
             if fixed_recycle is not None:
                 count = int(fixed_recycle)
@@ -169,29 +201,22 @@ class StructureAutoencoder(nn.Module):
             else:
                 count = _randint_count(generator, latent.device)
 
-           # print(f"WITH ({count}) iters of decoder")
-            
             for _ in range(count):
                 result_i = self.decoder(data, prev, generator=generator)
-                prev = {
-                    "pos": result_i["pos"].detach(),
-                    "local": result_i["local"].detach(),
-                }
+                if atom37_main:
+                    prev = {
+                        "pos37": result_i["pos37"].detach(),
+                        "local": result_i["local"].detach(),
+                    }
+                else:
+                    prev = {
+                        "pos": result_i["pos"].detach(),
+                        "local": result_i["local"].detach(),
+                    }
 
-        if DEBUG:
-            local0, _, _, _, _, _ = self.decoder.prepare_features(data, prev)
-            trace["dec/local0"] = _stat(local0)
-        if DEBUG:
-            print("DATA before decoder:")
-            print_desc(data)
         result = self.decoder(data, prev, generator=generator)
 
-        if DEBUG:
-            print("DATA after decoder:")
-            print_desc(data)
-            print('\n result after decoder:')
-            print_desc(result)
-        if return_trace and DEBUG:
+        if return_trace:
             trace["dec/pos"] = result["pos"].detach()
             trace["dec/local"] = result["local"].detach()
             trace["dec/atom_pos"] = result["atom_pos"].detach()
@@ -205,10 +230,8 @@ class StructureAutoencoder(nn.Module):
         out_dict = dict(results=result, losses=losses)
         if getattr(c, "codebook_size", 0) and getattr(c, "state", False):
             out_dict["_state_update"] = state_update
-        if return_trace and DEBUG:
-            return total, out_dict, trace
         if return_trace:
-            return total, out_dict, {}
+            return total, out_dict, trace
         return total, out_dict
     
     def add_noise(self, latent: torch.Tensor, batch: torch.Tensor, *, generator: torch.Generator | None = None):
@@ -338,7 +361,7 @@ class StructureAutoencoder(nn.Module):
 
         return latent, time
 
-def prepare_data(data, generator=None):
+def prepare_data(data, generator=None, detect_nonfinite: bool = False):
     """Prepare model inputs from a batch of data."""
     pos = data["all_atom_positions"]   # [N, M, 3]
     atom_mask = data["all_atom_mask"]  # [N, M]
@@ -347,10 +370,7 @@ def prepare_data(data, generator=None):
 
     if not torch.is_tensor(pos):
         pos = torch.as_tensor(pos)
-    if DEBUG:
-        for el in data:
-            print(f"{el} device is {data[el].device} & dtype is {data[el].dtype}") 
-        
+
     device = pos.device
     dtype = pos.dtype if pos.dtype.is_floating_point else torch.float32
     if pos.dtype != dtype:
@@ -374,17 +394,26 @@ def prepare_data(data, generator=None):
     if batch.dtype != torch.long:
         batch = batch.long()
     no_random = data.get("no_random", False)
-    # if torch.is_tensor(no_random):
-    #     if no_random.device != device:
-    #         raise ValueError(f"no_random is on {no_random.device}, expected {device}")
-    #     no_random_bool = no_random.bool()
-    # else:
-    #     no_random_bool = torch.as_tensor(bool(no_random), device=device)
 
-    # recast positions into atom14:
-    # first, truncate to atom14 format
-    pos = pos[:, :14]
-    atom_mask = atom_mask[:, :14]
+    # handle atom37 input vs atom14 input
+    atom_pos_37 = None
+    atom_mask_37 = None
+    if pos.shape[-2] == 37:
+        atom_pos_37 = pos
+        atom_mask_37 = atom_mask
+        # convert to atom14 for backbone processing
+        aa_gt_t = data.get("aa_gt")
+        if aa_gt_t is None:
+            raise ValueError("aa_gt required when all_atom_positions has 37 atoms")
+        if not torch.is_tensor(aa_gt_t):
+            aa_gt_t = torch.as_tensor(aa_gt_t, device=device, dtype=torch.long)
+        elif aa_gt_t.dtype != torch.long:
+            aa_gt_t = aa_gt_t.long()
+        pos, atom_mask = atom37_to_atom14(aa_gt_t, pos.to(dtype=dtype), atom_mask.to(dtype=dtype))
+    else:
+        # recast positions into atom14: truncate to atom14 format
+        pos = pos[:, :14]
+        atom_mask = atom_mask[:, :14]
 
     # boolean atom mask for logic
     atom_mask_bool = atom_mask.bool()
@@ -470,10 +499,35 @@ def prepare_data(data, generator=None):
         all_atom_mask=atom_mask_out,
     )
 
-    if DEBUG:
-        for el in out_data:
-            print(f"OUT {el} device is {out_data[el].device} & dtype is {out_data[el].dtype}") 
-        
+    if atom_pos_37 is not None:
+        # center and fill missing positions with pseudo-CB
+        atom_pos_37_c = (atom_pos_37 - center[:, None, :]).to(dtype=dtype)
+        atom_mask_37_f = atom_mask_37.to(dtype=dtype)
+        pseudo_cb_37 = compute_pseudo_cb(atom_pos_37_c)
+        atom_pos_37_c = torch.where(
+            atom_mask_37.bool()[..., None],
+            atom_pos_37_c,
+            pseudo_cb_37[:, None, :].expand_as(atom_pos_37_c))
+        pos37_gt = atom_pos_37_c
+        pos37_init = torch.randn(
+            pos37_gt.shape, device=device, dtype=dtype, generator=generator)
+        if no_random:
+            pos37_init = pos37_gt
+        out_data.update(
+            all_atom_positions_37=atom_pos_37_c,
+            all_atom_mask_37=atom_mask_37_f,
+            physical_all_atom_mask_37=atom_mask_37_f,
+            pos37=pos37_init,
+            pos37_gt=pos37_gt,
+            pos37_input=pos37_gt,
+        )
+
+    if detect_nonfinite:
+        _assert_finite("prepare_data/pos_gt", out_data["pos_gt"])
+        _assert_finite("prepare_data/pos", out_data["pos"])
+        _assert_finite("prepare_data/dmap", out_data["dmap"])
+        _assert_finite("prepare_data/mask", out_data["mask"])
+
     return out_data 
         
 class StructureDecoderInference(nn.Module):
@@ -489,6 +543,7 @@ class StructureDecoderInference(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.prepare_data_fn = prepare_data_fn
         c = self.config
 
         # fixed encoder apply fn (returns (latent, codebook_index))
@@ -508,32 +563,45 @@ class StructureDecoderInference(nn.Module):
     @torch.no_grad()
     def forward(self, data: Dict[str, Any], *, generator: Optional[torch.Generator] = None, return_trace: bool = False) -> Dict[str, Any] | tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
         c = self.config
-        data = dict(data)
+        raw_data = dict(data)
+        data = dict(raw_data)
+        trace: Dict[str, torch.Tensor] = {} if return_trace else {}
+        if generator is None:
+            data.update(self.prepare_data_fn(raw_data))
+        else:
+            data.update(self.prepare_data_fn(raw_data, generator=generator))
+        if return_trace:
+            trace["prep/pos"] = data["pos"].detach()
+            trace["prep/pos_gt"] = data["pos_gt"].detach()
+            trace["prep/mask"] = data["mask"].detach()
+            trace["prep/dmap"] = data["dmap"].detach()
 
-        # data.update(self.prepare_data(data))
-        
-        latent, codebook_index = self.encoder_apply(data, generator=generator)
+        latent, codebook_index = self.encoder_apply(raw_data, generator=generator)
         latent = latent.detach()
         data["latent"] = latent
+        if return_trace:
+            trace["enc/latent"] = latent.detach()
 
-        prev = dict(
-            pos=data["pos"],
-            local=torch.zeros(
-                (data["pos"].shape[0], c.local_size),
-                device=data["pos"].device,
-                dtype=latent.dtype,
-            ),
+        atom37_main = (
+            getattr(c, 'atom37_parallel_mode', 'none') == 'parallel'
+            and getattr(c, 'atom37_main_branch', False)
         )
+        prev = self.decoder.init_prev(data)
 
         count = int(c.num_recycle)
         for _ in range(count):
             result_i = self.decoder(data, prev, generator=generator)
-            prev = {
-                "pos": result_i["pos"].detach(),
-                "local": result_i["local"].detach(),
-            }
+            if atom37_main:
+                prev = {"pos37": result_i["pos37"].detach(), "local": result_i["local"].detach()}
+            else:
+                prev = {"pos": result_i["pos"].detach(), "local": result_i["local"].detach()}
 
         result = self.decoder(data, prev, generator=generator)
+        if return_trace:
+            trace["dec/pos"] = result["pos"].detach()
+            trace["dec/local"] = result["local"].detach()
+            trace["dec/atom_pos"] = result["atom_pos"].detach()
+            trace["dec/aa"] = result["aa"].detach()
 
         mask = data.get("mask_bool", data["mask"])
         if mask.dtype != torch.bool:
@@ -597,6 +665,8 @@ class StructureDecoderInference(nn.Module):
         if getattr(c, "codebook_size", 0):
             out["codebook_index"] = codebook_index
 
+        if return_trace:
+            return out, trace
         return out
 
 class AssignState(nn.Module):
@@ -720,16 +790,25 @@ class StructureDecoder(StructureAutoencoder):
         *,
         generator: Optional[torch.Generator] = None,
         running_init: bool = False,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        return_trace: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]] | Tuple[torch.Tensor, Dict[str, Any], Dict[str, torch.Tensor]]:
         c = self.config
         data = dict(data)
+        trace: Dict[str, torch.Tensor] = {} if return_trace else {}
 
         data.update(self.prepare_data_fn(data) if generator is None else self.prepare_data_fn(data, generator=generator))
+        if return_trace:
+            trace["prep/pos"] = data["pos"].detach()
+            trace["prep/pos_gt"] = data["pos_gt"].detach()
+            trace["prep/mask"] = data["mask"].detach()
+            trace["prep/dmap"] = data["dmap"].detach()
 
         latent, codebook_index = self.encoder_apply(data, generator=generator)
 
         latent = latent.detach()
         data["latent"] = latent
+        if return_trace:
+            trace["enc/latent"] = latent.detach()
 
         prev = dict(
             pos=data["pos"],
@@ -754,6 +833,11 @@ class StructureDecoder(StructureAutoencoder):
                 )
 
         result = self.decoder(data, prev, generator=generator)
+        if return_trace:
+            trace["dec/pos"] = result["pos"].detach()
+            trace["dec/local"] = result["local"].detach()
+            trace["dec/atom_pos"] = result["atom_pos"].detach()
+            trace["dec/aa"] = result["aa"].detach()
 
         total, losses = self.decoder.loss(data, result, generator=generator)
 
@@ -761,6 +845,8 @@ class StructureDecoder(StructureAutoencoder):
             results=result,
             losses=losses,
         )
+        if return_trace:
+            return total, out_dict, trace
         return total, out_dict
 
     def add_noise(
@@ -858,18 +944,19 @@ class StructureAutoencoderInference(StructureAutoencoder):
 
         data["latent"] = latent
 
-        prev = dict(
-            pos=data["pos"],
-            local=torch.zeros((data["pos"].shape[0], c.local_size), device=latent.device, dtype=latent.dtype),
+        atom37_main = (
+            getattr(c, 'atom37_parallel_mode', 'none') == 'parallel'
+            and getattr(c, 'atom37_main_branch', False)
         )
+        prev = self.decoder.init_prev(data)
 
         count = int(c.num_recycle)
         for _ in range(count):
             result_i = self.decoder(data, prev, generator=generator)
-            prev = {
-                "pos": result_i["pos"].detach(),
-                "local": result_i["local"].detach(),
-            }
+            if atom37_main:
+                prev = {"pos37": result_i["pos37"].detach(), "local": result_i["local"].detach()}
+            else:
+                prev = {"pos": result_i["pos"].detach(), "local": result_i["local"].detach()}
 
         result = self.decoder(data, prev, generator=generator)
         if return_trace:
@@ -964,8 +1051,6 @@ class StructureAutoencoderInference(StructureAutoencoder):
         if getattr(c, "codebook_size", 0):
             out["codebook_index"] = codebook_index
 
-        if return_trace:
-            return out, trace
         if return_trace:
             return out, trace
         return out

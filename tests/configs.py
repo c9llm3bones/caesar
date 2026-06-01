@@ -34,9 +34,15 @@ default = dotdict(
     fape_neighbours=64,
     # loss weights
     local_weight=1.0,
+    full_atom_weight=0.0,
     aa_weight=10.0,
     fape_weight=1,
     fape_trajectory_weight=0.5,
+    sidechain_decoder="angles",
+    atom14_masked_input="local",
+    atom14_masked_backbone_source="predicted",
+    full_atom_loss_mode="local",
+    atom37_encoder_mode="none",
     # dataset constraints
     min_size=50,
     max_size=None
@@ -58,4 +64,3 @@ test_deterministic.num_random_neighbours = 0
 test_deterministic.latent_diffusion = False
 test_deterministic.eval = True  
 # test_deterministic.fape_neighbours = 0
-

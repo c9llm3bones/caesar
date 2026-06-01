@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import json
 import argparse
 from dataclasses import dataclass
 from copy import deepcopy
@@ -10,14 +11,128 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from caesar.data.allpdb import BatchedProteinPDBStream
+from caesar.data.allpdb import BatchedProteinPDBStream, ProteinPDBSample
 from flexloop.data import BatchStream
 from caesar.modules.autoencoder import StructureAutoencoder, StructureDecoder
 from caesar.modules.config import distance_to_structure_decoder as config_choices
 
+
+def _make_protein_pdb_cls(config):
+    """Return a ProteinPDB-compatible class that emits atom37 when needed."""
+    needs_atom37 = (
+        getattr(config, "atom37_parallel_mode", "none") == "parallel"
+    )
+    if not needs_atom37:
+        return None  # use BatchedProteinPDBStream default
+
+    class ProteinPDBAtom37(ProteinPDBSample):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.format = "atom37"
+
+    return ProteinPDBAtom37
+
 @dataclass
 class LoopState:
     step_id: int
+
+
+class NonFiniteError(RuntimeError):
+    def __init__(self, stage: str, tensor_name: str, message: str):
+        super().__init__(message)
+        self.stage = stage
+        self.tensor_name = tensor_name
+
+
+def _bool_from_opt(value: Any) -> bool:
+    if isinstance(value, str):
+        return value == "True"
+    return bool(value)
+
+
+def _first_nonfinite_in_state(model: torch.nn.Module, *, kind: str) -> Optional[Tuple[str, str]]:
+    for name, param in model.named_parameters():
+        tensor = param if kind == "param" else param.grad
+        if tensor is None:
+            continue
+        if not bool(torch.isfinite(tensor).all().item()):
+            return name, kind
+    return None
+
+
+def _clone_generator(generator: Optional[torch.Generator]) -> Optional[torch.Generator]:
+    if generator is None:
+        return None
+    device = generator.device if hasattr(generator, "device") else torch.device("cpu")
+    cloned = torch.Generator(device=device)
+    cloned.set_state(generator.get_state())
+    return cloned
+
+
+def _to_numpy_payload(data: Dict[str, Any], prefix: str) -> Dict[str, np.ndarray]:
+    payload: Dict[str, np.ndarray] = {}
+    for key, value in data.items():
+        name = f"{prefix}__{key.replace('/', '__')}"
+        if torch.is_tensor(value):
+            payload[name] = value.detach().cpu().numpy()
+        elif isinstance(value, np.ndarray):
+            payload[name] = value
+        elif isinstance(value, (float, int, bool, np.generic)):
+            payload[name] = np.asarray(value)
+    return payload
+
+
+@torch.no_grad()
+def collect_diagnostic_artifacts(
+    *,
+    model: torch.nn.Module,
+    batch: Dict[str, Any],
+    rebatch: int,
+    generator: Optional[torch.Generator],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    artifacts = _to_numpy_payload(batch, "raw")
+    metadata: Dict[str, Any] = {}
+    try:
+        result = model(batch, generator=generator, return_trace=True)
+        if isinstance(result, tuple) and len(result) == 3:
+            loss, out, trace = result
+        else:
+            loss, out = result
+            trace = {}
+        artifacts["diag__loss"] = np.asarray(float(loss.detach().float().cpu().item()))
+        if isinstance(trace, dict):
+            artifacts.update(_to_numpy_payload(trace, "trace"))
+    except Exception as exc:
+        metadata["diagnostic_error"] = str(exc)
+    return artifacts, metadata
+
+
+def save_bad_step_artifacts(
+    *,
+    save_dir: str,
+    step: int,
+    raw_batch: Dict[str, Any],
+    model: torch.nn.Module,
+    rebatch: int,
+    generator: Optional[torch.Generator],
+    metadata: Dict[str, Any],
+) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    npz_path = os.path.join(save_dir, f"bad_step_{step}.npz")
+    json_path = os.path.join(save_dir, f"bad_step_{step}.json")
+    artifacts = _to_numpy_payload(raw_batch, "raw")
+    diag_artifacts, diag_meta = collect_diagnostic_artifacts(
+        model=model,
+        batch=raw_batch,
+        rebatch=rebatch,
+        generator=generator,
+    )
+    artifacts.update(diag_artifacts)
+    metadata = dict(metadata)
+    metadata.update(diag_meta)
+    np.savez_compressed(npz_path, **artifacts)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
 
 
 def flatten_dict(d: Any, prefix: str = "") -> Dict[str, Any]:
@@ -177,6 +292,7 @@ def train_one_step(
     amp_dtype: torch.dtype,
     generator: Optional[torch.Generator],
     log_losses: bool,
+    detect_nonfinite: bool,
 ) -> Tuple[float, Dict[str, float]]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -191,10 +307,14 @@ def train_one_step(
             assert scaler is not None
             with torch.amp.autocast("cuda", dtype=amp_dtype):
                 loss, out = forward_and_loss(model, batch, rebatch=rebatch, generator=generator)
+                if detect_nonfinite and not bool(torch.isfinite(loss.detach()).all().item()):
+                    raise NonFiniteError("loss", "loss", "Non-finite loss detected before backward/optimizer step.")
                 loss_to_backward = loss / float(acc_n)
             scaler.scale(loss_to_backward).backward()
         else:
             loss, out = forward_and_loss(model, batch, rebatch=rebatch, generator=generator)
+            if detect_nonfinite and not bool(torch.isfinite(loss.detach()).all().item()):
+                raise NonFiniteError("loss", "loss", "Non-finite loss detected before backward/optimizer step.")
             (loss / float(acc_n)).backward()
 
         if log_losses:
@@ -213,12 +333,22 @@ def train_one_step(
             scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(clip))
 
+    if detect_nonfinite:
+        bad_grad = _first_nonfinite_in_state(model, kind="grad")
+        if bad_grad is not None:
+            raise NonFiniteError("grad", bad_grad[0], f"Non-finite gradient detected in parameter {bad_grad[0]}.")
+
     # optimizer step
     if use_amp and scaler is not None and scaler.is_enabled():
         scaler.step(optimizer)
         scaler.update()
     else:
         optimizer.step()
+
+    if detect_nonfinite:
+        bad_param = _first_nonfinite_in_state(model, kind="param")
+        if bad_param is not None:
+            raise NonFiniteError("param", bad_param[0], f"Non-finite parameter detected after optimizer step in {bad_param[0]}.")
 
     if log_losses:
         denom = float(acc_n)
@@ -237,6 +367,7 @@ def valid_one_step(
     use_amp: bool,
     amp_dtype: torch.dtype,
     generator: Optional[torch.Generator],
+    detect_nonfinite: bool,
 ) -> Tuple[float, Dict[str, float]]:
     model.eval()
 
@@ -245,6 +376,9 @@ def valid_one_step(
             loss, out = forward_and_loss(model, batch, rebatch=rebatch, generator=generator)
     else:
         loss, out = forward_and_loss(model, batch, rebatch=rebatch, generator=generator)
+
+    if detect_nonfinite and not bool(torch.isfinite(loss.detach()).all().item()):
+        raise NonFiniteError("valid_loss", "loss", "Non-finite validation loss detected.")
 
     loss_scalar = float(loss.detach().float().cpu().item())
     losses = out.get("losses", {}) if isinstance(out, dict) else {}
@@ -302,14 +436,18 @@ def parse_args():
     p.add_argument("--cudnn_benchmark", type=str, default="True")
 
     # AMP (V100: fp16)
-    p.add_argument("--amp", type=str, default="True")
+    p.add_argument("--amp", type=str, default="False")
     p.add_argument("--amp_dtype", type=str, default="fp16")  # fp16 recommended on V100
+    p.add_argument("--detect_nonfinite", type=str, default="True")
+    p.add_argument("--save_bad_batch_dir", type=str, default="")
+    p.add_argument("--max_steps", type=int, default=-1)
 
     return p.parse_args()
 
 
 def main():
     opt = parse_args()
+    detect_nonfinite = _bool_from_opt(opt.detect_nonfinite)
 
     torch.manual_seed(opt.seed)
 
@@ -332,6 +470,12 @@ def main():
 
     ModelClass = StructureDecoder if is_decoder else StructureAutoencoder
     model = ModelClass(config).to(device)
+
+    # dataset class (atom37 for full-atom configs)
+    pdb_cls_kwargs = {}
+    atom37_cls = _make_protein_pdb_cls(config)
+    if atom37_cls is not None:
+        pdb_cls_kwargs["base_dataset"] = atom37_cls
 
     # outdir
     sae = "sdd" if is_decoder else "sae"
@@ -356,6 +500,7 @@ def main():
         size=int(opt.num_aa),
         min_size=16,
         max_size=int(opt.num_aa),
+        **pdb_cls_kwargs,
     )
     train_iter = iter(
         BatchStream(
@@ -376,6 +521,7 @@ def main():
         max_size=int(opt.num_aa),
         start_date="01/01/22",
         cutoff_date="12/31/23",
+        **pdb_cls_kwargs,
     )
     valid_iter = iter(
         BatchStream(
@@ -397,6 +543,7 @@ def main():
     model.train()
     with torch.no_grad():
         sample = to_torch_batch(next(train_iter), device)
+        sample["detect_nonfinite"] = detect_nonfinite
         if amp_enabled:
             with torch.amp.autocast("cuda", dtype=amp_dtype):
                 _ = model(sample, generator=generator)
@@ -430,9 +577,18 @@ def main():
     print("Starting training...")
     print(f"Log files and tensorboard records will be written to {outdir}")
     print(f"Device: {device} | AMP: {amp_enabled} | amp_dtype: {amp_dtype}")
+    print(
+        f"Run config: config={opt.config}, seed={opt.seed}, amp={amp_enabled}, "
+        f"detect_nonfinite={detect_nonfinite}, save_bad_batch_dir={opt.save_bad_batch_dir or '<disabled>'}"
+    )
 
     # loop
+    steps_run = 0
+    final_step = start_step
     for step in range(start_step, total_steps):
+        if int(opt.max_steps) > 0 and steps_run >= int(opt.max_steps):
+            print(f"Stopping early after {steps_run} steps because --max_steps={opt.max_steps}.")
+            break
         t0 = time.time()
 
         # lr
@@ -445,25 +601,65 @@ def main():
         load_time = time.time() - t_load
 
         batch = to_torch_batch(raw, device)
+        batch["detect_nonfinite"] = detect_nonfinite
 
         # train step
         t_step = time.time()
         log_now = (step % int(opt.log_interval) == 0)
-        total_loss, losses_avg = train_one_step(
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            batch=batch,
-            rebatch=int(opt.rebatch),
-            accumulate=int(opt.accumulate),
-            clip=float(opt.clip),
-            use_amp=amp_enabled,
-            amp_dtype=amp_dtype,
-            generator=generator,
-            log_losses=log_now,
-        )
+        replay_generator = _clone_generator(generator)
+        try:
+            total_loss, losses_avg = train_one_step(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                batch=batch,
+                rebatch=int(opt.rebatch),
+                accumulate=int(opt.accumulate),
+                clip=float(opt.clip),
+                use_amp=amp_enabled,
+                amp_dtype=amp_dtype,
+                generator=generator,
+                log_losses=log_now,
+                detect_nonfinite=detect_nonfinite,
+            )
+        except (NonFiniteError, RuntimeError) as exc:
+            if isinstance(exc, NonFiniteError):
+                stage = exc.stage
+                tensor_name = exc.tensor_name
+            else:
+                if "Non-finite tensor detected" not in str(exc):
+                    raise
+                stage = "model"
+                tensor_name = "model"
+            print(f"Aborting at step {step}: {exc} (stage={stage}, tensor={tensor_name})")
+            if opt.save_bad_batch_dir:
+                diagnostic_model = deepcopy(model).to(device)
+                diagnostic_model.load_state_dict(model.state_dict())
+                diagnostic_model.eval()
+                save_bad_step_artifacts(
+                    save_dir=opt.save_bad_batch_dir,
+                    step=step,
+                    raw_batch=batch,
+                    model=diagnostic_model,
+                    rebatch=int(opt.rebatch),
+                    generator=replay_generator,
+                    metadata={
+                        "step": step,
+                        "lr": float(lr),
+                        "amp": bool(amp_enabled),
+                        "seed": int(opt.seed),
+                        "config": str(opt.config),
+                        "stage": stage,
+                        "tensor_name": tensor_name,
+                        "error": str(exc),
+                    },
+                )
+                print(f"Saved bad-step diagnostics to {opt.save_bad_batch_dir}")
+            raise
         step_time = time.time() - t_step
         total_time = time.time() - t0
+        steps_run += 1
+        final_step = step + 1
 
         # prints + TB
         if log_now:
@@ -483,6 +679,7 @@ def main():
             for _ in range(int(opt.valid_batches)):
                 v_raw = next(valid_iter)
                 v_batch = to_torch_batch(v_raw, device)
+                v_batch["detect_nonfinite"] = detect_nonfinite
                 v_loss, v_dict = valid_one_step(
                     model=model,
                     batch=v_batch,
@@ -490,6 +687,7 @@ def main():
                     use_amp=amp_enabled,
                     amp_dtype=amp_dtype,
                     generator=generator,
+                    detect_nonfinite=detect_nonfinite,
                 )
                 v_losses.append(v_loss)
                 for k, v in v_dict.items():
@@ -507,7 +705,7 @@ def main():
             print(f"Saved checkpoint: {ckpt_path} (step {step})")
 
     # final checkpoint
-    save_checkpoint(ckpt_path, total_steps, model, optimizer, scaler)
+    save_checkpoint(ckpt_path, final_step, model, optimizer, scaler)
     writer.close()
     print("Training finished.")
 

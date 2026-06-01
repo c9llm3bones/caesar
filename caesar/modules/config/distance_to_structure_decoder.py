@@ -5,7 +5,7 @@ default = dotdict(
     ## feature sizes
     local_size=128,
     pair_size=64,
-    latent_size=20,
+    latent_size=320,
     ## module parameters
     relative_position_encoding_max=32,
     factor=4,
@@ -35,9 +35,21 @@ default = dotdict(
     aa_weight=10.0,
     fape_weight=1,
     fape_trajectory_weight=0.5,
+    # atom37 full-atom parameters
+    atom37_parallel_mode="none",
+    atom37_main_branch=False,
+    pos37_local_mode="all_atom",
+    pos37_local_weight=0.0,
+    atom37_sidechain_aligned_weight=0.0,
+    full_atom_aligned_weight=0.0,
+    kabsch_rmsd37_weight=0.0,
+    pos37_global_weight=0.0,
+    pos37_global_loss_type="l2",
+    pos37_global_align=False,
+    loss_all_atoms=False,
     # dataset constraints
     min_size=50,
-    max_size=None, 
+    max_size=None,
     num_random_neighbours=32,
 )
 
@@ -185,3 +197,15 @@ small_semiequivariant_vq_e2.encoder_depth = 2
 
 small_none = deepcopy(small)
 small_none.distogram_block = "none"
+
+small_inner_atom37_parallel = deepcopy(small_inner)
+small_inner_atom37_parallel.atom37_parallel_mode = "parallel"
+small_inner_atom37_parallel.pos37_local_weight = 0.1
+
+small_inner_atom37_main = deepcopy(small_inner_atom37_parallel)
+small_inner_atom37_main.atom37_main_branch = True
+
+small_inner_atom37_main_sc = deepcopy(small_inner_atom37_main)
+small_inner_atom37_main_sc.pos37_local_mode = "sidechain"
+small_inner_atom37_main_sc.pos37_local_weight = 0.1
+small_inner_atom37_main_sc.atom37_sidechain_aligned_weight = 0.1

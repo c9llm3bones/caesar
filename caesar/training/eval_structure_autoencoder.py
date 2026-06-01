@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from caesar.aflib.common.protein import to_pdb, from_pdb_string, Protein
-from caesar.utils.all_atom_multimer import atom14_to_atom37, atom37_to_atom14
+from caesar.utils.all_atom_multimer import atom14_to_atom37
 from caesar.modules.autoencoder import (
     StructureAutoencoderInference,
     StructureDecoderInference,
@@ -14,7 +14,7 @@ from caesar.modules.autoencoder import (
 )
 from caesar.modules.config import distance_to_structure_decoder as config_choices
 from caesar.data.allpdb import slice_dict
-from caesar.training.train_structure_autoencoder import prepare_batch, slice_batch_first_dim
+from caesar.training.train_structure_autoencoder import to_torch_batch
 from flexloop.utils import parse_options
 
 
@@ -49,21 +49,13 @@ def parse_input_data(path: str, size: int = 1024):
         chain = protein.chain_index
         batch = np.zeros_like(protein.residue_index)
 
-        pos37_t = torch.as_tensor(atom_pos_37, dtype=torch.float32)
-        mask37_t = torch.as_tensor(atom_mask_37, dtype=torch.float32)
-        aa_t = torch.as_tensor(aatype, dtype=torch.long)
-
-        atom_pos_14, atom_mask_14 = atom37_to_atom14(aa_t, pos37_t, mask37_t)
-        atom_pos_14 = atom_pos_14.cpu().numpy()
-        atom_mask_14 = atom_mask_14.cpu().numpy()
-
         data = dict(
             aa_gt=aatype,
             residue_index=resi,
             chain_index=chain,
             batch_index=batch,
-            all_atom_positions=atom_pos_14,
-            all_atom_mask=atom_mask_14,
+            all_atom_positions=atom_pos_37,
+            all_atom_mask=atom_mask_37,
             seq_mask=(aatype != 20),
             residue_mask=atom_mask_37[:, 1],
         )
@@ -83,14 +75,18 @@ def pad_to_size(data: dict, size: int):
     return result
 
 
+def prepare_eval_batch(data: dict, device: torch.device):
+    return to_torch_batch(data, device=device)
+
+
 if __name__ == "__main__":
     opt = parse_options(
         "sample from a protein diffusion model.",
         params="checkpoint.jax",
         out_path="outputs/",
         config="small_inner",
-        path="inputs/",
-        diagnostics="False",
+        path="/disk/10tb/home/kostikov/casp14.targets.T-dom.public_11.29.2020/",
+        diagnostics="True",
         trace="False",
         no_random="False",
         time=0.0,
@@ -124,19 +120,20 @@ if __name__ == "__main__":
     params_path = opt.params
     is_jax = str(params_path).endswith(".jax")
 
-    if is_jax:
-        # Warmup to materialize LazyLinear, then import salad weights.
-        first_item = next(parse_input_data(opt.path, size=1024), None)
-        if first_item is None:
-            raise FileNotFoundError(f"No .pdb files found in {opt.path}")
-        _, warmup_data = first_item
-        warmup = prepare_batch(warmup_data, device=device, float_dtype=torch.float32)
-        warmup["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
-        if opt.no_random == "True":
-            warmup["no_random"] = torch.tensor(True, device=device)
-        with torch.no_grad():
-            _ = model(warmup, generator=torch.Generator(device=device).manual_seed(int(opt.jax_seed)))
+    # Warmup before loading to materialize lazy / conditional submodules so
+    # strict checkpoint loading sees the final module structure.
+    first_item = next(parse_input_data(opt.path, size=1024), None)
+    if first_item is None:
+        raise FileNotFoundError(f"No .pdb files found in {opt.path}")
+    _, warmup_data = first_item
+    warmup = prepare_eval_batch(warmup_data, device=device)
+    warmup["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
+    if opt.no_random == "True":
+        warmup["no_random"] = torch.tensor(True, device=device)
+    with torch.no_grad():
+        _ = model(warmup, generator=torch.Generator(device=device).manual_seed(int(opt.jax_seed)))
 
+    if is_jax:
         from caesar.scripts.import_salad_weights import import_salad_weights_
         import_salad_weights_(model, params_path, verbose=False, strict_missing=True, report=True)
     else:
@@ -146,11 +143,7 @@ if __name__ == "__main__":
     print("Model parameters loaded.")
 
     # warmup (after weights load) to ensure lazy params are set on device
-    first_item = next(parse_input_data(opt.path, size=1024), None)
-    if first_item is None:
-        raise FileNotFoundError(f"No .pdb files found in {opt.path}")
-    _, warmup_data = first_item
-    warmup = prepare_batch(warmup_data, device=device, float_dtype=torch.float32)
+    warmup = prepare_eval_batch(warmup_data, device=device)
     warmup["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
     if opt.no_random == "True":
         warmup["no_random"] = torch.tensor(True, device=device)
@@ -164,7 +157,7 @@ if __name__ == "__main__":
         f_scores.write("name,num_aa,recovery,perplexity,rmsd_ca,tm,lddt\n")
         key = torch.Generator(device=device).manual_seed(int(opt.jax_seed))
         for name, data in parse_input_data(opt.path, size=1024):
-            data_t = prepare_batch(data, device=device, float_dtype=torch.float32)
+            data_t = prepare_eval_batch(data, device=device)
             data_t["time"] = torch.tensor(float(opt.time), device=device, dtype=torch.float32)
             if opt.no_random == "True":
                 data_t["no_random"] = torch.tensor(True, device=device)

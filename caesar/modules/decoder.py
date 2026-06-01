@@ -18,11 +18,13 @@ from caesar.modules.utils.geometry import (
     distance_one_hot, get_spatial_neighbours, index_align,
     sequence_relative_position,
     extract_neighbours_salad_compatible as extract_neighbours,
-    get_neighbours, distance_rbf, 
-    index_mean, 
-    get_random_neighbours, 
+    get_neighbours, distance_rbf,
+    index_mean,
+    get_random_neighbours,
     index_sum,
-    single_protein_sidechains)
+    single_protein_sidechains,
+    atom37_to_ncacocb, atom37_local_feature_channels, mask_atom37_local_positions,
+)
 
 from caesar.modules.basic import Linear, MLP, init_zeros, init_linear, gelu_salad
 
@@ -38,7 +40,30 @@ from caesar.modules.geometric import (
 from caesar.utils.loss import violation_loss
 from caesar.utils.all_atom_multimer import get_atom14_mask
 
-DEBUG = False
+def _as_bool(value):
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return False
+        return bool(value.detach().bool().any().item())
+    return bool(value)
+
+
+def _assert_finite(name: str, tensor: torch.Tensor):
+    finite = torch.isfinite(tensor)
+    if bool(finite.all().item()):
+        return
+    bad_count = int((~finite).sum().item())
+    finite_vals = tensor[finite]
+    if finite_vals.numel() > 0:
+        min_val = float(finite_vals.min().item())
+        max_val = float(finite_vals.max().item())
+    else:
+        min_val = float("nan")
+        max_val = float("nan")
+    raise RuntimeError(
+        f"Non-finite tensor detected in {name}: bad_count={bad_count}, "
+        f"finite_min={min_val}, finite_max={max_val}"
+    )
 
 def stop_gradient(x):
     if isinstance(x, torch.Tensor):
@@ -208,10 +233,10 @@ class Decoder(nn.Module):
         self.config = config
         c = config
 
-        if c.equivariance == "nonequivariant":
+        if getattr(c, 'equivariance', 'equivariant') == "nonequivariant":
             decoder_module = NonEquivariantDecoderStack
             decoder_block = NonEquivariantDecoderBlock
-        elif c.equivariance == "semiequivariant":
+        elif getattr(c, 'equivariance', 'equivariant') == "semiequivariant":
             decoder_module = SemiEquivariantDecoderStack
             decoder_block = SemiEquivariantDecoderBlock
         else:
@@ -221,10 +246,11 @@ class Decoder(nn.Module):
         self.decoder_stack = decoder_module(c, decoder_block)
         self.aa_decoder = AADecoder(c)
 
-        self.use_latent_diff = bool(c.input_diffusion or c.latent_diffusion)
+        self.use_latent_diff = bool(
+            getattr(c, 'input_diffusion', False) or getattr(c, 'latent_diffusion', False))
         if self.use_latent_diff:
-            self.latent_ln = nn.LayerNorm(c.local_size) 
-            out_dim = c.local_size if c.noembed else c.latent_size
+            self.latent_ln = nn.LayerNorm(c.local_size)
+            out_dim = c.local_size if getattr(c, 'noembed', False) else c.latent_size
             self.latent_decoder = MLP(
                 size=c.local_size * 2,
                 out_size=out_dim,
@@ -244,11 +270,74 @@ class Decoder(nn.Module):
 
         self.local_ln = nn.LayerNorm(c.local_size, elementwise_affine=True)
         self.angle_pos = GetAnglePositions(local_dim=c.local_size)
+
+        # atom37 main branch decoder
+        self.decoder_stack37 = None
+        atom37_main = (
+            getattr(c, 'atom37_parallel_mode', 'none') == 'parallel'
+            and getattr(c, 'atom37_main_branch', False)
+        )
+        if atom37_main:
+            self.decoder_stack37 = DecoderStackAtom37(c, DecoderBlockAtom37)
+            self.prev_local_ln_atom37 = nn.LayerNorm(c.local_size, elementwise_affine=True)
+            self.local_mlp_atom37 = MLP(
+                size=4 * c.local_size, out_size=c.local_size,
+                activation=gelu_salad, bias=False, final_init=init_linear(),
+            )
+            self.local_ln_atom37 = nn.LayerNorm(c.local_size, elementwise_affine=True)
         
     def forward(self, data, prev, generator=None):
         if prev is None:
             prev = self.init_prev(data)
         c = self.config
+
+        atom37_main = (
+            getattr(c, 'atom37_parallel_mode', 'none') == 'parallel'
+            and getattr(c, 'atom37_main_branch', False)
+        )
+
+        if atom37_main:
+            local37, pos37, atom_mask37, resi, chain, batch, mask = self.prepare_features(data, prev)
+            sup_neighbours = get_random_neighbours(c.fape_neighbours)(
+                Vec3Array.from_array(data["pos_gt"][:, -1]), batch, mask, generator=generator)
+
+            local37, pos37, trajectory37, sup_distogram = self.decoder_stack37(
+                local37, pos37, atom_mask37, None,
+                resi, chain, batch, mask,
+                sup_neighbours=sup_neighbours, generator=generator)
+
+            # derive backbone view from atom37
+            pos = atom37_to_ncacocb(pos37)
+            trajectory = torch.stack(
+                [atom37_to_ncacocb(trajectory37[t]) for t in range(trajectory37.shape[0])], dim=0)
+            local = local37
+
+            result = {
+                "latent": data["latent"],
+                "trajectory": trajectory,
+                "trajectory37": trajectory37,
+                "sup_neighbours": sup_neighbours,
+                "sup_distogram": sup_distogram,
+                "local": local,
+                "pos": pos,
+                "pos37": pos37,
+            }
+
+            aa_logits, decoder_features, corrupt_aa = self.aa_decoder.decode_train(
+                data["aa_gt"], local, pos, resi, chain, batch, mask)
+            result.update({
+                "aa": aa_logits,
+                "aa_features": decoder_features,
+                "corrupt_aa": corrupt_aa * data["mask"] * (data["aa_gt"] != 20),
+                "aa_gt": data["aa_gt"],
+            })
+
+            aatype = data["aa_gt"]
+            if getattr(c, "eval", False):
+                aatype = aa_logits.argmax(dim=-1)
+            raw_angles, angles, atom_pos = self.angle_pos(aatype, local, pos)
+            result.update({"raw_angles": raw_angles, "angles": angles, "atom_pos": atom_pos})
+            return result
 
         local, pos, resi, chain, batch, mask = self.prepare_features(data, prev)
 
@@ -258,7 +347,7 @@ class Decoder(nn.Module):
         )
 
         local, pos, trajectory, sup_distogram = self.decoder_stack(
-            local, pos, resi, chain, batch, mask, sup_neighbours, 
+            local, pos, resi, chain, batch, mask, sup_neighbours,
             generator=generator
         )
 
@@ -277,7 +366,7 @@ class Decoder(nn.Module):
             )
 
             time = data["time"]
-            if c.vp_diffusion:
+            if getattr(c, 'vp_diffusion', False):
                 predicted_latent = data["latent"] + latent_update
             else:
                 predicted_latent = (
@@ -298,7 +387,7 @@ class Decoder(nn.Module):
         })
 
         aatype = data["aa_gt"]
-        if c.eval:  
+        if getattr(c, "eval", False):
             aatype = aa_logits.argmax(dim=-1)
 
         raw_angles, angles, atom_pos = self.angle_pos(aatype, local, pos)
@@ -313,6 +402,17 @@ class Decoder(nn.Module):
     def init_prev(self, data):
         c = self.config
         local_dtype = data["latent"].dtype if "latent" in data else data["pos"].dtype
+        atom37_main = (
+            getattr(c, 'atom37_parallel_mode', 'none') == 'parallel'
+            and getattr(c, 'atom37_main_branch', False)
+        )
+        if atom37_main:
+            pos37 = data["pos37"]
+            return {
+                "pos37": pos37,
+                "local": torch.zeros((pos37.shape[0], c.local_size),
+                                      device=pos37.device, dtype=local_dtype),
+            }
         return {
             "pos": data["pos"],
             "local": torch.zeros(
@@ -325,12 +425,38 @@ class Decoder(nn.Module):
     def prepare_features(self, data, prev):
         c = self.config
 
-        pos = prev["pos"]
+        atom37_main = (
+            getattr(c, 'atom37_parallel_mode', 'none') == 'parallel'
+            and getattr(c, 'atom37_main_branch', False)
+        )
+
         resi = data["residue_index"]
         chain = data["chain_index"]
         batch = data["batch_index"]
         latent = data["latent"]
         mask = data["mask"]
+
+        if atom37_main:
+            pos37 = prev["pos37"]
+            atom_mask37 = data["all_atom_mask_37"].to(dtype=pos37.dtype)
+            _, local_pos37 = extract_aa_frames(Vec3Array.from_array(pos37))
+            local_pos37_arr = local_pos37.to_tensor()
+            local_pos37_arr = mask_atom37_local_positions(local_pos37_arr, atom_mask37)
+
+            local_features37 = [
+                local_pos37_arr.reshape(local_pos37_arr.shape[0], -1),
+                distance_rbf(
+                    torch.sqrt(torch.clamp((local_pos37_arr ** 2).sum(dim=-1), min=1e-6)),
+                    0.0, 22.0).reshape(local_pos37_arr.shape[0], -1),
+                latent,
+                self.prev_local_ln_atom37(prev["local"]),
+            ]
+            local_features37 = torch.cat(local_features37, dim=-1)
+            local37 = self.local_mlp_atom37(local_features37)
+            local37 = self.local_ln_atom37(local37)
+            return local37, pos37, atom_mask37, resi, chain, batch, mask
+
+        pos = prev["pos"]
 
         _, local_pos = extract_aa_frames(Vec3Array.from_array(pos))
 
@@ -340,7 +466,7 @@ class Decoder(nn.Module):
             latent
         ]
 
-        if c.time_embedding and c.latent_diffusion and "time" in data:
+        if getattr(c, 'time_embedding', False) and getattr(c, 'latent_diffusion', False) and "time" in data:
             time = distance_rbf(data["time"], 0, 80.0, bins=200)
             local_features.append(time)
 
@@ -356,6 +482,7 @@ class Decoder(nn.Module):
     def loss(self, data, result, generator=None):
         """Compute Decoder losses from the input data and Decoder results."""
         c = self.config
+        detect_nonfinite = _as_bool(data.get("detect_nonfinite", False))
 
         resi = data["residue_index"]
         chain = data["chain_index"]
@@ -448,7 +575,84 @@ class Decoder(nn.Module):
         fape_loss = (float(c.fape_weight) * fape_traj[-1] + float(c.fape_trajectory_weight) * fape_traj.mean()) / 3.0
         losses["weighted_fape"] = fape_loss
         total = total + losses["weighted_fape"]
-       
+
+        # atom37 full-atom losses
+        if getattr(c, 'atom37_parallel_mode', 'none') == 'parallel' and 'pos37' in result:
+            pos37_pred = result['pos37']
+            pos37_gt = data.get('pos37_gt', None)
+            if pos37_gt is not None:
+                atom37_mask = data.get('all_atom_mask_37', data['all_atom_mask'])
+                if getattr(c, 'loss_all_atoms', False):
+                    atom37_mask = torch.ones_like(atom37_mask) * mask[:, None]
+
+                pos37_pred_v = Vec3Array.from_array(pos37_pred)
+                pos37_gt_v = Vec3Array.from_array(pos37_gt)
+
+                pos37_local_mode = getattr(c, 'pos37_local_mode', 'all_atom')
+                local_neighbours37 = get_spatial_neighbours(count=c.local_neighbours)(
+                    pos37_gt_v[:, 1], batch, mask)
+                mask37_gt = _gather_rows(atom37_mask, local_neighbours37)
+
+                if pos37_local_mode == 'sidechain':
+                    # sidechain mask: exclude N(0), CA(1), C(2), O(4) backbone atoms
+                    sc_mask37 = atom37_mask.clone()
+                    sc_mask37[:, 0] = 0  # N
+                    sc_mask37[:, 1] = 0  # CA
+                    sc_mask37[:, 2] = 0  # C
+                    sc_mask37[:, 4] = 0  # O
+                    mask37_gt = mask37_gt * _gather_rows(sc_mask37, local_neighbours37)
+
+                frames37_gt, _ = extract_aa_frames(pos37_gt_v)
+                pos37_gt_local = frames37_gt[:, None, None].apply_inverse_to_point(
+                    _gather_vec3(pos37_gt_v, local_neighbours37))
+                frames37, _ = extract_aa_frames(pos37_pred_v)
+                pos37_local = frames37[:, None, None].apply_inverse_to_point(
+                    _gather_vec3(pos37_pred_v, local_neighbours37))
+
+                pos37_loss = torch.where(
+                    mask37_gt.bool(),
+                    (pos37_local - pos37_gt_local).norm2(),
+                    torch.zeros_like((pos37_local - pos37_gt_local).norm2())
+                ).sum(dim=(1, 2))
+                pos37_loss = pos37_loss / torch.clamp(
+                    mask37_gt.sum(dim=(1, 2)).to(dtype=pos37_loss.dtype), min=1)
+                pos37_loss = (torch.where(
+                    mask.bool(), pos37_loss, torch.zeros_like(pos37_loss)
+                ) * base_weight).sum() / 3.0
+                losses['pos37'] = pos37_loss
+                losses['pos37_local'] = pos37_loss
+                weighted_pos37 = float(getattr(c, 'pos37_local_weight', 0.0)) * pos37_loss
+                losses['weighted_pos37_local'] = weighted_pos37
+                total = total + weighted_pos37
+
+                # Aligned sidechain loss
+                sc_aligned_w = float(getattr(c, 'atom37_sidechain_aligned_weight', 0.0))
+                if sc_aligned_w > 0:
+                    sc_mask37 = atom37_mask.clone()
+                    sc_mask37[:, 0] = 0
+                    sc_mask37[:, 1] = 0
+                    sc_mask37[:, 2] = 0
+                    sc_mask37[:, 4] = 0
+                    pos37_gt_bb_aligned = index_align(
+                        pos37_gt, pos37_pred, batch, mask)
+                    sc_sqerr = ((pos37_pred - pos37_gt_bb_aligned) ** 2).sum(dim=-1)
+                    sc_sqerr = torch.where(
+                        sc_mask37.bool(), sc_sqerr, torch.zeros_like(sc_sqerr)).sum(dim=-1)
+                    sc_count = torch.clamp(
+                        sc_mask37.sum(dim=-1).to(dtype=sc_sqerr.dtype), min=1)
+                    sc_sqerr = sc_sqerr / sc_count
+                    sc_sqerr = (torch.where(
+                        mask.bool(), sc_sqerr, torch.zeros_like(sc_sqerr)
+                    ) * base_weight).sum() / 3.0
+                    losses['atom37_sidechain_aligned_loss'] = sc_sqerr
+                    weighted_sc = sc_aligned_w * sc_sqerr
+                    losses['weighted_atom37_sidechain_aligned_loss'] = weighted_sc
+                    total = total + weighted_sc
+
+                # RMSD diagnostic
+                losses['rmsd_no_align_atom37'] = _masked_rmsd_no_align(
+                    pos37_pred, pos37_gt, atom37_mask, mask)
+
         # sup distogram loss
         if getattr(c, "distogram_block", None) not in (None, "none"):
             cb_gt = pos_gt[:, -1]  
@@ -466,9 +670,7 @@ class Decoder(nn.Module):
             losses["distogram_trajectory"] = distogram_nll.mean()
             losses["weighted_distogram"] = 10.0 * distogram_nll[-1] + 5.0 * distogram_nll.mean()
             total = total + losses["weighted_distogram"]
-            if DEBUG:
-                print("kabsch_rmsd loss:", distogram_nll[-1].item())
- 
+
         # Kabsch RMSD loss
         if getattr(c, "kabsch_rmsd", False):
             traj = Vec3Array.from_array(result["trajectory"])
@@ -487,8 +689,6 @@ class Decoder(nn.Module):
             pos_loss = (float(c.fape_weight) * pos_loss[-1] + float(c.fape_trajectory_weight) * pos_loss.mean()) / 3.0
             losses["weighted_kabsch_rmsd"] = pos_loss
             total = total + losses["weighted_kabsch_rmsd"]
-            if DEBUG:
-                print("kabsch_rmsd loss:", pos_loss.item())
 
         # local loss
         atom_pos = Vec3Array.from_array(result["atom_pos"])
@@ -527,9 +727,6 @@ class Decoder(nn.Module):
             if not getattr(c, "state", False):
                 total = total + float(c.codebook_loss_scale) * (cl["codebook"] + cl["unassigned"])
             total = total + float(c.codebook_loss_scale) * float(c.codebook_b) * cl["commitment"]
-            if DEBUG:
-                print("codebook loss:", (cl["codebook"] + cl["unassigned"]).item())
-                print("commitment loss:", cl["commitment"].item())
                 
         # additional denoising losses (not used in manuscript)
         if (getattr(c, "input_diffusion", False) or getattr(c, "latent_diffusion", False)) and getattr(c, "latent_loss_scale", 0):
@@ -544,8 +741,6 @@ class Decoder(nn.Module):
             losses["latent"] = weighted_loss
             losses["weighted_latent"] = float(c.latent_loss_scale) * weighted_loss
             total = total + losses["weighted_latent"]
-            if DEBUG:
-                print("latent loss:", weighted_loss.item())
 
         # AlphaFold violation loss. (not used in manuscript)
         if getattr(c, "violation_scale", 0):
@@ -569,8 +764,12 @@ class Decoder(nn.Module):
             losses["violation"] = violation.mean()
             losses["weighted_violation"] = float(c.violation_scale) * violation.mean()
             total = total + losses["weighted_violation"]
-            if DEBUG:
-                print("violation loss:", violation.mean().item())
+
+        if detect_nonfinite:
+            _assert_finite("decoder/aa", result["aa"])
+            _assert_finite("decoder/trajectory", result["trajectory"])
+            _assert_finite("decoder/atom_pos", result["atom_pos"])
+            _assert_finite("decoder/total", total)
 
         losses["total"] = total
         return total, losses
@@ -1296,6 +1495,250 @@ class DecoderPairFeatures(nn.Module):
 
         return pair, pair_mask
     
+def _masked_rmsd_no_align(pred, target, atom_mask, residue_mask=None):
+    """Compute RMSD without alignment, over masked atoms."""
+    sq = ((pred - target) ** 2).sum(dim=-1)
+    m = atom_mask.to(dtype=pred.dtype)
+    if residue_mask is not None:
+        m = m * residue_mask[:, None].to(dtype=pred.dtype)
+    denom = torch.clamp(m.sum(), min=1.0)
+    return torch.sqrt((sq * m).sum() / denom)
+
+
+class DecoderPairFeaturesAtom37(nn.Module):
+    """Pair features for the atom37 decoder branch."""
+
+    def __init__(self, c):
+        super().__init__()
+        self.c = c
+        self.relpos = sequence_relative_position(32, one_hot=True, pseudo_chains=True)
+        self.p_relpos = Linear(c.pair_size, bias=False, initializer="linear")
+        self.p_dmap = (
+            Linear(c.pair_size, bias=False, initializer="linear")
+            if getattr(c, "distogram_block", "none") != "none" else None
+        )
+        self.p_dist = Linear(c.pair_size, bias=False, initializer="linear")
+        self.p_dir  = Linear(c.pair_size, bias=False, initializer="linear")
+        self.p_rot  = Linear(c.pair_size, bias=False, initializer="linear")
+        self.p_vec  = Linear(c.pair_size, bias=False, initializer="linear")
+        self.p_local_self  = Linear(c.pair_size, bias=False, initializer="linear")
+        self.p_local_self_j = Linear(c.pair_size, bias=False, initializer="linear")
+        self.p_local_neigh = Linear(c.pair_size, bias=False, initializer="linear")
+        self.ln = nn.LayerNorm(c.pair_size, elementwise_affine=True)
+        self.mlp = MLP(c.pair_size * 2, c.pair_size, activation=gelu_salad, final_init="linear")
+
+    def forward(self, pos37: torch.Tensor, dmap, neighbours: torch.Tensor,
+                resi, chain, batch, mask,
+                atom_mask37: torch.Tensor = None):
+        c = self.c
+        if neighbours.dtype != torch.long:
+            neighbours = neighbours.long()
+
+        gathered_mask = _gather_rows(mask, neighbours)
+        pair_mask = mask[:, None] * gathered_mask
+        pair_mask = pair_mask * (neighbours != -1).to(pair_mask.dtype)
+
+        if dmap is not None:
+            dmap_gathered = _gather_dim1(dmap, neighbours)
+        else:
+            dmap_gathered = None
+
+        # use NCACOCB view for geometric features
+        pos_view = Vec3Array.from_array(atom37_to_ncacocb(pos37))
+        pair = self.p_relpos(self.relpos(resi, chain, batch, neighbours))
+        if dmap_gathered is not None and self.p_dmap is not None:
+            dmap_feat = distance_rbf(dmap_gathered)
+            pair = pair + self.p_dmap(torch.where(pair_mask[..., None].bool(), dmap_feat, 0.0))
+        pair = pair + self.p_dist(distance_features(pos_view, neighbours, d_min=0.0, d_max=22.0))
+        pair = pair + self.p_dir(direction_features(pos_view, neighbours))
+        pair = pair + self.p_rot(position_rotation_features(pos_view, neighbours))
+        pair = pair + self.p_vec(pair_vector_features(pos_view, neighbours))
+        if atom_mask37 is not None:
+            pos37_v = Vec3Array.from_array(pos37)
+            frames37, local_pos37 = extract_aa_frames(pos37_v)
+            local_self_feat = atom37_local_feature_channels(local_pos37.to_tensor(), atom_mask37)
+            local_neigh_pos = frames37[:, None, None].apply_inverse_to_point(
+                _gather_vec3(pos37_v, neighbours)).to_tensor()
+            neigh_mask37 = _gather_rows(atom_mask37, neighbours)
+            local_neigh_feat = atom37_local_feature_channels(local_neigh_pos, neigh_mask37)
+            pair = pair + self.p_local_self(local_self_feat)[:, None]
+            pair = pair + self.p_local_self_j(_gather_rows(local_self_feat, neighbours))
+            pair = pair + self.p_local_neigh(local_neigh_feat)
+        pair = self.ln(pair)
+        pair = self.mlp(pair)
+        return pair, pair_mask
+
+
+class DecoderUpdateAtom37(nn.Module):
+    """GeGLU update with global averaging for the atom37 decoder."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        c = config
+        local_size = int(c.local_size)
+
+        self.pos_mlp = MLP(local_size * 2, local_size, activation=gelu_salad, final_init="zeros")
+        self.local_update = Linear(local_size * int(c.factor), initializer="linear", bias=False)
+        self.local_gate  = Linear(local_size * int(c.factor), initializer="relu", bias=False)
+        self.chain_gate  = Linear(local_size * int(c.factor), initializer="relu", bias=False)
+        self.batch_gate  = Linear(local_size * int(c.factor), initializer="relu", bias=False)
+        self.out = Linear(local_size, initializer="zeros")
+
+    def forward(self, local, pos37, chain, batch, mask,
+                atom_mask37: torch.Tensor = None):
+        _, local_pos37 = extract_aa_frames(Vec3Array.from_array(pos37))
+        local_pos37_arr = local_pos37.to_tensor()
+        if atom_mask37 is not None:
+            local_pos37_arr = mask_atom37_local_positions(local_pos37_arr, atom_mask37)
+        local_pos_flat = local_pos37_arr.reshape(local_pos37_arr.shape[0], -1)
+        local = local + self.pos_mlp(local_pos_flat)
+        local_update = self.local_update(local)
+        local_gate  = gelu_salad(self.local_gate(local))
+        chain_gate  = gelu_salad(self.chain_gate(local))
+        batch_gate  = gelu_salad(self.batch_gate(local))
+        hidden = index_mean(batch_gate * local_update, batch, mask[..., None])
+        hidden = hidden + index_mean(chain_gate * local_update, chain, mask[..., None])
+        hidden = hidden + local_gate * local_update
+        return self.out(hidden)
+
+
+class UpdatePositionsAtom37(nn.Module):
+    """Equivariant position update for atom37 coordinates."""
+    def __init__(self):
+        super().__init__()
+        self.proj: Optional[Linear] = None
+        self._A: Optional[int] = None
+
+    def forward(self, pos37: torch.Tensor, local_norm: torch.Tensor, *,
+                scale: float = 10.0, symm=None) -> torch.Tensor:
+        A = int(pos37.shape[-2])
+        if self.proj is None:
+            self._A = A
+            self.proj = Linear(A * 3, initializer="zeros", bias=False,
+                               device=local_norm.device, dtype=local_norm.dtype)
+        else:
+            if self._A != A:
+                raise ValueError(f"UpdatePositionsAtom37 initialized with A={self._A}, got A={A}")
+        frames37, local_pos37 = extract_aa_frames(Vec3Array.from_array(pos37))
+        pos_update = float(scale) * self.proj(local_norm)
+        if symm is not None:
+            pos_update = symm(pos_update)
+        pos_update = Vec3Array.from_array(pos_update.reshape(pos_update.shape[0], A, 3))
+        local_pos37 = local_pos37 + pos_update
+        return frames37[..., None].apply_to_point(local_pos37).to_tensor()
+
+
+class DecoderBlockAtom37(nn.Module):
+    """Equivariant decoder block for the atom37 branch."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        c = config
+
+        if c.distogram_block == "mlp":
+            self.distogram = QuickDistogram(c)
+        elif c.distogram_block == "inner":
+            self.distogram = InnerDistogram(c)
+        elif c.distogram_block in (None, "none"):
+            self.distogram = None
+        else:
+            raise ValueError(f"Unknown distogram_block={c.distogram_block}")
+
+        self.ln_attn_main  = nn.LayerNorm(c.local_size)
+        self.ln_attn_dist  = nn.LayerNorm(c.local_size) if self.distogram is not None else None
+        self.ln_update     = nn.LayerNorm(c.local_size)
+        self.ln_pos        = nn.LayerNorm(c.local_size)
+
+        self.attn_main = SparseStructureAttention(c)
+        self.attn_dist = SparseStructureAttention(c) if self.distogram is not None else None
+
+        self.update = DecoderUpdateAtom37(c)
+        self.pos_update = UpdatePositionsAtom37()
+
+        nr = int(getattr(c, "num_random_neighbours", 32))
+        self.current_neigh = extract_neighbours(num_index=16, num_spatial=16, num_random=nr)
+        self.dmap_neigh = extract_dmap_neighbours(count=32)
+
+        self.pair_features_main = DecoderPairFeaturesAtom37(c)
+        self.pair_features_dist = DecoderPairFeaturesAtom37(c) if self.distogram is not None else None
+
+    def forward(self, features: torch.Tensor, pos37: torch.Tensor,
+                atom_mask37: torch.Tensor, backbone_pos,
+                resi, chain, batch, mask,
+                sup_neighbours=None, generator=None):
+        c = self.config
+        # CB from atom37 view for neighbours
+        pos37_v = Vec3Array.from_array(pos37)
+        cb37 = Vec3Array.from_array(atom37_to_ncacocb(pos37)[:, -1])
+        dmap37 = (cb37[:, None] - cb37[None, :]).norm()
+
+        distogram_logits = None
+        dmap_neighbours = None
+        if self.distogram is not None:
+            dist_full_logits, _ = self.distogram(features, resi, chain, batch, None)
+            if sup_neighbours is None:
+                raise ValueError("sup_neighbours required when distogram is enabled")
+            distogram_logits = _gather_dim1(dist_full_logits, sup_neighbours.long())
+            dmap_neighbours = self.dmap_neigh(dmap37.detach(), resi, chain, batch, mask,
+                                               generator=generator)
+        else:
+            distogram_logits = torch.zeros((1,), dtype=features.dtype, device=features.device)
+
+        current_neighbours = self.current_neigh(pos37_v, resi, chain, batch, mask, generator=generator)
+
+        pair, pair_mask = self.pair_features_main(
+            pos37, dmap37, current_neighbours, resi, chain, batch, mask, atom_mask37)
+        features = features + self.attn_main(
+            self.ln_attn_main(features),
+            pos37 / float(c.sigma_data), pair, pair_mask,
+            current_neighbours, resi, chain, batch, mask)
+
+        if self.distogram is not None:
+            pair2, pair2_mask = self.pair_features_dist(
+                pos37, dmap37, dmap_neighbours, resi, chain, batch, mask, atom_mask37)
+            features = features + self.attn_dist(
+                self.ln_attn_dist(features),
+                pos37 / float(c.sigma_data), pair2, pair2_mask,
+                dmap_neighbours, resi, chain, batch, mask)
+
+        features = features + self.update(
+            self.ln_update(features), pos37, chain, batch, mask, atom_mask37)
+
+        local_norm = self.ln_pos(features)
+        symm = getattr(c, "symm", None)
+        pos37 = self.pos_update(pos37, local_norm, scale=float(c.sigma_data), symm=symm)
+        if pos37.dtype != local_norm.dtype:
+            pos37 = pos37.to(dtype=local_norm.dtype)
+        return features, pos37, distogram_logits
+
+
+class DecoderStackAtom37(nn.Module):
+    """Atom37 decoder stack."""
+
+    def __init__(self, config, block_cls):
+        super().__init__()
+        self.config = config
+        self.blocks = nn.ModuleList([block_cls(config) for _ in range(config.depth)])
+
+    def forward(self, local37, pos37, atom_mask37, backbone_pos,
+                resi, chain, batch, mask,
+                sup_neighbours=None, generator=None):
+        trajectory37 = []
+        sup_distograms = []
+        for block in self.blocks:
+            local37, pos37, sup_dist = block(
+                local37, pos37, atom_mask37, backbone_pos,
+                resi, chain, batch, mask,
+                sup_neighbours=sup_neighbours, generator=generator)
+            trajectory37.append(pos37)
+            sup_distograms.append(sup_dist)
+        trajectory37 = torch.stack(trajectory37, dim=0)
+        sup_distograms = torch.stack(sup_distograms, dim=0)
+        return local37, pos37, trajectory37, sup_distograms
+
+
 class QuickDistogram(nn.Module):
     """Per-layer distogram module.
 

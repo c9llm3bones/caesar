@@ -252,7 +252,13 @@ def atom37_to_atom14(aatype, all_atom_pos, all_atom_mask):
   atom14_positions = jax.tree.map(
       lambda x: utils.batched_gather(x, residx_atom14_to_atom37, batch_dims=1),
       all_atom_pos)
-  atom14_positions = atom14_mask * atom14_positions
+  # Support both raw ndarray positions (..., 14, 3) and Vec3Array pytrees.
+  # For ndarrays we need an extra singleton axis for xyz broadcasting.
+  atom14_positions = jax.tree.map(
+      lambda x: x * jnp.reshape(
+          atom14_mask,
+          atom14_mask.shape + (1,) * max(0, x.ndim - atom14_mask.ndim)),
+      atom14_positions)
   return atom14_positions, atom14_mask
 
 

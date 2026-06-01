@@ -5,6 +5,7 @@ All models in the manuscript were trained with the BatchedProteinPDBStream datas
 
 import os
 import datetime
+import inspect
 from typing import Dict, Optional
 
 import random
@@ -33,6 +34,42 @@ AA_ORDER = ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN',
 AA_BACKBONE_ATOMS = ["N", "CA", "C", "O"]
 # list of nucleic acid backbone atom names
 NA_BACKBONE_ATOMS = ["P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C1'", "C2'", "O2'", "C3'", "O3'"]
+ATOM37_POSITION_FIELD = "position_atom37"
+ATOM37_MASK_FIELD = "atom_mask_atom37"
+
+def init_base_dataset(base_dataset, *args, format="atom24", **kwargs):
+    """Initialize a dataset, passing format only if it is supported."""
+    if "format" in inspect.signature(base_dataset).parameters:
+        kwargs["format"] = format
+    return base_dataset(*args, **kwargs)
+
+def _select_npz_fields(raw_data, fields, accept):
+    """Load required fields and keep optional atom37 fields when available."""
+    result = {
+        name: raw_data[name][accept]
+        for name in fields
+    }
+    for name in (ATOM37_POSITION_FIELD, ATOM37_MASK_FIELD):
+        if name in raw_data:
+            result[name] = raw_data[name][accept]
+    return result
+
+def get_protein_atom_coords(raw_data: Dict[str, np.ndarray],
+                            format: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return protein atom coordinates in the requested storage format.
+
+    `atom24` preserves the legacy residue-bundled storage from the npz files.
+    `atom37` requires native canonical atom37 fields in the loaded npz file.
+    """
+    if format == "atom24":
+        return raw_data["position"], raw_data["atom_mask"]
+    if format != "atom37":
+        raise ValueError(f"Unsupported protein atom format: {format}")
+    if ATOM37_POSITION_FIELD not in raw_data or ATOM37_MASK_FIELD not in raw_data:
+        raise KeyError(
+            f"Requested format='atom37', but npz is missing "
+            f"'{ATOM37_POSITION_FIELD}'/'{ATOM37_MASK_FIELD}'.")
+    return raw_data[ATOM37_POSITION_FIELD], raw_data[ATOM37_MASK_FIELD]
 
 class AllPDB:
     """Implements data loading for structures in the PDB.
@@ -91,20 +128,14 @@ class AllPDB:
             split_data = dict()
             for res_type in self.filter_residue_type:
                 accept = residue_type == res_type
-                raw_data_part = {
-                    name: raw_data[name][accept]
-                    for name in self.fields
-                }
+                raw_data_part = _select_npz_fields(raw_data, self.fields, accept)
                 split_data[res_type] = raw_data_part
             raw_data = split_data
         # by default, return one dictionary
         # for all residue types
         else:
             accept = (residue_type[:, None] == self.filter_residue_type[None, :]).any(axis=-1)
-            raw_data = {
-                name: raw_data[name][accept]
-                for name in self.fields
-            }
+            raw_data = _select_npz_fields(raw_data, self.fields, accept)
         return raw_data, chosen_chain["chain"]
 
 class AllPDBSample(AllPDB):
@@ -134,22 +165,19 @@ class AllPDBSample(AllPDB):
         raw_data = np.load(f"{self.path}/{assembly}")
         residue_type = raw_data["residue_type"]
         accept = (residue_type[:, None] == self.filter_residue_type[None, :]).any(axis=-1)
-        raw_data = {
-            name: raw_data[name][accept]
-            for name in self.fields
-        }
+        raw_data = _select_npz_fields(raw_data, self.fields, accept)
         return raw_data, chosen_chain["chain"]
 
 class ProteinPDB(AllPDB):
-    """Protein-specific PDB dataset in atom24 format
-    (amino acid and nucleic acid atoms)."""
+    """Protein-specific PDB dataset in residue-bundled atom24 / atom37 format."""
     def __init__(self, path, start_date="01/01/90",
                  cutoff_date="12/31/21",
                  cutoff_resolution=4,
                  seqres_aa="clusterSeqresAA",
                  seqres_na="clusterSeqresNA",
                  assembly=True,
-                 seed: Optional[int] = None) -> None:
+                 seed: Optional[int] = None,
+                 format: str = "atom24") -> None:
         super().__init__(
             path, start_date, cutoff_date,
             cutoff_resolution, ["AA"],
@@ -157,6 +185,9 @@ class ProteinPDB(AllPDB):
             seqres_na=seqres_na,
             assembly=assembly,
             seed=seed)
+        if format not in ("atom24", "atom37"):
+            raise ValueError(f"Unsupported ProteinPDB format: {format}")
+        self.format = format
         self.aa_order = np.array(
             ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN',
              'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS',
@@ -178,8 +209,8 @@ class ProteinPDB(AllPDB):
         residue_index = raw_data["residue_index"]
         chain_index = raw_data["chain_index"]
         entity_index = raw_data["entity_index"]
-        all_atom_positions = raw_data["position"]
-        all_atom_mask = raw_data["atom_mask"]
+        all_atom_positions, all_atom_mask = get_protein_atom_coords(
+            raw_data, self.format)
         return dict(
             aa_gt=aa_gt,
             residue_index=residue_index,
@@ -491,10 +522,10 @@ class ProteinBinderPDB(ProteinPDB):
     """
     def __init__(self, path, num_aa=1024, start_date="01/01/90", cutoff_date="12/31/21",
                  cutoff_resolution=4, seqres_aa="clusterSeqresAA", seqres_na="clusterSeqresNA",
-                 assembly=True):
+                 assembly=True, format="atom24"):
         super().__init__(
             path, start_date, cutoff_date, cutoff_resolution,
-            seqres_aa, seqres_na, assembly)
+            seqres_aa, seqres_na, assembly, format=format)
         self.num_aa = num_aa
 
     def __getitem__(self, index) -> Dict[str, ndarray]:
@@ -578,8 +609,10 @@ class ProteinBinderPDB(ProteinPDB):
 class ProteinCropPDB(ProteinPDB):
     """Fixed-size crop ProteinPDB dataset."""
     def __init__(self, path, size, start_date="01/01/90", cutoff_date="12/31/21", cutoff_resolution=4,
-                 seqres_aa="clusterSeqresAA", seqres_na="clusterSeqresNA", assembly=True) -> None:
-        super().__init__(path, start_date, cutoff_date, cutoff_resolution, seqres_aa, seqres_na, assembly)
+                 seqres_aa="clusterSeqresAA", seqres_na="clusterSeqresNA", assembly=True,
+                 format="atom24") -> None:
+        super().__init__(path, start_date, cutoff_date, cutoff_resolution, seqres_aa, seqres_na, assembly,
+                         format=format)
         self.size = size
 
     def __getitem__(self, index) -> Dict[str, ndarray]:
@@ -608,24 +641,22 @@ class ProteinPDBSample(AllPDBSample):
                  cutoff_resolution=4,
                  seqres_aa="clusterSeqresAA",
                  seqres_na="clusterSeqresNA",
-                 assembly=True) -> None:
+                 assembly=True,
+                 format: str = "atom24") -> None:
         super().__init__(
             path, start_date, cutoff_date,
             cutoff_resolution, ["AA"],
             seqres_aa=seqres_aa,
             seqres_na=seqres_na,
             assembly=assembly)
-        self.format = "atom24"
+        if format not in ("atom24", "atom37"):
+            raise ValueError(f"Unsupported ProteinPDBSample format: {format}")
+        self.format = format
         self.aa_order = np.array(
             ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN',
              'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS',
              'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP',
              'TYR', 'VAL', 'UNK'])
-        self.atom_order_37 = np.array(
-            ['N', 'CA', 'C', 'CB', 'O', 'CG', 'CG1', 'CG2', 'OG', 'OG1', 'SG', 'CD',
-             'CD1', 'CD2', 'ND1', 'ND2', 'OD1', 'OD2', 'SD', 'CE', 'CE1', 'CE2', 'CE3',
-             'NE', 'NE1', 'NE2', 'OE1', 'OE2', 'CH2', 'NH1', 'NH2', 'OH', 'CZ', 'CZ2',
-             'CZ3', 'NZ', 'OXT', ''])
 
     def __getitem__(self, index) -> Dict[str, np.ndarray]:
         data = super().__getitem__("AA", index)
@@ -642,16 +673,8 @@ class ProteinPDBSample(AllPDBSample):
         residue_index = raw_data["residue_index"]
         chain_index = raw_data["chain_index"]
         entity_index = raw_data["entity_index"]
-        all_atom_positions = raw_data["position"]
-        all_atom_mask = raw_data["atom_mask"]
-        
-        if self.format == "atom37":
-            atom_name = raw_data["atom_name"]
-            atom37_assignment = np.argmax(
-                atom_name[:, :, None] == self.atom_order_37[None, None, :], axis=-2)
-            idb = np.arange(atom_name.shape[0], dtype=np.int32)
-            all_atom_positions = all_atom_positions[idb[:, None], atom37_assignment]
-            all_atom_mask = all_atom_mask[idb[:, None], atom37_assignment]
+        all_atom_positions, all_atom_mask = get_protein_atom_coords(
+            raw_data, self.format)
         return dict(
             aa_gt=aa_gt,
             residue_index=residue_index,
@@ -676,13 +699,16 @@ class BatchedProteinPDB(Dataset):
                  min_size=32,
                  max_size=None,
                  legacy_repetitive_chains=True,
-                 base_dataset=ProteinPDB) -> None:
+                 base_dataset=ProteinPDB,
+                 format="atom24") -> None:
         super().__init__()
-        self.protein_pdb = base_dataset(
+        self.protein_pdb = init_base_dataset(
+            base_dataset,
             path, start_date, cutoff_date, cutoff_resolution,
             seqres_aa=seqres_aa,
             seqres_na=seqres_na,
-            assembly=assembly)
+            assembly=assembly,
+            format=format)
         self.size = size
         self.min_size = min_size
         self.max_size = max_size or size
@@ -824,15 +850,18 @@ class BatchedProteinPDBStream(IterableDataset):
                  max_size=None,
                  legacy_repetitive_chains=True,
                  base_dataset=ProteinPDB,
-                 seed: Optional[int] = None) -> None:
+                 seed: Optional[int] = None,
+                 format="atom24") -> None:
         super().__init__()
         self.rng = random.Random(seed)
-        self.protein_pdb = base_dataset(
+        self.protein_pdb = init_base_dataset(
+            base_dataset,
             path, start_date, cutoff_date, cutoff_resolution,
             seqres_aa=seqres_aa,
             seqres_na=seqres_na,
             assembly=assembly,
-            seed=seed)
+            seed=seed,
+            format=format)
         self.size = size
         self.min_size = min_size
         self.max_size = max_size or size
@@ -970,7 +999,7 @@ class BatchedProteinPDBStream(IterableDataset):
         }
         result["batch_index"] = batch_index
         result = pad_dict(result, self.size)
-        result["seq_mask"] = result["mask"] * (result["aa_gt"] != 20)
+        result["seq_mask"] = result["mask"] * (result["aa_gt"] != 20)   
         result["residue_mask"] = result["mask"] * result["all_atom_mask"].any(axis=-1)
 
         return result
@@ -986,11 +1015,12 @@ class CroppedPDBStream(BatchedProteinPDBStream):
                  seqres_aa="clusterSeqresAA", seqres_na="clusterSeqresNA",
                  assembly=True, min_size=32, max_size=None, spatial_crop_monomer=0.0,
                  legacy_repetitive_chains=True,
-                 base_dataset=ProteinPDB):
+                 base_dataset=ProteinPDB,
+                 format="atom24"):
         super().__init__(path, start_date, cutoff_date, cutoff_resolution,
                          size, p_complex, seqres_aa, seqres_na, assembly,
                          min_size, max_size, legacy_repetitive_chains,
-                         base_dataset)
+                         base_dataset, format=format)
         self.spatial_crop_monomer = spatial_crop_monomer
 
     def next_item(self) -> Dict[str, np.ndarray]:
@@ -1113,14 +1143,16 @@ class BinderPDBStream(IterableDataset):
                  seqres_na="clusterSeqresNA",
                  assembly=True,
                  min_size=32,
-                 max_size=None) -> None:
+                 max_size=None,
+                 format="atom24") -> None:
         super().__init__()
         self.protein_pdb = ProteinBinderPDB(
             path, size,
             start_date, cutoff_date, cutoff_resolution,
             seqres_aa=seqres_aa,
             seqres_na=seqres_na,
-            assembly=assembly)
+            assembly=assembly,
+            format=format)
         self.size = size
         self.min_size = min_size
         self.max_size = max_size or size

@@ -338,7 +338,7 @@ def _AAUpdateParams(upd) -> dict:
 
 def _DecoderPrepareFeaturesParams(dec) -> dict:
     # salad: structure_autoencoder/diffusion/~prepare_features/*
-    return {
+    out = {
         "layer_norm": LayerNormParams(dec.prev_local_ln),
         "mlp": {
             "linear": LinearParams(dec.local_mlp.layers[0].lin, has_bias=False),
@@ -346,6 +346,16 @@ def _DecoderPrepareFeaturesParams(dec) -> dict:
         },
         "layer_norm_1": LayerNormParams(dec.local_ln),
     }
+    if getattr(dec, "prev_local_ln_atom37", None) is not None:
+        out.update({
+            "atom37_prev_local_norm": LayerNormParams(dec.prev_local_ln_atom37),
+            "atom37_decoder_input": {
+                "linear":   LinearParams(dec.local_mlp_atom37.layers[0].lin, has_bias=False),
+                "linear_1": LinearParams(dec.local_mlp_atom37.layers[1].lin, has_bias=False),
+            },
+            "atom37_decoder_input_norm": LayerNormParams(dec.local_ln_atom37),
+        })
+    return out
 
 
 def _AnglePosMLPParams(dec) -> dict:
@@ -409,6 +419,22 @@ def _DistogramParams(dist) -> dict:
     }
 
 
+def _DecoderUpdateAtom37Params(upd) -> dict:
+    # salad: light_global_update_atom37/*
+    # Order: mlp first (pos_mlp), then local_update, local_gate, chain_gate, batch_gate, out
+    return {
+        "mlp": {
+            "linear":   LinearParams(upd.pos_mlp.layers[0].lin, has_bias=True),
+            "linear_1": LinearParams(upd.pos_mlp.layers[1].lin, has_bias=True),
+        },
+        "linear":   LinearParams(upd.local_update.lin, has_bias=False),
+        "linear_1": LinearParams(upd.local_gate.lin,   has_bias=False),
+        "linear_2": LinearParams(upd.chain_gate.lin,   has_bias=False),
+        "linear_3": LinearParams(upd.batch_gate.lin,   has_bias=False),
+        "linear_4": LinearParams(upd.out.lin,          has_bias=True),
+    }
+
+
 def _DecoderUpdateParams(upd) -> dict:
     return {
         "linear": LinearParams(upd.local_update.lin, has_bias=False),
@@ -421,6 +447,101 @@ def _DecoderUpdateParams(upd) -> dict:
             "linear_1": LinearParams(upd.pos_mlp.layers[1].lin, has_bias=True),
         },
     }
+
+
+def _DecoderBlockAtom37Params(block) -> dict:
+    # salad: decoder_stack_atom37/__layer_stack_with_state/decoder_block_atom37/*
+    #
+    # Haiku linear numbering within DecoderBlockAtom37.__call__:
+    #   linear–linear_8   : pair_features_main (p_relpos,p_dmap,p_dist,p_dir,p_rot,p_vec,
+    #                        p_local_self,p_local_self_j,p_local_neigh)
+    #   mlp               : pair_features_main.mlp
+    #   sparse_structure_attn : attn_main
+    #   linear_9–linear_17: pair_features_dist (same order)
+    #   mlp_1             : pair_features_dist.mlp
+    #   sparse_structure_attn_1 : attn_dist
+    #   light_global_update_atom37: update
+    #   linear_18         : pos_update.proj  (from update_positions_atom37())
+    #
+    # Haiku layer_norm numbering:
+    #   layer_norm   : pair_features_main.ln
+    #   layer_norm_1 : ln_attn_main
+    #   layer_norm_2 : pair_features_dist.ln
+    #   layer_norm_3 : ln_attn_dist
+    #   layer_norm_4 : ln_update
+    #   layer_norm_5 : ln_pos
+
+    # UpdatePositionsAtom37 lazily creates proj on first forward pass; materialise here.
+    if block.pos_update.proj is None:
+        from caesar.modules.basic import Linear as _Lin
+        block.pos_update.proj = _Lin(37 * 3, initializer="zeros", bias=False)
+        block.pos_update._A = 37
+
+    pf_m = block.pair_features_main
+    pf_d = block.pair_features_dist
+
+    out = {
+        "layer_norm":   LayerNormParams(pf_m.ln),
+        "layer_norm_1": LayerNormParams(block.ln_attn_main),
+        "layer_norm_4": LayerNormParams(block.ln_update),
+        "layer_norm_5": LayerNormParams(block.ln_pos),
+
+        # pair_features_main linears
+        "linear":   LinearParams(pf_m.p_relpos.lin,      has_bias=False),
+        "linear_2": LinearParams(pf_m.p_dist.lin,        has_bias=False),
+        "linear_3": LinearParams(pf_m.p_dir.lin,         has_bias=False),
+        "linear_4": LinearParams(pf_m.p_rot.lin,         has_bias=False),
+        "linear_5": LinearParams(pf_m.p_vec.lin,         has_bias=False),
+        "linear_6": LinearParams(pf_m.p_local_self.lin,  has_bias=False),
+        "linear_7": LinearParams(pf_m.p_local_self_j.lin, has_bias=False),
+        "linear_8": LinearParams(pf_m.p_local_neigh.lin, has_bias=False),
+
+        "mlp": MLP2Params(pf_m.mlp, has_bias=True),
+
+        "sparse_structure_attn": {
+            "ada_point_attention": _AAPointAttnParams(block.attn_main.attn),
+        },
+
+        "light_global_update_atom37": _DecoderUpdateAtom37Params(block.update),
+
+        # update_positions_atom37 creates one Linear in DecoderBlockAtom37 scope
+        "linear_18": LinearParams(block.pos_update.proj.lin, has_bias=False),
+    }
+
+    if pf_m.p_dmap is not None:
+        out["linear_1"] = LinearParams(pf_m.p_dmap.lin, has_bias=False)
+
+    if pf_d is not None:
+        out.update({
+            "layer_norm_2": LayerNormParams(pf_d.ln),
+            "layer_norm_3": LayerNormParams(block.ln_attn_dist),
+
+            "linear_9":  LinearParams(pf_d.p_relpos.lin,      has_bias=False),
+            "linear_11": LinearParams(pf_d.p_dist.lin,        has_bias=False),
+            "linear_12": LinearParams(pf_d.p_dir.lin,         has_bias=False),
+            "linear_13": LinearParams(pf_d.p_rot.lin,         has_bias=False),
+            "linear_14": LinearParams(pf_d.p_vec.lin,         has_bias=False),
+            "linear_15": LinearParams(pf_d.p_local_self.lin,  has_bias=False),
+            "linear_16": LinearParams(pf_d.p_local_self_j.lin, has_bias=False),
+            "linear_17": LinearParams(pf_d.p_local_neigh.lin, has_bias=False),
+
+            "mlp_1": MLP2Params(pf_d.mlp, has_bias=True),
+
+            "sparse_structure_attn_1": {
+                "ada_point_attention": _AAPointAttnParams(block.attn_dist.attn),
+            },
+        })
+        if pf_d.p_dmap is not None:
+            out["linear_10"] = LinearParams(pf_d.p_dmap.lin, has_bias=False)
+
+    if getattr(block, "distogram", None) is not None:
+        out["inner_distogram"] = {
+            "inner_weight": Other(block.distogram.inner_weight),
+            "linear":   LinearParams(block.distogram.code_proj.lin, has_bias=False),
+            "linear_1": LinearParams(block.distogram.gate_proj.lin, has_bias=False),
+        }
+
+    return out
 
 
 def _DecoderBlockParams(block) -> dict:
@@ -562,21 +683,34 @@ def generate_translation_dict_salad_structure_autoencoder(model) -> dict:
         )
 
     dec = model.decoder
-    dec_blocks = list(dec.decoder_stack.blocks)
-    dec_stack = stacked([_DecoderBlockParams(b) for b in dec_blocks])
+    atom37_main = getattr(dec, "decoder_stack37", None) is not None
+
+    diffusion: dict = {
+        "~prepare_features": _DecoderPrepareFeaturesParams(dec),
+        "mlp": _AnglePosMLPParams(dec),
+        "aa_decoder": _AADecoderParams(dec),
+    }
+
+    if atom37_main:
+        dec_blocks37 = list(dec.decoder_stack37.blocks)
+        dec_stack37 = stacked([_DecoderBlockAtom37Params(b) for b in dec_blocks37])
+        diffusion["decoder_stack_atom37"] = {
+            "__layer_stack_with_state": {
+                "decoder_block_atom37": dec_stack37,
+            },
+        }
+    else:
+        dec_blocks = list(dec.decoder_stack.blocks)
+        dec_stack = stacked([_DecoderBlockParams(b) for b in dec_blocks])
+        diffusion["decoder_stack"] = {
+            "__layer_stack_with_state": {
+                "decoder_block": dec_stack,
+            },
+        }
 
     translations = {
         "structure_autoencoder": {
-            "diffusion": {
-                "~prepare_features": _DecoderPrepareFeaturesParams(dec),
-                "mlp": _AnglePosMLPParams(dec),
-                "aa_decoder": _AADecoderParams(dec),
-                "decoder_stack": {
-                    "__layer_stack_with_state": {
-                        "decoder_block": dec_stack,
-                    },
-                },
-            },
+            "diffusion": diffusion,
             "encoder": _EncoderParams(model),
         },
     }

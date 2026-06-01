@@ -32,7 +32,9 @@ def model_step(config):
         return out
     return step
 
-def parse_input_data(path, size=1024):
+def parse_input_data(path, size=1024, data_format="atom24"):
+    if data_format not in ("atom24", "atom37"):
+        raise ValueError(f"Unsupported data_format={data_format!r}")
     file_names = os.listdir(path)
     for name in file_names:
         if not name.endswith(".pdb"):
@@ -53,11 +55,21 @@ def parse_input_data(path, size=1024):
             residue_index=resi,
             chain_index=chain,
             batch_index=batch,
-            all_atom_positions=atom_pos_14,
-            all_atom_mask=atom_mask_14,
             seq_mask=aatype != 20,
             residue_mask=atom_mask_37[:, 1]
         )
+        if data_format == "atom37":
+            data.update(
+                all_atom_positions=atom_pos_37,
+                all_atom_mask=atom_mask_37,
+                all_atom_positions_37=atom_pos_37,
+                all_atom_mask_37=atom_mask_37,
+            )
+        else:
+            data.update(
+                all_atom_positions=atom_pos_14,
+                all_atom_mask=atom_mask_14,
+            )
         data = pad_to_size(data, size=size)
         yield name, data
 
@@ -80,6 +92,8 @@ if __name__ == "__main__":
         out_path="outputs/",
         config="small_inner",
         path="inputs/",
+        data_format="atom24",
+        size=1024,
         diagnostics="False",
         trace="False",
         no_random="False",
@@ -113,7 +127,7 @@ if __name__ == "__main__":
     os.makedirs(f"{opt.out_path}/diagnostics/", exist_ok=True)
     with open(f"{opt.out_path}/diagnostics/scores.csv", "wt") as f_scores:
         f_scores.write(f"name,num_aa,recovery,perplexity,rmsd_ca,tm,lddt\n")
-        for name, data in parse_input_data(opt.path, size=1024):
+        for name, data in parse_input_data(opt.path, size=int(opt.size), data_format=opt.data_format):
             data["time"] = opt.time # FIXME: time input
             if opt.no_random == "True":
                 data["no_random"] = True
@@ -128,8 +142,12 @@ if __name__ == "__main__":
             out = slice_dict(out, mask)
             if trace is not None:
                 out["__trace"] = trace
-            atom37 = atom14_to_atom37(out["atom_pos"], out["aatype"])
-            atom37_mask = get_atom37_mask(out["aatype"])
+            if "pos37" in out:
+                atom37 = out["pos37"]
+                atom37_mask = data["all_atom_mask"][mask]
+            else:
+                atom37 = atom14_to_atom37(out["atom_pos"], out["aatype"])
+                atom37_mask = get_atom37_mask(out["aatype"])
             protein = Protein(np.array(atom37), np.array(out["aatype"]),
                             np.array(atom37_mask), np.array(data["residue_index"]),
                             np.array(data["chain_index"]),

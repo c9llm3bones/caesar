@@ -144,6 +144,7 @@ if __name__ == "__main__":
         path="network/",
         config="small_inner",
         data_path="",
+        data_format="atom24",
         num_aa=1024,
         p_complex=0.5,
         lr=1e-3,
@@ -170,6 +171,8 @@ if __name__ == "__main__":
     seed = int(opt.jax_seed)
     random.seed(seed)
     np.random.seed(seed)
+    if opt.data_format not in ("atom24", "atom37"):
+        raise ValueError(f"Unsupported data_format={opt.data_format!r}")
     multigpu = opt.multigpu == "True"
     NUM_DEVICES = jax.device_count()
     if not multigpu:
@@ -191,6 +194,7 @@ if __name__ == "__main__":
                                    seqres_aa="clusterSeqresAA",
                                    cutoff_resolution=4.0,
                                    p_complex=opt.p_complex,
+                                   format=opt.data_format,
                                    size=512, #1024,
                                    min_size=16,
                                    max_size=512, #1024,
@@ -208,6 +212,7 @@ if __name__ == "__main__":
                                          seqres_aa="clusterSeqresAA",
                                          cutoff_resolution=4.0,
                                          p_complex=opt.p_complex,
+                                         format=opt.data_format,
                                          size=512, #1024,
                                          min_size=16,
                                          max_size=512, #1024,
