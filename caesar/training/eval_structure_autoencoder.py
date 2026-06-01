@@ -87,6 +87,8 @@ def parse_input_data(path: str, size: int = 1024):
             batch_index=batch,
             all_atom_positions=atom_pos_37,
             all_atom_mask=atom_mask_37,
+            physical_all_atom_mask_37=atom_mask_37,
+            metric_all_atom_mask_37=atom_mask_37,
             seq_mask=(aatype != 20),
             residue_mask=atom_mask_37[:, 1],
         )
@@ -218,14 +220,19 @@ if __name__ == "__main__":
                     out = model(data_t, generator=subkey)
 
             out = slice_dict(out, mask)
-            atom37, atom37_mask = atom14_to_atom37(out["atom_pos"], out["aatype"])
+            if "pos37" in out:
+                atom37 = out["pos37"]
+                atom37_mask = data_t["all_atom_mask"][mask]
+            else:
+                atom37, atom37_mask = atom14_to_atom37(out["atom_pos"], out["aatype"])
+            mask_np = mask.detach().cpu().numpy().astype(bool)
 
             protein = Protein(
                 np.array(atom37.detach().cpu().numpy()),
                 np.array(out["aatype"].detach().cpu().numpy()),
                 np.array(atom37_mask.detach().cpu().numpy()),
-                np.array(data["residue_index"]),
-                np.array(data["chain_index"]),
+                np.array(data["residue_index"])[mask_np],
+                np.array(data["chain_index"])[mask_np],
                 np.stack([100 * np.array(out["lddt"].detach().cpu().numpy())] * 37, axis=-1),
             )
             pdb_string = to_pdb(protein)

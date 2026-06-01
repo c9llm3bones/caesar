@@ -665,6 +665,10 @@ class StructureDecoderInference(nn.Module):
         )
         if getattr(c, "codebook_size", 0):
             out["codebook_index"] = codebook_index
+        if "pos37" in result:
+            out["pos37"] = result["pos37"]
+            if "trajectory37" in result:
+                out["trajectory37"] = result["trajectory37"]
 
         if return_trace:
             return out, trace
@@ -1089,6 +1093,10 @@ class StructureAutoencoderInference(StructureAutoencoder):
         )
         if getattr(c, "codebook_size", 0):
             out["codebook_index"] = codebook_index
+        if "pos37" in result:
+            out["pos37"] = result["pos37"]
+            if "trajectory37" in result:
+                out["trajectory37"] = result["trajectory37"]
 
         if return_trace:
             return out, trace
