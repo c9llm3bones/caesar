@@ -52,6 +52,8 @@ def _bool_from_opt(value: Any) -> bool:
 
 def _first_nonfinite_in_state(model: torch.nn.Module, *, kind: str) -> Optional[Tuple[str, str]]:
     for name, param in model.named_parameters():
+        if isinstance(param, torch.nn.parameter.UninitializedParameter):
+            continue
         tensor = param if kind == "param" else param.grad
         if tensor is None:
             continue
