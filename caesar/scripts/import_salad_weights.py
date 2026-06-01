@@ -337,8 +337,18 @@ def _AAUpdateParams(upd) -> dict:
 
 # decoder (structure_autoencoder/diffusion/*)
 
-def _DecoderPrepareFeaturesParams(dec) -> dict:
+def _DecoderPrepareFeaturesParams(dec, *, atom37_main: bool = False) -> dict:
     # salad: structure_autoencoder/diffusion/~prepare_features/*
+    if atom37_main:
+        return {
+            "atom37_prev_local_norm": LayerNormParams(dec.prev_local_ln_atom37),
+            "atom37_decoder_input": {
+                "linear":   LinearParams(dec.local_mlp_atom37.layers[0].lin, has_bias=False),
+                "linear_1": LinearParams(dec.local_mlp_atom37.layers[1].lin, has_bias=False),
+            },
+            "atom37_decoder_input_norm": LayerNormParams(dec.local_ln_atom37),
+        }
+
     out = {
         "layer_norm": LayerNormParams(dec.prev_local_ln),
         "mlp": {
@@ -766,7 +776,7 @@ def generate_translation_dict_salad_structure_autoencoder(model) -> dict:
     atom37_main = getattr(dec, "decoder_stack37", None) is not None
 
     diffusion: dict = {
-        "~prepare_features": _DecoderPrepareFeaturesParams(dec),
+        "~prepare_features": _DecoderPrepareFeaturesParams(dec, atom37_main=atom37_main),
         "mlp": _AnglePosMLPParams(dec),
         "aa_decoder": _AADecoderParams(dec),
     }
