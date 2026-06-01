@@ -10,22 +10,32 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
   "torch>=2.0",
+  "tensorboard",
   "numpy",
   "scipy",
   "tqdm",
   "biopython",
-  "chex",
   "immutabledict",
   "ml-collections",
   "pydssp",
   "dm-tree",
-  "jax[cpu]==0.5.0",
-  "dm-haiku @ git+https://github.com/deepmind/dm-haiku@v0.0.14",
   "flexloop @ git+https://github.com/mjendrusch/flexloop.git",
   "gemmi",
   "pytest>=7.0",
   "pytest-cov",
+]
+
+[project.optional-dependencies]
+jax = [
+  "jax[cpu]==0.5.0",
+  "chex",
   "flax",
+  "dm-haiku @ git+https://github.com/deepmind/dm-haiku@v0.0.14",
+]
+web = [
+  "fastapi",
+  "uvicorn[standard]",
+  "python-multipart",
 ]
 
 [project.urls]
@@ -37,5 +47,8 @@ Issues = "https://github.com/c9llm3bones/caesar/issues"
 testpaths = ["tests"]
 python_files = "test_*.py"
 
-[tool.setuptools]
-packages = ["caesar"]
+[tool.setuptools.packages.find]
+include = ["caesar*"]
+
+[tool.setuptools.package-data]
+"caesar.web" = ["static/static/index.html"]

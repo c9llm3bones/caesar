@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Protein Autoencoder</title>
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f5f6fa; color: #222; }
+  header { background: #1a1a2e; color: #eee; padding: 14px 24px; font-size: 1.15rem; font-weight: 600; letter-spacing: .02em; }
+  nav { display: flex; gap: 0; background: #fff; border-bottom: 2px solid #e0e0e0; padding: 0 24px; }
+  .tab { padding: 12px 20px; cursor: pointer; border-bottom: 3px solid transparent; font-size: .95rem; transition: border-color .15s; }
+  .tab.active { border-bottom-color: #4f6ef7; color: #4f6ef7; font-weight: 600; }
+  .tab:hover:not(.active) { border-bottom-color: #bbb; }
+  .page { display: none; padding: 24px; max-width: 1100px; margin: 0 auto; }
+  .page.active { display: block; }
+  h2 { font-size: 1.05rem; font-weight: 600; margin-bottom: 14px; color: #333; }
+  .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px #0001; padding: 20px; margin-bottom: 20px; }
+  label { font-size: .9rem; color: #555; display: block; margin-bottom: 4px; }
+  input[type=file] { font-size: .9rem; margin-bottom: 10px; }
+  button.btn {
+    background: #4f6ef7; color: #fff; border: none; border-radius: 6px;
+    padding: 9px 20px; cursor: pointer; font-size: .92rem; font-weight: 500;
+    transition: background .15s;
+  }
+  button.btn:disabled { background: #a0aec0; cursor: not-allowed; }
+  button.btn:hover:not(:disabled) { background: #3b56d4; }
+  button.btn-outline {
+    background: transparent; color: #4f6ef7; border: 1.5px solid #4f6ef7;
+    border-radius: 6px; padding: 8px 18px; cursor: pointer; font-size: .9rem;
+    transition: background .15s;
+  }
+  button.btn-outline:hover { background: #eef0ff; }
+  .viewers { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .viewer-wrap { position: relative; }
+  .viewer-label { font-size: .8rem; color: #666; text-align: center; margin-bottom: 4px; }
+  .mol-viewer { width: 100%; height: 420px; border-radius: 6px; border: 1px solid #ddd; background: #111; }
+  .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 10px; }
+  .metric-box { background: #f0f4ff; border-radius: 6px; padding: 10px 14px; }
+  .metric-name { font-size: .75rem; color: #666; margin-bottom: 2px; }
+  .metric-val { font-size: 1.1rem; font-weight: 700; color: #2d3a8c; }
+  .interp-controls { display: flex; align-items: center; gap: 16px; margin: 12px 0; }
+  .interp-controls input[type=range] { flex: 1; accent-color: #4f6ef7; }
+  .alpha-label { font-size: .95rem; font-weight: 600; min-width: 60px; }
+  .status { font-size: .85rem; color: #555; margin-top: 8px; min-height: 1.2em; }
+  .status.error { color: #c0392b; }
+  .status.ok { color: #27ae60; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #bbb; border-top-color: #4f6ef7; border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .latent-section { margin-top: 16px; }
+  .sep { border: none; border-top: 1px solid #eee; margin: 18px 0; }
+</style>
+</head>
+<body>
+
+<header>Protein Structure Autoencoder</header>
+
+<nav>
+  <div class="tab active" onclick="switchTab('reconstruct')">Reconstruction</div>
+  <div class="tab" onclick="switchTab('interpolate')">Interpolation</div>
+  <div class="tab" onclick="switchTab('latent')">Latent Vector</div>
+</nav>
+
+<!-- ============================================================ -->
+<!--  TAB 1: Reconstruction                                        -->
+<!-- ============================================================ -->
+<div id="page-reconstruct" class="page active">
+  <div class="card">
+    <h2>Reconstruct a protein structure</h2>
+    <div class="row">
+      <div>
+        <label>PDB / mmCIF file</label>
+        <input type="file" id="r-file" accept=".pdb,.cif,.ent">
+      </div>
+      <button class="btn" onclick="doReconstruct()">Run</button>
+    </div>
+    <div class="status" id="r-status"></div>
+  </div>
+
+  <div class="card" id="r-metrics-card" style="display:none">
+    <h2>Metrics</h2>
+    <div class="metrics-grid" id="r-metrics"></div>
+  </div>
+
+  <div class="viewers" id="r-viewers" style="display:none">
+    <div class="viewer-wrap">
+      <div class="viewer-label">Original</div>
+      <div class="mol-viewer" id="r-viewer-orig"></div>
+    </div>
+    <div class="viewer-wrap">
+      <div class="viewer-label">Reconstructed</div>
+      <div class="mol-viewer" id="r-viewer-recon"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!--  TAB 2: Interpolation                                         -->
+<!-- ============================================================ -->
+<div id="page-interpolate" class="page">
+  <div class="card">
+    <h2>Interpolate between two structures</h2>
+    <div class="row">
+      <div>
+        <label>Structure A</label>
+        <input type="file" id="i-file-a" accept=".pdb,.cif,.ent">
+      </div>
+      <div>
+        <label>Structure B</label>
+        <input type="file" id="i-file-b" accept=".pdb,.cif,.ent">
+      </div>
+      <button class="btn" onclick="doInterpolate()">Run</button>
+    </div>
+    <div class="status" id="i-status"></div>
+  </div>
+
+  <div class="card" id="i-result-card" style="display:none">
+    <h2>Interpolated structure</h2>
+    <div class="interp-controls">
+      <span class="alpha-label" id="i-alpha-label">α = 0.00</span>
+      <input type="range" id="i-slider" min="0" max="4" step="1" value="0" oninput="showInterp(this.value)">
+      <button class="btn-outline" onclick="downloadInterp()">Download PDB</button>
+    </div>
+    <div class="viewer-wrap">
+      <div class="mol-viewer" id="i-viewer"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!--  TAB 3: Latent Vector                                         -->
+<!-- ============================================================ -->
+<div id="page-latent" class="page">
+  <div class="card">
+    <h2>Encode → download latent vector (.npz)</h2>
+    <div class="row">
+      <div>
+        <label>PDB / mmCIF file</label>
+        <input type="file" id="e-file" accept=".pdb,.cif,.ent">
+      </div>
+      <button class="btn" onclick="doEncode()">Encode</button>
+    </div>
+    <div class="status" id="e-status"></div>
+  </div>
+
+  <hr class="sep">
+
+  <div class="card">
+    <h2>Decode latent vector → download PDB</h2>
+    <div class="row">
+      <div>
+        <label>.npz file (key "latent", shape [L, 320])</label>
+        <input type="file" id="d-file" accept=".npz">
+      </div>
+      <button class="btn" onclick="doDecode()">Decode</button>
+    </div>
+    <div class="status" id="d-status"></div>
+  </div>
+</div>
+
+<script>
+// ----------------------------------------------------------------
+// Tab switching
+// ----------------------------------------------------------------
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    const names = ['reconstruct', 'interpolate', 'latent'];
+    t.classList.toggle('active', names[i] === name);
+  });
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+}
+
+// ----------------------------------------------------------------
+// 3Dmol helpers
+// ----------------------------------------------------------------
+const viewers = {};
+
+function getViewer(id) {
+  if (viewers[id]) return viewers[id];
+  const el = document.getElementById(id);
+  const v = $3Dmol.createViewer(el, { backgroundColor: '#111' });
+  viewers[id] = v;
+  return v;
+}
+
+function showPDB(viewerId, pdbStr) {
+  const v = getViewer(viewerId);
+  v.clear();
+  v.addModel(pdbStr, 'pdb');
+  v.setStyle({}, { cartoon: { colorscheme: 'spectrum' } });
+  v.zoomTo();
+  v.render();
+}
+
+// ----------------------------------------------------------------
+// Status helper
+// ----------------------------------------------------------------
+function setStatus(id, msg, cls) {
+  const el = document.getElementById(id);
+  el.className = 'status' + (cls ? ' ' + cls : '');
+  el.innerHTML = msg;
+}
+
+function spinning(id, msg) {
+  setStatus(id, `<span class="spinner"></span>${msg}`);
+}
+
+// ----------------------------------------------------------------
+// Tab 1: Reconstruct
+// ----------------------------------------------------------------
+async function doReconstruct() {
+  const fileEl = document.getElementById('r-file');
+  if (!fileEl.files.length) { setStatus('r-status', 'Select a PDB file.', 'error'); return; }
+  spinning('r-status', 'Running encoder + decoder…');
+  document.getElementById('r-metrics-card').style.display = 'none';
+  document.getElementById('r-viewers').style.display = 'none';
+
+  const fd = new FormData();
+  fd.append('file', fileEl.files[0]);
+  try {
+    const res = await fetch('/api/reconstruct', { method: 'POST', body: fd });
+    if (!res.ok) { const t = await res.text(); throw new Error(t); }
+    const data = await res.json();
+
+    // metrics
+    const metricNames = {
+      rmsd_ca: 'RMSD Cα (Å)', rmsd_full_atom: 'RMSD all-atom (Å)',
+      tm_score: 'TM-score', lddt: 'lDDT', recovery: 'Seq. recovery',
+      num_residues: 'Residues',
+    };
+    const grid = document.getElementById('r-metrics');
+    grid.innerHTML = Object.entries(data.metrics).map(([k, v]) => `
+      <div class="metric-box">
+        <div class="metric-name">${metricNames[k] || k}</div>
+        <div class="metric-val">${typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(3) : v}</div>
+      </div>`).join('');
+    document.getElementById('r-metrics-card').style.display = '';
+
+    // viewers
+    document.getElementById('r-viewers').style.display = '';
+    showPDB('r-viewer-orig', data.pdb_original);
+    showPDB('r-viewer-recon', data.pdb_reconstructed);
+    setStatus('r-status', 'Done.', 'ok');
+  } catch (e) {
+    setStatus('r-status', 'Error: ' + e.message, 'error');
+  }
+}
+
+// ----------------------------------------------------------------
+// Tab 2: Interpolation
+// ----------------------------------------------------------------
+let interpStructures = [];
+const ALPHAS = [0.0, 0.25, 0.5, 0.75, 1.0];
+
+async function doInterpolate() {
+  const fa = document.getElementById('i-file-a');
+  const fb = document.getElementById('i-file-b');
+  if (!fa.files.length || !fb.files.length) {
+    setStatus('i-status', 'Select both PDB files.', 'error'); return;
+  }
+  spinning('i-status', 'Encoding and interpolating…');
+  document.getElementById('i-result-card').style.display = 'none';
+  interpStructures = [];
+
+  const fd = new FormData();
+  fd.append('file_a', fa.files[0]);
+  fd.append('file_b', fb.files[0]);
+  try {
+    const res = await fetch('/api/interpolate', { method: 'POST', body: fd });
+    if (!res.ok) { const t = await res.text(); throw new Error(t); }
+    const data = await res.json();
+    interpStructures = data.structures;
+    document.getElementById('i-result-card').style.display = '';
+    document.getElementById('i-slider').value = 0;
+    showInterp(0);
+    setStatus('i-status', 'Done.', 'ok');
+  } catch (e) {
+    setStatus('i-status', 'Error: ' + e.message, 'error');
+  }
+}
+
+function showInterp(idx) {
+  idx = parseInt(idx);
+  if (!interpStructures.length) return;
+  const s = interpStructures[idx];
+  document.getElementById('i-alpha-label').textContent = `α = ${s.alpha.toFixed(2)}`;
+  showPDB('i-viewer', s.pdb);
+}
+
+function downloadInterp() {
+  const idx = parseInt(document.getElementById('i-slider').value);
+  if (!interpStructures.length) return;
+  const s = interpStructures[idx];
+  downloadText(s.pdb, `interp_alpha_${s.alpha.toFixed(2)}.pdb`);
+}
+
+// ----------------------------------------------------------------
+// Tab 3: Encode / Decode
+// ----------------------------------------------------------------
+async function doEncode() {
+  const fileEl = document.getElementById('e-file');
+  if (!fileEl.files.length) { setStatus('e-status', 'Select a PDB file.', 'error'); return; }
+  spinning('e-status', 'Encoding…');
+
+  const fd = new FormData();
+  fd.append('file', fileEl.files[0]);
+  try {
+    const res = await fetch('/api/encode', { method: 'POST', body: fd });
+    if (!res.ok) { const t = await res.text(); throw new Error(t); }
+    const blob = await res.blob();
+    downloadBlob(blob, 'latent.npz');
+    setStatus('e-status', 'Done — latent.npz downloaded.', 'ok');
+  } catch (e) {
+    setStatus('e-status', 'Error: ' + e.message, 'error');
+  }
+}
+
+async function doDecode() {
+  const fileEl = document.getElementById('d-file');
+  if (!fileEl.files.length) { setStatus('d-status', 'Select a .npz file.', 'error'); return; }
+  spinning('d-status', 'Decoding…');
+
+  const fd = new FormData();
+  fd.append('file', fileEl.files[0]);
+  try {
+    const res = await fetch('/api/decode', { method: 'POST', body: fd });
+    if (!res.ok) { const t = await res.text(); throw new Error(t); }
+    const blob = await res.blob();
+    downloadBlob(blob, 'decoded.pdb');
+    setStatus('d-status', 'Done — decoded.pdb downloaded.', 'ok');
+  } catch (e) {
+    setStatus('d-status', 'Error: ' + e.message, 'error');
+  }
+}
+
+// ----------------------------------------------------------------
+// Download helpers
+// ----------------------------------------------------------------
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function downloadText(text, name) {
+  downloadBlob(new Blob([text], { type: 'text/plain' }), name);
+}
+</script>
+</body>
+</html>
