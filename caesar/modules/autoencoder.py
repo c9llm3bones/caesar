@@ -1014,21 +1014,24 @@ class StructureAutoencoderInference(StructureAutoencoder):
         lddt_ca = (in_threshold.sum(dim=1).to(dtype=aa_nll.dtype) / denom).mean(dim=-1)
         lddt_ca = torch.where(mask, lddt_ca, torch.zeros_like(lddt_ca))
 
-        # AlphaFold-style violation loss (JAX-salad compatible API)
-        res_mask = mask_f
-        pred_mask = get_atom14_mask(aatype).to(device=res_mask.device, dtype=res_mask.dtype) * res_mask[:, None]
-        violation_error, _ = violation_loss(
-            aatype,
-            data["residue_index"],
-            result["atom_pos"],
-            pred_mask,
-            res_mask,
-            clash_overlap_tolerance=1.5,
-            violation_tolerance_factor=2.0,
-            chain_index=data["chain_index"],
-            batch_index=data["batch_index"],
-            per_residue=False,
-        )
+        if getattr(c, "compute_violation", True):
+            # AlphaFold-style violation loss (JAX-salad compatible API)
+            res_mask = mask_f
+            pred_mask = get_atom14_mask(aatype).to(device=res_mask.device, dtype=res_mask.dtype) * res_mask[:, None]
+            violation_error, _ = violation_loss(
+                aatype,
+                data["residue_index"],
+                result["atom_pos"],
+                pred_mask,
+                res_mask,
+                clash_overlap_tolerance=1.5,
+                violation_tolerance_factor=2.0,
+                chain_index=data["chain_index"],
+                batch_index=data["batch_index"],
+                per_residue=False,
+            )
+        else:
+            violation_error = torch.zeros((), device=mask_f.device, dtype=mask_f.dtype)
 
         latent_out = data["latent"]
         if "predicted_latent" in result:

@@ -93,6 +93,7 @@ if __name__ == "__main__":
         num_recycle=4,
         jax_seed=42,
         save_imported_path="",
+        compute_violation="False",
     )
 
     print(f"Running decoder with {int(opt.num_recycle) + 1} steps on files in {opt.path}")
@@ -101,6 +102,7 @@ if __name__ == "__main__":
     config = deepcopy(getattr(config_choices, opt.config))
     config.eval = True
     config.num_recycle = int(opt.num_recycle)
+    config.compute_violation = (opt.compute_violation == "True")
     if opt.no_random == "True":
         config.num_random_neighbours = 0
         config.fape_neighbours = 0
