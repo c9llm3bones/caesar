@@ -608,13 +608,15 @@ class ProteinPDBSample(AllPDBSample):
                  cutoff_resolution=4,
                  seqres_aa="clusterSeqresAA",
                  seqres_na="clusterSeqresNA",
-                 assembly=True) -> None:
+                 assembly=True,
+                 seed=None) -> None:
         super().__init__(
             path, start_date, cutoff_date,
             cutoff_resolution, ["AA"],
             seqres_aa=seqres_aa,
             seqres_na=seqres_na,
-            assembly=assembly)
+            assembly=assembly,
+            seed=seed)
         self.format = "atom24"
         self.aa_order = np.array(
             ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN',
