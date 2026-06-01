@@ -652,8 +652,8 @@ class ProteinPDBSample(AllPDBSample):
             atom37_assignment = np.argmax(
                 atom_name[:, :, None] == self.atom_order_37[None, None, :], axis=-2)
             idb = np.arange(atom_name.shape[0], dtype=np.int32)
-            all_atom_positions = all_atom_positions[idb[:, None], atom37_assignment]
-            all_atom_mask = all_atom_mask[idb[:, None], atom37_assignment]
+            all_atom_positions = all_atom_positions[idb[:, None], atom37_assignment[:, :37]]
+            all_atom_mask = all_atom_mask[idb[:, None], atom37_assignment[:, :37]]
         return dict(
             aa_gt=aa_gt,
             residue_index=residue_index,
