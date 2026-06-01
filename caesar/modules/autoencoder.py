@@ -611,7 +611,7 @@ class StructureDecoderInference(nn.Module):
             aa_gt = aa_gt.long()
 
         aa_pred = result["aa"]  
-        aa_onehot = F.one_hot(aa_gt, 20).to(dtype=aa_pred.dtype)
+        aa_onehot = F.one_hot(aa_gt.clamp(0, 19), 20).to(dtype=aa_pred.dtype)
 
         aa_nll = -(aa_pred * aa_onehot).sum(dim=-1)
         aa_nll = torch.where(mask, aa_nll, torch.zeros_like(aa_nll))
@@ -973,7 +973,7 @@ class StructureAutoencoderInference(StructureAutoencoder):
         aa_gt = data["aa_gt"]
         if aa_gt.dtype != torch.long:
             aa_gt = aa_gt.long()
-        aa_onehot = F.one_hot(aa_gt, 20).to(dtype=aa_logits_or_logprobs.dtype)
+        aa_onehot = F.one_hot(aa_gt.clamp(0, 19), 20).to(dtype=aa_logits_or_logprobs.dtype)
         aa_nll = -(aa_logits_or_logprobs * aa_onehot).sum(dim=-1)
         aa_nll = torch.where(mask, aa_nll, torch.zeros_like(aa_nll))
         mask_f = mask.to(dtype=aa_nll.dtype)
