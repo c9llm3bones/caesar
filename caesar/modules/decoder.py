@@ -1603,6 +1603,21 @@ class DecoderUpdateAtom37(nn.Module):
         return self.out(hidden)
 
 
+def inject_pos_backbone_into_pos37(pos37: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    """Copy backbone [N, CA, C, O] from NCACOCB pos into atom37 coordinates.
+
+    pos is NCACOCB format: [N=0, CA=1, C=2, O=3, CB=4].
+    pos37 is atom37 format: [N=0, CA=1, C=2, CB=3, O=4, ...].
+    O lives at index 3 in NCACOCB but at index 4 in atom37.
+    """
+    pos37 = pos37.clone()
+    pos37[..., 0, :] = pos[..., 0, :]   # N
+    pos37[..., 1, :] = pos[..., 1, :]   # CA
+    pos37[..., 2, :] = pos[..., 2, :]   # C
+    pos37[..., 4, :] = pos[..., 3, :]   # O: NCACOCB[3] → atom37[4]
+    return pos37
+
+
 class UpdatePositionsAtom37(nn.Module):
     """Equivariant position update for atom37 coordinates."""
     def __init__(self):
@@ -1611,7 +1626,8 @@ class UpdatePositionsAtom37(nn.Module):
         self._A: Optional[int] = None
 
     def forward(self, pos37: torch.Tensor, local_norm: torch.Tensor, *,
-                scale: float = 10.0, symm=None) -> torch.Tensor:
+                scale: float = 10.0, symm=None,
+                backbone_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         A = int(pos37.shape[-2])
         if self.proj is None:
             self._A = A
@@ -1626,7 +1642,10 @@ class UpdatePositionsAtom37(nn.Module):
             pos_update = symm(pos_update)
         pos_update = Vec3Array.from_array(pos_update.reshape(pos_update.shape[0], A, 3))
         local_pos37 = local_pos37 + pos_update
-        return frames37[..., None].apply_to_point(local_pos37).to_tensor()
+        pos37 = frames37[..., None].apply_to_point(local_pos37).to_tensor()
+        if backbone_pos is not None:
+            pos37 = inject_pos_backbone_into_pos37(pos37, backbone_pos)
+        return pos37
 
 
 class DecoderBlockAtom37(nn.Module):
@@ -1671,20 +1690,19 @@ class DecoderBlockAtom37(nn.Module):
         c = self.config
         # CB from atom37 view for neighbours
         pos37_v = Vec3Array.from_array(pos37)
-        cb37 = Vec3Array.from_array(atom37_to_ncacocb(pos37)[:, -1])
-        dmap37 = (cb37[:, None] - cb37[None, :]).norm()
-
         distogram_logits = None
         dmap_neighbours = None
         if self.distogram is not None:
-            dist_full_logits, _ = self.distogram(features, resi, chain, batch, None)
+            dist_full_logits, dmap37 = self.distogram(features, resi, chain, batch, None)
             if sup_neighbours is None:
                 raise ValueError("sup_neighbours required when distogram is enabled")
             distogram_logits = _gather_dim1(dist_full_logits, sup_neighbours.long())
-            dmap_neighbours = self.dmap_neigh(dmap37.detach(), resi, chain, batch, mask,
-                                               generator=generator)
         else:
+            cb37 = Vec3Array.from_array(atom37_to_ncacocb(pos37)[:, -1])
+            dmap37 = (cb37[:, None] - cb37[None, :]).norm()
             distogram_logits = torch.zeros((1,), dtype=features.dtype, device=features.device)
+        dmap_neighbours = self.dmap_neigh(dmap37.detach(), resi, chain, batch, mask,
+                                           generator=generator)
 
         current_neighbours = self.current_neigh(pos37_v, resi, chain, batch, mask, generator=generator)
 
@@ -1695,7 +1713,7 @@ class DecoderBlockAtom37(nn.Module):
             pos37 / float(c.sigma_data), pair, pair_mask,
             current_neighbours, resi, chain, batch, mask)
 
-        if self.distogram is not None:
+        if self.pair_features_dist is not None:
             pair2, pair2_mask = self.pair_features_dist(
                 pos37, dmap37, dmap_neighbours, resi, chain, batch, mask, atom_mask37)
             features = features + self.attn_dist(
