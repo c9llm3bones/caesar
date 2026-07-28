@@ -1408,6 +1408,15 @@ def extract_dmap_neighbours(count: int = 32):
     def inner(distance, resi, chain, batch, mask, *, generator: torch.Generator | None = None):
         same_item = batch[:, None].eq(batch[None, :])
         mask_bool = mask.bool()
+        mask2 = same_item & mask_bool[:, None] & mask_bool[None, :]
+
+        if generator is None:
+            deterministic_distance = torch.where(
+                same_item,
+                distance,
+                torch.full_like(distance, float("inf")),
+            )
+            return get_neighbours(count)(deterministic_distance, mask2)
 
         weight = -3.0 * torch.log(distance + 1e-6)
 
@@ -1427,8 +1436,6 @@ def extract_dmap_neighbours(count: int = 32):
 
         inf = torch.tensor(torch.inf, device=distance2.device, dtype=distance2.dtype)
         distance2 = torch.where(same_item, distance2, inf)
-
-        mask2 = same_item & mask_bool[:, None] & mask_bool[None, :]
 
         return get_neighbours(count)(distance2, mask2)
 

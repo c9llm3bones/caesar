@@ -1,1024 +1,139 @@
-from typing import Optional
+"""Compatibility facade for tensor-native geometric modules.
+
+The original port kept JAX-style object wrappers in this file. The actual
+implementations now live in ``caesar.experimental.torch_native`` and operate on
+plain tensors. This module preserves the legacy import surface used by
+``encoder.py``/``decoder.py`` while moving hot-path math to tensor-native code.
+"""
+
+from __future__ import annotations
+
 import torch
 
-# def _is_compiling() -> bool:
-#     try:
-#         import torch.compiler as _compiler  # type: ignore
-#         return bool(_compiler.is_compiling())
-#     except Exception:
-#         return False
-
-# try:
-#     _dynamo_disable = torch.compiler.disable  # type: ignore[attr-defined]
-# except Exception:
-#     try:
-#         import torch._dynamo as _dynamo  # type: ignore
-#         _dynamo_disable = _dynamo.disable
-#     except Exception:
-#         def _dynamo_disable(fn):
-#             return fn
-# import numpy as np
-import torch.nn.functional as F
-import torch.nn as nn
-from caesar.utils.geometry import Vec3Array
-from caesar.modules.basic import Linear, MLP, init_linear, gelu_salad
-from caesar.modules.utils.geometry import (
-    distance_rbf, extract_aa_frames, 
-    sequence_relative_position, 
-    index_mean
+from caesar.experimental.torch_native import tensor_geometry as _tg
+from caesar.experimental.torch_native.native_geometric import (
+    DenseNonEquivariantPointAttentionNative,
+    LinearToPointsNative,
+    SemiEquivariantSparseStructureAttentionNative,
+    SparseAttentionNative,
+    SparseInvariantMultiQueryAttentionNative,
+    SparseInvariantPointAttentionNative,
+    SparseSemiEquivariantPointAttentionNative,
+    SparseStructureAttentionNative,
+    SparseStructureMessageNative,
 )
-from caesar.utils.all_atom_multimer import make_transform_from_reference
-
-from caesar.utils.geometry import Vec3Array, Rigid3Array
-
-def _gather_rows(source: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """Gather rows along dim 0 for an arbitrary index shape."""
-    if index.dtype != torch.long:
-        index = index.long()
-    flat_index = index.reshape(-1).remainder(source.shape[0])
-    gathered = torch.index_select(source, dim=0, index=flat_index)
-    return gathered.reshape(*index.shape, *source.shape[1:])
+from caesar.utils.geometry import Rigid3Array, Vec3Array
 
 
-def _gather_vec3(source: Vec3Array, index: torch.Tensor) -> Vec3Array:
-    return Vec3Array(
-        _gather_rows(source.x, index),
-        _gather_rows(source.y, index),
-        _gather_rows(source.z, index),
+def _to_tensor(x):
+    return x.to_tensor() if hasattr(x, "to_tensor") else x
+
+
+def _frame_to_tensor(frames):
+    return frames.to_tensor() if hasattr(frames, "to_tensor") else frames
+
+
+def extract_aa_frames(positions: Vec3Array | torch.Tensor) -> tuple[Rigid3Array, Vec3Array]:
+    """Extract residue frames and local atom positions.
+
+    Returns OpenFold-style wrappers for legacy callers, but computes the frame
+    math through tensor-native kernels.
+    """
+    pos = _to_tensor(positions)
+    rot, trans, local = _tg.local_positions(pos)
+    frames = Rigid3Array.from_array4x4(_tg.frame_tensor_from_rot_trans(rot, trans))
+    return frames, Vec3Array.from_array(local)
+
+
+def sequence_relative_position(
+    count: int | None = 32,
+    one_hot: bool = False,
+    cyclic: bool = False,
+    identify_ends: bool = False,
+    pseudo_chains: bool = False,
+):
+    return _tg.sequence_relative_position(
+        count=count,
+        one_hot=one_hot,
+        cyclic=cyclic,
+        identify_ends=identify_ends,
+        pseudo_chains=pseudo_chains,
     )
-
-
-def _gather_rigid(source: Rigid3Array, index: torch.Tensor) -> Rigid3Array:
-    rot = source.rotation
-    gathered_rot = type(rot)(
-        _gather_rows(rot.xx, index),
-        _gather_rows(rot.xy, index),
-        _gather_rows(rot.xz, index),
-        _gather_rows(rot.yx, index),
-        _gather_rows(rot.yy, index),
-        _gather_rows(rot.yz, index),
-        _gather_rows(rot.zx, index),
-        _gather_rows(rot.zy, index),
-        _gather_rows(rot.zz, index),
-    )
-    trans = source.translation
-    gathered_trans = Vec3Array(
-        _gather_rows(trans.x, index),
-        _gather_rows(trans.y, index),
-        _gather_rows(trans.z, index),
-    )
-    return Rigid3Array(gathered_rot, gathered_trans)
 
 
 def distance_features(pos, neighbours=None, d_min=0.0, d_max=22.0, num_rbf=16):
-    """Compute residue pair distance features.
-    
-    Args:
-        pos: residue atom positions of shape (N, M, 3).
-        neighbours: optional neighbour array.
-        d_min: minimum distance for binning. Default: 0.0.
-        d_max: maximum distance for binning. Default: 22.0.
-        num_rbf: number of radial basis functions.
-    Returns:
-        5 * 5 * 16 radial basis functions per residue pair.
-        If a neighbour array was provided, the output has shape (N, K, 400)
-        otherwise it has shape (N, N, 400).
-    """
-    if neighbours is None:
-        dist = (pos[:, None, :5, None] - pos[None, :, None, :5]).norm()
-    else:
-        pos_neighbours = _gather_vec3(pos, neighbours)
-        dist = (pos[:, None, :5, None] - pos_neighbours[:, :, None, :5]).norm()
-    dist = dist.reshape(*dist.shape[:-2], -1)
-    result = distance_rbf(dist, d_min, d_max, num_rbf).reshape(*dist.shape[:-1], -1)
-    return result
+    return _tg.distance_features(_to_tensor(pos), neighbours, d_min=d_min, d_max=d_max, num_rbf=num_rbf)
 
-# @_dynamo_disable
+
 def direction_features(pos, neighbours=None, d_min=0.0, d_max=22.0, num_rbf=16):
-    """Computes residue relative direction features.
-    
-    Args:
-        pos: residue atom positions of shape (N, atoms, 3).
-        neighbours: optional neighbour array.
-    Returns:
-        Direction vectors from the center of each residue frame to
-        all atoms in each of its neighbours (N, K, atoms, 3).
-    """
-    frames, _ = extract_aa_frames(pos)
-    if neighbours is None:
-        local_pos = frames[:, None, None].apply_inverse_to_point(pos[None, :])
-        dirs = local_pos.normalized().to_tensor()
-    else:
-        local_pos = frames[:, None, None].apply_inverse_to_point(
-            _gather_vec3(pos, neighbours)
-        )
-        dirs = local_pos.normalized().to_tensor()
-    result = dirs.reshape(*dirs.shape[:2], -1)
-    return result
+    del d_min, d_max, num_rbf
+    return _tg.direction_features(_to_tensor(pos), neighbours)
+
 
 def paired_distance_features(x, y, d_min=0.0, d_max=22.0, num_rbf=16):
-    """Compute distance features for a pair of structures x and y.
-    
-    Args:
-        x, y: residue atom positions of shape (N, atoms, 3).
-        d_min: minimum distance for binning. Default: 0.0.
-        d_max: maximum distance for binning. Default: 22.0.
-        num_rbf: number of radial basis functions.
-    Returns:
-        5 * 5 * 16 radial basis functions per residue pair.
-    """
-    dist = (x[..., :, None, :] - y[..., None, :, :]).norm()
-    dist = dist.reshape(*dist.shape[:-2], -1)
-    return distance_rbf(dist, d_min, d_max, num_rbf).reshape(*dist.shape[:-1], -1)
+    return _tg.paired_distance_features(_to_tensor(x), _to_tensor(y), d_min=d_min, d_max=d_max, num_rbf=num_rbf)
+
 
 def rotation_features(frames, neighbours=None):
-    """Relative rotation features for a set of residue frames and neighbours.
-    
-    Args:
-        frames (Rigid3Array): local coordinate frames for a set of residues.
-        neighbours (Optional[array]): neighbours of each residue
-    Returns:
-        Entries of the relative rotation matrix between
-        pairs of neighbouring residues (N, K, 9).
-    """
-    if neighbours is None:
-        rot = frames[:, None].inverse().rotation @ frames[None, :].rotation
+    if hasattr(frames, "rotation"):
+        rot = frames.rotation.to_tensor()
     else:
-        rot = frames[:, None].inverse().rotation @ _gather_rigid(frames, neighbours).rotation
-    rot = rot.to_tensor().reshape(*rot.shape, -1)
-    return rot
+        rot, _ = _tg.rot_trans_from_frame_tensor(frames)
+    return _tg.rotation_features_from_frames(rot, neighbours)
 
-def position_rotation_features(pos: Vec3Array, neighbours=None):
-    """Relative cotation features computed from atom positions.
-    
-    Args:
-        pos (Vec3Array): residue backbone atom coordinates.
-        neighbours (Optional[array]): neighbours of each residue
-    Returns:
-        Entries of the relative rotation matrix between
-        pairs of neighbouring residues (N, K, 9).
-    """
-    frames, _ = extract_aa_frames(pos)
-    if neighbours is None:
-        rot = frames[:, None].inverse().rotation @ frames[None, :].rotation
-    else:
-        rot = frames[:, None].inverse().rotation @ _gather_rigid(frames, neighbours).rotation
-    rot = rot.to_tensor().reshape(*rot.shape, -1)
-    return rot
+
+def position_rotation_features(pos, neighbours=None):
+    return _tg.position_rotation_features(_to_tensor(pos), neighbours)
+
 
 def paired_rotation_features(x, y):
-    """Compute rotation features for a pair of structures x and y.
-    
-    Args:
-        x, y: residue atom positions of shape (N, atoms, 3).
-        neighbours (Optional[array]): neighbours of each residue
-    Returns:
-        Entries of the relative rotation matrix between
-        pairs of residues in x and y.
-    """
-    x_frames = make_transform_from_reference(x[..., 0], x[..., 1], x[..., 2])
-    y_frames = make_transform_from_reference(y[..., 0], y[..., 1], y[..., 2])
-    rot = x_frames.inverse().rotation[:, None] @ y_frames.rotation[None, :]
-    return rot.to_tensor().reshape(*rot.shape, -1)
+    return _tg.paired_rotation_features(_to_tensor(x), _to_tensor(y))
+
 
 def pair_vector_features(pos, neighbours=None, scale: float = 0.1):
-    """Compute local coordinate features (PyTorch, close to JAX original).
-
-    Args:
-        pos: Vec3Array with shape (N, A) OR torch.Tensor with shape (N, A, 3).
-        neighbours: optional LongTensor (N, K). If None -> (N, N) broadcast arange.
-        scale: position scale factor.
-
-    Returns:
-        torch.Tensor of shape (N, K, 12*A) = concat([direction(=6*A), coords(=6*A)], -1).
-    """
-    if torch.is_tensor(pos):
-        # assert pos.ndim == 3 and pos.shape[-1] == 3, f"expected (N,A,3), got {tuple(pos.shape)}"
-        pos = Vec3Array.from_array(pos)
-    else:
-        assert isinstance(pos, Vec3Array), "pos must be Vec3Array or torch.Tensor (N,A,3)"
-
-    device = pos.x.device
-    N = pos.shape[0]
-    A = pos.shape[1]
-
-    if neighbours is None:
-        neighbours = torch.arange(N, device=device, dtype=torch.long)[None, :].expand(N, N)
-    else:
-        neighbours = torch.as_tensor(neighbours, device=device, dtype=torch.long)
-
-    frames, _ = extract_aa_frames(pos)  
-
-    pair_vectors = torch.cat((
-        # broadcast_to(frames.apply_inverse_to_point(pos[:,None])) to (N,K,A,3)
-        frames[:, None, None].apply_inverse_to_point(pos[:, None]).to_tensor()
-            .expand(neighbours.shape[0], neighbours.shape[1], A, 3),
-        # frames.apply_inverse_to_point(pos[neighbours]) -> (N,K,A,3)
-        frames[:, None, None].apply_inverse_to_point(_gather_vec3(pos, neighbours)).to_tensor(),
-    ), dim=-2)  
-
-    pair_vectors = Vec3Array.from_array(pair_vectors)  # (N,K,2A)
-
-    direction = pair_vectors.normalized().to_tensor().reshape(*pair_vectors.shape[:-1], -1)
-    coords = (scale * pair_vectors).to_tensor().reshape(*pair_vectors.shape[:-1], -1)
-
-    return torch.cat((direction, coords), dim=-1)
+    return _tg.pair_vector_features(_to_tensor(pos), neighbours, scale=scale)
 
 
-class LinearToPoints(nn.Module):
-    """Linear layer returning points in 3D space."""
-    def __init__(self, size: int = 8, init: str = "linear"):
-        super().__init__()
-        self.size = int(size)
-        self.init = init
-
-        self.proj = Linear(self.size * 3, bias=False, initializer=self.init)
-
+class LinearToPoints(LinearToPointsNative):
     def forward(self, data: torch.Tensor, frames):
-        dtype = data.dtype
+        return super().forward(data, _frame_to_tensor(frames))
 
-        raw = self.proj(data)
 
-        raw = raw.reshape(*raw.shape[:-1], self.size, 3)
-
-        points = Vec3Array.from_array(raw)                
-        points = frames[..., None].apply_to_point(points)
-
-        out = points.to_tensor()
-        if out.dtype != dtype:
-            out = out.to(dtype=dtype)
-        return out
-
-class SparseStructureMessage(nn.Module):
-    """Message passing wrapper."""
-
-    def __init__(self, config,):
-        super().__init__()
-        self.config = config
-        self.pair_mlp = MLP(
-            2 * int(config.pair_size),
-            out_size=None,
-            depth=3,
-            activation=gelu_salad,
-            final_init="zeros",
-        )
-
-    def forward(self, local, pos, pair, pair_mask, neighbours, resi, chain, batch, mask):
-        c = self.config
-
-        # if pos.dtype != torch.float32:
-        #     pos = pos.to(dtype=torch.float32)
-        pos = Vec3Array.from_array(pos)
-
-        pair = self.pair_mlp(pair)
-
-        local_update = torch.where(
-            pair_mask[..., None].bool(),
-            pair,
-            torch.zeros_like(pair)
-        ).sum(dim=1)
-
-        local_update = local_update / pair.shape[1]
-        return local_update
-    
-class SparseStructureAttention(nn.Module):
-    """Sparse attention wrapper."""
-
-    def __init__(self, config, normalize: bool = True):
-        super().__init__()
-        self.config = config
-        self.normalize = normalize
-
-        c = self.config
-        final_init = c.update_init if getattr(c, "update_init", None) else "zeros"
-
-        Attn = SparseInvariantMultiQueryAttention if getattr(c, "multi_query", False) else SparseInvariantPointAttention
-        self.attn = Attn(
-            heads=c.heads,
-            size=c.key_size,
-            final_init=final_init,
-            normalize=self.normalize,
-        )
-
-    def forward(
-        self,
-        local: torch.Tensor,
-        pos: torch.Tensor,
-        pair: torch.Tensor,
-        pair_mask: torch.Tensor,
-        neighbours: torch.Tensor,
-        resi: torch.Tensor,
-        chain: torch.Tensor,
-        batch: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        frames, _ = extract_aa_frames(Vec3Array.from_array(pos))
-        arr = frames.to_tensor()
-        # print("frames.to_tensor shape:", arr.shape, "dtype:", arr.dtype)
-        # print("frames.to_tensor[0]:", arr.reshape(-1, arr.shape[-1])[0])
-        frames_t = frames.to_tensor() if hasattr(frames, "to_tensor") else frames
-
-        local_update = self.attn(
-            local,
-            pair,
-            frames_t,
-            neighbours,
-            pair_mask,
-        )
-        return local_update
-
-class SemiEquivariantSparseStructureAttention(nn.Module):
-    """Sparse attention wrapper"""
-
-    def __init__(
-        self,
-        config,
-        normalize: bool = False
-    ):
-        super().__init__()
-        self.normalize = bool(normalize)
-        self.config = config
-
-        c = self.config
-        final_init = c.update_init if getattr(c, "update_init", None) else "zeros"
-
-        self.attn = SparseSemiEquivariantPointAttention(
-            heads=c.heads,
-            size=c.key_size,
-            final_init=final_init,
-            normalize=self.normalize,
-        )
-
-    def forward(self, local, pos, pair, pair_mask, neighbours, resi, chain, batch, mask):
-        c = self.config
-        local_update = self.attn(local, pair, pos, neighbours, pair_mask)
-        return local_update
-    
-class SparseInvariantMultiQueryAttention(nn.Module):
-    """Sparse IPA with multi-query attention."""
-
-    def __init__(
-        self,
-        *,
-        config,                  
-        size: int = 32,
-        heads: int = 4,
-        query_points: int = 8,
-        value_points: int = 8,
-        final_init: str = "zeros",
-        normalize: bool = False,
-        name: Optional[str] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.size = int(size)
-        self.heads = int(heads)
-        self.query_points = int(query_points)
-        self.value_points = int(value_points)
-        self.final_init = final_init
-        self.normalize = bool(normalize)
-
-        H, C, Q = self.heads, self.size, self.query_points
-
-        self.q_proj = Linear(H * C, bias=True, initializer="linear")
-        self.k_proj = Linear(1 * C, bias=True, initializer="linear")  # heads=1
-        self.v_proj = Linear(1 * C, bias=True, initializer="linear")  # heads=1
-
-        self.qp_proj = Linear(H * Q * 3, bias=True, initializer="linear")
-        self.kp_proj = Linear(1 * Q * 3, bias=True, initializer="linear")  # heads=1
-        self.vp_proj = Linear(1 * Q * 3, bias=True, initializer="linear")  # heads=1
-
-        self.pair_bias = Linear(H, bias=False, initializer="linear")
-
-        gamma0 = torch.log(torch.exp(torch.tensor(1.0)) - torch.tensor(1.0))
-        self.gamma = nn.Parameter(gamma0.repeat(H))  # (H,)
-
-        local_size = int(getattr(config, "local_size"))
-        self.out_proj = Linear(local_size, bias=False, initializer=final_init)
-
-    def _component(self, x: torch.Tensor, proj: Linear, heads: int) -> torch.Tensor:
-        y = proj(x)  # (N, heads*size)
-        return y.view(y.shape[0], heads, self.size)
-
-    def _points_global(self, x: torch.Tensor, proj: Linear, frames: Rigid3Array, heads: int) -> torch.Tensor:
-        N, H, Q = x.shape[0], heads, self.query_points
-        y = proj(x).view(N, H, Q, 3)                       # local
-        pts = Vec3Array.from_array(y)
-        pts_g = frames[:, None, None].apply_to_point(pts)  # global
-        return pts_g.to_tensor()
-
-    def _to_local(self, x_global: torch.Tensor, frames: Rigid3Array) -> torch.Tensor:
-        pts = Vec3Array.from_array(x_global)
-        pts_l = frames[:, None, None].apply_inverse_to_point(pts)
-        return pts_l.to_tensor() 
-
-    def forward(
-        self,
-        local: torch.Tensor,        # (N, C_local)
-        pair: torch.Tensor,         # (N, K, C_pair)
-        frames: torch.Tensor,        
-        neighbours: torch.Tensor,   # (N, K)
-        mask: torch.Tensor,         # (N, K)
-    ) -> torch.Tensor:
-        if isinstance(frames, Rigid3Array):
-            frames_r = frames
-        else:
-            # if frames.dtype != torch.float32:
-            #     frames = frames.to(dtype=torch.float32)
-            frames_r = Rigid3Array.from_array(frames)
-        # arr = frames_r.to_tensor()
-        # print("frames.to_tensor shape:", arr.shape, "dtype:", arr.dtype)
-        # print("frames.to_tensor[0]:", arr.reshape(-1, arr.shape[-1])[0])
-        neighbours = neighbours.long()
-        mask_bool = mask.bool()
-
-        N, K = neighbours.shape
-        H, C, Q = self.heads, self.size, self.query_points
-
-        q = self._component(local, self.q_proj, heads=H)
-        k = self._component(local, self.k_proj, heads=1)
-        v = self._component(local, self.v_proj, heads=1)
-
-        q = F.layer_norm(q, (C,), weight=None, bias=None)
-        k = F.layer_norm(k, (C,), weight=None, bias=None)
-
-        qp = self._points_global(local, self.qp_proj, frames_r, heads=H)   # (N,H,Q,3)
-        kp = self._points_global(local, self.kp_proj, frames_r, heads=1)   # (N,1,Q,3)
-        vp = self._points_global(local, self.vp_proj, frames_r, heads=1)   # (N,1,Q,3)
-
-        k_g = _gather_rows(k, neighbours)    # (N,K,1,C)
-        v_g = _gather_rows(v, neighbours)    # (N,K,1,C)
-        kp_g = _gather_rows(kp, neighbours)  # (N,K,1,Q,3)
-        vp_g = _gather_rows(vp, neighbours)  # (N,K,1,Q,3)
-
-        k_g = k_g.expand(-1, -1, H, -1)             # (N,K,H,C)
-        v_g = v_g.expand(-1, -1, H, -1)             # (N,K,H,C)
-        kp_g = kp_g.expand(-1, -1, H, -1, -1)       # (N,K,H,Q,3)
-        vp_g = vp_g.expand(-1, -1, H, -1, -1)       # (N,K,H,Q,3)
-
-        w_C = (2.0 / (9.0 * Q)) ** 0.5
-        w_L = (1.0 / 3.0) ** 0.5
-
-        scale = F.softplus(self.gamma.view(1, 1, H)) * w_C / 2.0  # (1,1,H)
-
-        attn_logits = (q.unsqueeze(1) * k_g).sum(dim=-1)          # (N,K,H)
-        attn_logits = attn_logits / (C ** 0.5)
-
-        dist = ((qp.unsqueeze(1) - kp_g) ** 2).sum(dim=(-1, -2))  # (N,K,H)
-
-        bias = self.pair_bias(pair)                                # (N,K,H)
-
-        attn_logits = w_L * (attn_logits - scale * dist + bias)
-
-        neg_inf = torch.full_like(attn_logits, -1e9)
-        attn_logits = torch.where(mask_bool.unsqueeze(-1), attn_logits, neg_inf)
-
-        attn = torch.softmax(attn_logits, dim=1)
-        attn = torch.where(mask_bool.unsqueeze(-1), attn, torch.zeros_like(attn))
-
-        local_update = torch.einsum("nkh,nkhc->nhc", attn, v_g).reshape(N, -1)   # (N,H*C)
-        pair_update  = torch.einsum("nkh,nkc->nhc",  attn, pair).reshape(N, -1) # (N,H*C_pair)
-
-        point_global = torch.einsum("nkh,nkhqd->nhqd", attn, vp_g)              # (N,H,Q,3)
-        point_local = self._to_local(point_global, frames_r).reshape(N, -1)    # (N,H*Q*3)
-
-        result = torch.cat([local_update, pair_update, point_local], dim=-1)
-        return self.out_proj(result)
-
-
-class SparseAttention(nn.Module):
-    """Sparse attention without point bias."""
-
-    def __init__(
-        self,
-        size: int = 32,
-        heads: int = 4,
-        final_init: str = "zeros",
-        normalize: bool = False
-    ):
-        super().__init__()
-        self.size = int(size)
-        self.heads = int(heads)
-        self.final_init = final_init
-        self.normalize = bool(normalize)
-
-        self.qkv = Linear(self.heads * 3 * self.size, bias=False, name="qkv")
-
-        self.ln_q = nn.LayerNorm(self.size, elementwise_affine=True)
-        self.ln_k = nn.LayerNorm(self.size, elementwise_affine=True)
-
-        self.bias = Linear(self.heads, bias=False, name="bias")
-
-        self._ln_local: Optional[nn.LayerNorm] = None
-        self._project_out: Optional[Linear] = None
-
-    def forward(self, local, pair, neighbours, mask):
-        if self.normalize:
-            if self._ln_local is None:
-                self._ln_local = nn.LayerNorm(
-                    local.shape[-1],
-                    elementwise_affine=True,
-                    device=local.device,
-                    dtype=local.dtype,
-                )
-            local = self._ln_local(local)
-
-        qkv = self.qkv(local).view(*local.shape[:-1], self.heads, 3 * self.size)
-        q, k, v = torch.split(qkv, self.size, dim=-1)
-
-        q = self.ln_q(q)
-        k = self.ln_k(k)
-
-        bias = self.bias(pair)
-        if bias.dim() < local.dim():
-            extension = (local.dim() - bias.dim()) * [1]
-            bias = bias.view(bias.shape[0], *extension, *bias.shape[1:])
-
-        w_L = (1.0 / 2.0) ** 0.5
-
-        if neighbours is not None:
-            neighbours = neighbours.long()
-
-        if neighbours is None:
-            k_neigh = k[None, :]
-            v_neigh = v[None, :]
-        else:
-            k_neigh = _gather_rows(k, neighbours)
-            v_neigh = _gather_rows(v, neighbours)
-
-        dot = (1.0 / self.size) ** 0.5 * (q.unsqueeze(1) * k_neigh).sum(dim=-1)
-        attn_logits = w_L * (dot + bias)
-
-        if neighbours is None:
-            pair_mask = mask
-        else:
-            pair_mask = mask * (neighbours != -1)
-
-        attn_logits = torch.where(
-            pair_mask[..., None].bool(),
-            attn_logits,
-            torch.full_like(attn_logits, -1e9),
-        )
-
-        attn = torch.softmax(attn_logits, dim=1)  
-        attn = torch.where(pair_mask[..., None].bool(), attn, torch.zeros_like(attn))
-
-        out_pair = torch.einsum("nkh,nkc->nhc", attn, pair)
-        out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v_neigh)
-
-        x = torch.cat(
-            [
-                out_pair.reshape(*out_pair.shape[:-2], -1),
-                out_scalar.reshape(*out_scalar.shape[:-2], -1),
-            ],
-            dim=-1,
-        )
-
-        if self._project_out is None:
-            self._project_out = Linear(
-                int(local.shape[-1]),
-                initializer=self.final_init,
-                name="project_out",
-                device=local.device,
-                dtype=local.dtype,
-            )
-
-        out = self._project_out(x)
-        if out.dtype != local.dtype:
-            out = out.to(dtype=local.dtype)
-        return out
-
-class DenseNonEquivariantPointAttention(nn.Module):
-    """EXPERIMENTAL. Non-equivariant point attention."""
-
-    def __init__(
-        self,
-        size: int = 32,
-        heads: int = 4,
-        query_points: int = 8,
-        value_points: int = 8,
-        final_init: str = "zeros",
-        normalize: bool = False,
-        use_pair: bool = False,
-        name: Optional[str] = "ada_point_attention",
-    ):
-        super().__init__()
-        self.size = int(size)
-        self.heads = int(heads)
-        self.query_points = int(query_points)
-        self.value_points = int(value_points)
-        self.final_init = final_init
-        self.use_pair = bool(use_pair)
-        self.normalize = bool(normalize)
-
-        H, C = self.heads, self.size
-        Q, V = self.query_points, self.value_points
-
-        self._ln_local: Optional[nn.LayerNorm] = None
-
-        self.q_proj = Linear(C * H, initializer="linear")
-        self.k_proj = Linear(C * H, initializer="linear")
-        self.v_proj = Linear(C * H, initializer="linear")
-
-        self.ln_q = nn.LayerNorm(C, elementwise_affine=True)
-        self.ln_k = nn.LayerNorm(C, elementwise_affine=True)
-
-        self.qp_proj = Linear(Q * H * 3, initializer="zeros")
-        self.kp_proj = Linear(Q * H * 3, initializer="zeros")
-        self.vp_proj = Linear(Q * H * 3, initializer="zeros")
-
-        self.relpos = sequence_relative_position(32, one_hot=True)
-
-        self.pair_lin = Linear(C + 3 * V, bias=False, initializer="linear")
-        self.bias_lin = Linear(H, initializer="linear")
-
-        # resi embedding table
-        emb = torch.empty(66, C + 3 * V)
-        init_linear()(emb)  
-        self.resi_embedding = nn.Parameter(emb)
-
-        gamma0 = torch.log(torch.exp(torch.tensor(1.0)) - torch.tensor(1.0))
-        self.gamma = nn.Parameter(gamma0.repeat(H))  # (H,)
-
-        self._out: Optional[Linear] = None
-
-    def forward(self, local, pos, resi, chain, batch, mask):
-        if self.normalize:
-            if self._ln_local is None:
-                self._ln_local = nn.LayerNorm(
-                    local.shape[-1],
-                    elementwise_affine=True,
-                    device=local.device,
-                    dtype=local.dtype,
-                )
-            local = self._ln_local(local)
-
-        H, C = self.heads, self.size
-        Q, V = self.query_points, self.value_points
-
-        same_batch = batch[:, None].eq(batch[None, :])
-        mask_bool = mask.bool()
-        pair_mask = mask_bool[:, None] & mask_bool[None, :] & same_batch
-
-        def attention_component(x, proj: Linear):
-            y = proj(x)  # (N, H*C)
-            return y.view(*y.shape[:-1], H, C)
-
-        def attention_point(x, proj: Linear):
-            y = proj(x)  # (N, H*Q*3)
-            y = y.view(*y.shape[:-1], H, Q, 3)
-            y = y + pos[:, 1][:, None, None]  
-            return y
-
-        query = self.ln_q(attention_component(local, self.q_proj))
-        key = self.ln_k(attention_component(local, self.k_proj))
-        value = attention_component(local, self.v_proj)
-
-        query_points = attention_point(local, self.qp_proj)
-        key_points = attention_point(local, self.kp_proj)
-        value_points = attention_point(local, self.vp_proj)
-
-        value = torch.cat((value, value_points.reshape(*value.shape[:-1], -1)), dim=-1)
-
-        inner_product_attention = torch.einsum(
-            "ihc,jhc->ijh",
-            query * ((1.0 / query.shape[-1]) ** 0.5),
-            key,
-        )
-
-        point_attention = -((query_points[:, None] - key_points[None, :]) ** 2).sum(dim=(-1, -2))
-
-        resi_dist = (resi[:, None] - resi[None, :]).clamp(-32, 32)
-        other_chain = chain[:, None].ne(chain[None, :])
-
-        ca = Vec3Array.from_array(10.0 * pos[:, 1])
-        dist = (ca[:, None] - ca[None, :]).norm()
-        dist = distance_rbf(dist, bins=16)
-
-        rel = (query_points[:, None] - key_points[None, :]).reshape(dist.shape[0], dist.shape[1], -1)
-
-        rdist = (resi_dist + 32).long()
-        rdist = torch.where(other_chain, torch.full_like(rdist, 65), rdist)
-        rdist_emb = self.resi_embedding[rdist]  # (N, N, C + 3*V)
-
-        pair = rdist_emb + self.pair_lin(torch.cat((rel, dist), dim=-1))
-        bias = self.bias_lin(torch.cat((rel, dist), dim=-1))  # (N, N, H)
-
-        pair = pair[:, :, None, :] + value[None, :]  # (N, N, H, C+3*V)
-
-        w_C = (2.0 / (9.0 * Q)) ** 0.5
-        point_scale = F.softplus(self.gamma.view(1, 1, H)) * w_C / 2.0
-
-        attn = (inner_product_attention + point_scale * point_attention + bias) * ((1.0 / 3.0) ** 0.5)
-        attn = torch.where(pair_mask[..., None], attn, torch.full_like(attn, -1e9))
-        attn = torch.softmax(attn, dim=1)
-        attn = torch.where(pair_mask[..., None], attn, torch.zeros_like(attn))
-
-        result = torch.einsum("ijh,ijhc->ihc", attn, pair).reshape(local.shape[0], -1)
-
-        if self._out is None:
-            self._out = Linear(
-                int(local.shape[-1]),
-                bias=False,
-                initializer="zeros",
-                device=local.device,
-                dtype=local.dtype,
-            )
-        out = self._out(result)
-        if out.dtype != local.dtype:
-            out = out.to(dtype=local.dtype)
-        return out
-
-class SparseSemiEquivariantPointAttention(nn.Module):
-    """Sparse IPA with additional non-equivariant features."""
-
-    def __init__(
-        self,
-        *,
-        config, 
-        size: int = 32,
-        heads: int = 4,
-        query_points: int = 8,
-        value_points: int = 8,
-        final_init: str = "zeros",
-        normalize: bool = False,
-        name: Optional[str] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.size = int(size)
-        self.heads = int(heads)
-        self.query_points = int(query_points)
-        self.value_points = int(value_points)
-        self.final_init = final_init
-        self.normalize = bool(normalize)
-
-        H, C = self.heads, self.size
-        Q, V = self.query_points, self.value_points
-
-        local_size = int(getattr(config, "local_size"))
-
-        self.ln_local = nn.LayerNorm(local_size, elementwise_affine=True)
-
-        self.qkv = Linear(H * 3 * C, bias=False, initializer="linear", name="qkv")
-
-        self.ln_q = nn.LayerNorm(C, elementwise_affine=True)
-        self.ln_k = nn.LayerNorm(C, elementwise_affine=True)
-
-        self.qkv_g = Linear(H * (2 * Q + V) * 3, bias=True, initializer="linear")
-
-        self.bias = Linear(H, bias=False, initializer="linear", name="bias")
-
-        gamma0 = torch.log(torch.exp(torch.tensor(1.0)) - torch.tensor(1.0))
-        self.gamma = nn.Parameter(gamma0.repeat(H))  # (H,)
-
-        self.project_out = Linear(local_size, bias=True, initializer=final_init, name="project_out")
-
-    def forward(
-        self,
-        local: torch.Tensor,                 
-        pair: torch.Tensor,                  
-        pos: torch.Tensor,                   
-        neighbours: Optional[torch.Tensor],  
-        mask: torch.Tensor,                  
-    ) -> torch.Tensor:
-        if self.normalize:
-            local = self.ln_local(local)
-
-        H, C = self.heads, self.size
-        Q, V = self.query_points, self.value_points
-
-        qkv = self.qkv(local)
-        qkv = qkv.view(*local.shape[:-1], H, 3 * C)
-        q, k, v = torch.split(qkv, C, dim=-1)
-
-        q = self.ln_q(q)
-        k = self.ln_k(k)
-
-        qkv_g = self.qkv_g(local)  # (..., H*(2Q+V)*3)
-        qkv_g = qkv_g.view(qkv_g.shape[0], -1, 3)
-
-        base = pos[:, 1, :]  # (N, 3)
-        qkv_g = qkv_g + base[:, None, :]           # (N, H*(2Q+V), 3)
-
-        qkv_g = qkv_g.view(qkv_g.shape[0], H, (2 * Q + V), 3)  # (N, H, 2Q+V, 3)
-        q_g, k_g, v_g = torch.split(qkv_g, [Q, Q, V], dim=-2)  # (N,H,Q,3), (N,H,Q,3), (N,H,V,3)
-
-        bias = self.bias(pair)  
-        if bias.dim() < local.dim():
-            extension = (local.dim() - bias.dim()) * [1]
-            bias = bias.view(bias.shape[0], *extension, *bias.shape[1:])
-
-        w_C = (2.0 / (9.0 * Q)) ** 0.5
-        w_L = (1.0 / 3.0) ** 0.5
-
-        dfactor = F.softplus(self.gamma.view(1, 1, H)) * w_C / 2.0  # (1,1,H)
-
-        if neighbours is None: # (c) here full-attn can be implemented
-            pair_mask = mask
-            raise NotImplementedError(
-                "neighbours=None branch is not supported in this port yet "
-                "(the original code has it, but downstream einsums expect neighbour dimension)."
-            )
-        else:
-            neighbours = neighbours.long()
-            pair_mask = mask * (neighbours != -1)
-
-        pair_mask_bool = pair_mask.bool()
-
-        k_n = _gather_rows(k, neighbours)  # (N,K,H,C)
-        v_n = _gather_rows(v, neighbours)  # (N,K,H,C)
-
-        k_gn = _gather_rows(k_g, neighbours)  # (N,K,H,Q,3)
-        v_gn = _gather_rows(v_g, neighbours)  # (N,K,H,V,3)
-
-        dist = dfactor * (q_g.unsqueeze(1) - k_gn).pow(2).sum(dim=(-1, -2))
-
-        dot = (1.0 / C) ** 0.5 * (q.unsqueeze(1) * k_n).sum(dim=-1)
-
-        attn_logits = w_L * (dot + bias - dist)
-
-        neg_inf = torch.full_like(attn_logits, -1e9)
-        attn_logits = torch.where(pair_mask_bool.unsqueeze(-1), attn_logits, neg_inf)
-
-        attn = torch.softmax(attn_logits, dim=1)
-        attn = torch.where(pair_mask_bool.unsqueeze(-1), attn, torch.zeros_like(attn))
-        # (N,H,C_pair)
-        out_pair = torch.einsum("nkh,nkc->nhc", attn, pair)
-
-        # (N,H,C)
-        out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v_n)
-
-        out_point = torch.einsum("nkh,nkhvd->nhvd", attn, v_gn)  # (N,H,V,3)
-
-        # if out_point.dtype != torch.float32:
-        #     out_point = out_point.to(dtype=torch.float32)
-        # if base.dtype != torch.float32:
-        #     base = base.to(dtype=torch.float32)
-        out_point_v = Vec3Array.from_array(out_point)
-        base_v = Vec3Array.from_array(base)[:, None, None]
-        out_point_v = out_point_v - base_v
-
-        out_norm = out_point_v.norm()  
-        out_point_t = out_point_v.to_tensor() 
-
-        out = torch.cat(
-            [
-                out_pair.reshape(out_pair.shape[0], -1),
-                out_scalar.reshape(out_scalar.shape[0], -1),
-                out_point_t.reshape(out_point_t.shape[0], -1),
-                out_norm.reshape(out_norm.shape[0], -1),
-            ],
-            dim=-1,
-        )
-
-        out = self.project_out(out)
-        if out.dtype != local.dtype:
-            out = out.to(dtype=local.dtype)
-        return out
-    
-class SparseInvariantPointAttention(nn.Module):
-    """Sparse IPA."""
-
-    def __init__(
-        self,
-        size: int = 32,
-        heads: int = 4,
-        query_points: int = 8,
-        value_points: int = 8,
-        final_init: str = "zeros",
-        normalize: bool = False
-    ):
-        super().__init__()
-        self.size = int(size)
-        self.heads = int(heads)
-        self.query_points = int(query_points)
-        self.value_points = int(value_points)
-        self.final_init = final_init
-        self.normalize = bool(normalize)
-
-        self.ln_q = nn.LayerNorm(self.size, elementwise_affine=True)
-        self.ln_k = nn.LayerNorm(self.size, elementwise_affine=True)
-
-        self.qkv = Linear(self.heads * 3 * self.size, bias=False, name="qkv")
-
-        self.qkv_global = LinearToPoints(
-            self.heads * (2 * self.query_points + self.value_points)
-        )
-
-        self.bias = Linear(self.heads, bias=False, name="bias")
-
-        gamma0 = torch.log(torch.exp(torch.tensor(1.0)) - torch.tensor(1.0))
-        self.gamma = nn.Parameter(gamma0.repeat(self.heads))  # (heads,)
-
-        self._ln_local: Optional[nn.LayerNorm] = None
-
-        self._project_out: Optional[Linear] = None
-
+class SparseInvariantPointAttention(SparseInvariantPointAttentionNative):
     def forward(self, local, pair, frames, neighbours, mask):
-        if self.normalize:
-            if self._ln_local is None:
-                self._ln_local = nn.LayerNorm(
-                    local.shape[-1],
-                    elementwise_affine=True,
-                    device=local.device,
-                    dtype=local.dtype,
-                )
-            local = self._ln_local(local)
-        if isinstance(frames, Rigid3Array):
-            frames = frames
-        else:
-            # if frames.dtype != torch.float32:
-            #     frames = frames.to(dtype=torch.float32)
-            frames = Rigid3Array.from_array(frames)
-        # arr = frames.to_tensor()
-        
-        qkv = self.qkv(local).view(*local.shape[:-1], self.heads, 3 * self.size)
-        q, k, v = torch.split(qkv, self.size, dim=-1)
+        return super().forward(local, pair, _frame_to_tensor(frames), neighbours, mask)
 
-        q = self.ln_q(q)
-        k = self.ln_k(k)
 
-        qkv_g = self.qkv_global(local, frames)
-        qkv_g = qkv_g.view(*qkv_g.shape[:-2], self.heads, -1, 3)
+class SparseInvariantMultiQueryAttention(SparseInvariantMultiQueryAttentionNative):
+    def forward(self, local, pair, frames, neighbours, mask):
+        return super().forward(local, pair, _frame_to_tensor(frames), neighbours, mask)
 
-        q_g, k_g, v_g = torch.split(
-            qkv_g,
-            [self.query_points, self.query_points, self.value_points],
-            dim=-2,
-        )
 
-        bias = self.bias(pair)
-        if bias.dim() < local.dim():
-            extension = (local.dim() - bias.dim()) * [1]
-            bias = bias.view(bias.shape[0], *extension, *bias.shape[1:])
+SparseStructureMessage = SparseStructureMessageNative
+SparseStructureAttention = SparseStructureAttentionNative
+SemiEquivariantSparseStructureAttention = SemiEquivariantSparseStructureAttentionNative
+SparseAttention = SparseAttentionNative
+DenseNonEquivariantPointAttention = DenseNonEquivariantPointAttentionNative
+SparseSemiEquivariantPointAttention = SparseSemiEquivariantPointAttentionNative
 
-        w_C = (2.0 / (9.0 * self.query_points)) ** 0.5
-        w_L = (1.0 / 3.0) ** 0.5
 
-        dfactor = F.softplus(self.gamma.view(1, 1, self.heads)) * w_C / 2.0
-
-        if neighbours is not None:
-            neighbours = neighbours.long()
-
-        if neighbours is None:
-            k_neigh = k[None, :]
-            v_neigh = v[None, :]
-            k_g_neigh = k_g[None, :]
-            v_g_neigh = v_g[None, :]
-        else:
-            k_neigh = _gather_rows(k, neighbours)
-            v_neigh = _gather_rows(v, neighbours)
-            k_g_neigh = _gather_rows(k_g, neighbours)
-            v_g_neigh = _gather_rows(v_g, neighbours)
-
-        dist = dfactor * (q_g[:, None] - k_g_neigh).pow(2).sum(dim=(-1, -2))
-        dot = (1.0 / self.size) ** 0.5 * (q.unsqueeze(1) * k_neigh).sum(dim=-1)
-
-        attn_logits = w_L * (dot + bias - dist)
-
-        if neighbours is None:
-            pair_mask = mask
-        else:
-            pair_mask = mask * (neighbours != -1)
-
-        attn_logits = torch.where(pair_mask[..., None].bool(), attn_logits, torch.full_like(attn_logits, -1e9))
-
-        attn = torch.softmax(attn_logits, dim=1)
-        attn = torch.where(pair_mask[..., None].bool(), attn, torch.zeros_like(attn))
-
-        out_pair = torch.einsum("nkh,nkc->nhc", attn, pair)
-        out_scalar = torch.einsum("nkh,nkhc->nhc", attn, v_neigh)
-        out_point = torch.einsum("nkh,nkhvd->nhvd", attn, v_g_neigh)
-
-        # if out_point.dtype != torch.float32:
-        #     out_point = out_point.to(dtype=torch.float32)
-        out_point = Vec3Array.from_array(out_point)
-        out_point = frames[:, None, None].apply_inverse_to_point(out_point)
-
-        out_norm = out_point.norm()
-        out_point = out_point.to_tensor() 
-
-        concat = torch.cat(
-            [
-                out_pair.reshape(*out_pair.shape[:-2], -1),
-                out_scalar.reshape(*out_scalar.shape[:-2], -1),
-                out_point.reshape(*out_point.shape[:-3], -1),
-                out_norm.reshape(*out_point.shape[:-3], -1),
-            ],
-            dim=-1,
-        )
-
-        if self._project_out is None:
-            self._project_out = Linear(
-                int(local.shape[-1]),
-                initializer=self.final_init,
-                name="project_out",
-                device=local.device,
-                dtype=local.dtype,
-            )
-
-        out = self._project_out(concat)
-        if out.dtype != local.dtype:
-            out = out.to(dtype=local.dtype)
-        return out
+__all__ = [
+    "DenseNonEquivariantPointAttention",
+    "LinearToPoints",
+    "SemiEquivariantSparseStructureAttention",
+    "SparseAttention",
+    "SparseInvariantMultiQueryAttention",
+    "SparseInvariantPointAttention",
+    "SparseSemiEquivariantPointAttention",
+    "SparseStructureAttention",
+    "SparseStructureMessage",
+    "direction_features",
+    "distance_features",
+    "extract_aa_frames",
+    "paired_distance_features",
+    "paired_rotation_features",
+    "pair_vector_features",
+    "position_rotation_features",
+    "rotation_features",
+    "sequence_relative_position",
+]

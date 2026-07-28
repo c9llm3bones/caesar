@@ -100,6 +100,7 @@ if __name__ == "__main__":
         path="network/",
         config="default",
         data_path="",
+        data_format="atom24",
         num_aa=1024,
         p_complex=0.5,
         lr=1e-3,
@@ -125,6 +126,8 @@ if __name__ == "__main__":
     )
     NUM_DEVICES = jax.device_count()
     multigpu = opt.multigpu == "True"
+    if opt.data_format not in ("atom24", "atom37"):
+        raise ValueError(f"Unsupported data_format={opt.data_format!r}")
     if opt.nanhunt == "True":
         multigpu = False
         NUM_DEVICES = 1
@@ -161,6 +164,7 @@ if __name__ == "__main__":
                                         seqres_aa="clusterSeqresAA",
                                         cutoff_resolution=4.0,
                                         p_complex=opt.p_complex,
+                                        format=opt.data_format,
                                         size=opt.num_aa,
                                         min_size=16,
                                         max_size=opt.num_aa,

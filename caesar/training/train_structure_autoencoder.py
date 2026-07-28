@@ -12,9 +12,9 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from caesar.data.allpdb import BatchedProteinPDBStream, ProteinPDBSample
-from flexloop.data import BatchStream
 from caesar.modules.autoencoder import StructureAutoencoder, StructureDecoder
 from caesar.modules.config import distance_to_structure_decoder as config_choices
+from caesar.experimental.torch_native import BackboneAutoencoderNative
 
 
 def _make_protein_pdb_cls(config):
@@ -405,6 +405,8 @@ def parse_args():
     p.add_argument("--config", type=str, default="small_inner")
     p.add_argument("--data_path", type=str, default="")
     p.add_argument("--suffix", type=str, default="1")
+    p.add_argument("--model_impl", type=str, default="legacy",
+                   choices=("legacy", "native_backbone"))
 
     # data
     p.add_argument("--num_aa", type=int, default=1024)
@@ -448,6 +450,8 @@ def parse_args():
 
 
 def main():
+    from flexloop.data import BatchStream
+
     opt = parse_args()
     detect_nonfinite = _bool_from_opt(opt.detect_nonfinite)
 
@@ -470,8 +474,13 @@ def main():
     config = getattr(config_choices, opt.config)
     is_decoder = bool(getattr(config, "is_decoder", False))
 
-    ModelClass = StructureDecoder if is_decoder else StructureAutoencoder
-    model = ModelClass(config).to(device)
+    if opt.model_impl == "native_backbone":
+        if is_decoder:
+            raise ValueError("--model_impl=native_backbone is only supported for autoencoder configs")
+        model = BackboneAutoencoderNative(config).to(device)
+    else:
+        ModelClass = StructureDecoder if is_decoder else StructureAutoencoder
+        model = ModelClass(config).to(device)
 
     # dataset class (atom37 for full-atom configs)
     pdb_cls_kwargs = {}
